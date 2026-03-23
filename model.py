@@ -60,7 +60,7 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
     params["ln_final.scale"] = jnp.ones(d_model)
     params["ln_final.bias"] = jnp.zeros(d_model)
 
-    # output projection (tied with token_emb would reduce params, but keep separate for ES)
+    # separate output projection (weight tying hurts quality with small models)
     key, k = jax.random.split(key)
     params["output_proj"] = jax.random.normal(k, (d_model, vocab_size)) * (d_model ** -0.5)
 

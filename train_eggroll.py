@@ -39,11 +39,12 @@ EPOCHS = 10
 SEED = 42
 
 # === EGGROLL hyperparameters ===
-HALF_POP = 1024         # antithetic pairs -> 2048 forward passes per batch
-POP_CHUNK = 8           # process this many perturbation pairs at a time (memory)
+HALF_POP = 512          # per accumulation round
+POP_CHUNK = 16          # process this many perturbation pairs at a time (memory)
+N_ACCUM = 4             # gradient accumulation rounds -> effective pop = HALF_POP * N_ACCUM * 2 = 4096
 SIGMA_START = 0.04      # perturbation scale
 SIGMA_DECAY = 0.998     # per epoch (slow decay)
-LR_START = 0.020        # learning rate (higher - constant alpha allows it)
+LR_START = 0.020        # learning rate
 LR_DECAY = 0.85         # per epoch
 ALPHA_START = 0.20      # label smoothing (constant - provides regularization)
 ALPHA_DECAY = 1.00      # no decay - smoothing prevents ES-induced overfitting
@@ -290,18 +291,20 @@ def train():
             bx = shuffled_x[start : start + BATCH_SIZE]
             by = shuffled_y[start : start + BATCH_SIZE]
 
-            # generate random perturbation vectors
-            key, vec_key = jax.random.split(key)
-            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+            # gradient accumulation: multiple rounds of perturbation evaluation
+            accum_grads = {k: jnp.zeros_like(params[k]) for k in params}
+            batch_loss = 0.0
+            for accum_idx in range(N_ACCUM):
+                key, vec_key = jax.random.split(key)
+                vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+                fitness_pos, fitness_neg = compute_fitness_batch(params, vecs, bx, by, sigma, alpha)
+                grads = eggroll_gradient(params, spec, total_vec_dim, vecs, fitness_pos, fitness_neg, sigma)
+                accum_grads = {k: accum_grads[k] + grads[k] for k in params}
+                batch_loss += float(jnp.mean(fitness_pos))
 
-            # compute fitness for all pairs
-            fitness_pos, fitness_neg = compute_fitness_batch(params, vecs, bx, by, sigma, alpha)
-
-            # update params
-            params = update_step(params, vecs, fitness_pos, fitness_neg, sigma, lr)
-
-            # track loss (use mean of pos fitness as rough proxy)
-            epoch_loss += float(jnp.mean(fitness_pos))
+            # average and apply
+            params = {k: params[k] - lr * lr_scales[k] * accum_grads[k] / N_ACCUM for k in params}
+            epoch_loss += batch_loss / N_ACCUM
 
         val_l = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         perplexity = jnp.exp(val_l)

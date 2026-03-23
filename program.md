@@ -166,6 +166,8 @@ The MNIST project has 8 sessions of optimization work. Read these files:
 5. Implement EGGROLL training
 6. Begin the experiment loop
 
+**Important:** Always commit and push work to the autoresearch branch regularly.
+
 ---
 
 ## Experiment Loop
