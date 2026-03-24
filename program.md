@@ -10,11 +10,12 @@ run experiments, log results, and keep going without stopping to ask for permiss
 ## Current State (2026-03-24)
 
 **Phase 1 (working): DONE.** EGGROLL trains a transformer from scratch.
-**Phase 2 (quality): val_loss=2.67 vs backprop 2.45.** Gap=0.22. Close but not matched.
-**Phase 3 (speed): 540s vs 1.3s.** 415x gap. No Triton kernel yet — main bottleneck.
+**Phase 2 (quality): val_loss=2.63 vs backprop 2.45.** Gap=0.18. Improved from 0.22.
+**Phase 3 (speed): 119s (10ep) / 433s (20ep) vs 1.3s.** 4.5x speedup via Triton kernel.
 
-Best EGGROLL config: `train_eggroll_optimized.py` with HALF_POP=1024, momentum=0.5,
-alpha=0.50, bf16, orthogonal QR vectors, N_ACCUM=2.
+Best EGGROLL config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020,
+LR_DECAY=0.95, momentum=0.5, alpha=0.50, bf16, Gaussian vectors (no QR since pop>vec_dim),
+N_ACCUM=1, 20 epochs. Uses fused Triton kernel for the full forward pass + CE loss.
 
 ---
 
@@ -26,8 +27,14 @@ data.py                       — char-level Shakespeare dataset (65 vocab, 7842
 model.py                      — decoder-only transformer (d=64, 1 layer, 2 heads, 66K params)
 train_backprop.py             — backprop baseline (vanilla SGD, LR=3e-4, under-tuned)
 train_eggroll.py              — fp32 EGGROLL (no momentum, no bf16 — superseded)
-train_eggroll_optimized.py    — best EGGROLL (bf16, momentum, orthogonal vecs, accum)
-benchmark.py                  — runs both and compares
+train_eggroll_optimized.py    — JAX vmap EGGROLL (bf16, momentum, orthogonal vecs, accum)
+train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL (4.5x faster)
+kernels/fused_transformer_ce.py — Triton kernel: full forward pass + CE loss fused
+validate_kernel.py            — validates Triton kernel against JAX forward pass
+benchmark_kernel.py           — benchmarks Triton vs JAX vmap speed
+profile_eggroll.py            — profiles time breakdown (forward=99%, QR=1%, grad=0%)
+benchmark.py                  — runs backprop vs eggroll comparison
+cuda_kernels_docs/            — Triton + jax-triton documentation (from MNIST project)
 ```
 
 ---
@@ -61,6 +68,15 @@ was 1000x below optimal.**
 | bf16, pop=2048, **alpha=0.50**, momentum=0.5 | 2.70 | 14.8 | 270s | high alpha sweet spot |
 | bf16, pop=4096 (accum=2), alpha=0.50, mom=0.5 | 2.69 | 14.7 | 540s | gradient accumulation |
 | bf16, pop=4096, alpha=0.50, mom=0.5, **ortho QR** | **2.67** | **14.4** | **540s** | **best EGGROLL** |
+
+### EGGROLL with Triton kernel (fused forward+CE, no vmap)
+
+| Config | val_loss | ppl | Time | Key change |
+|--------|----------|-----|------|-----------|
+| triton, pop=2048, LR=0.012, decay=0.92, 10ep | 2.67 | 14.50 | 119s | kernel validated, matches JAX |
+| triton, pop=8192, LR=0.012, decay=0.92, 10ep | 2.67 | 14.43 | 219s | higher pop, Gaussian vecs |
+| triton, pop=8192, LR=0.020, decay=0.95, 10ep | **2.64** | **14.04** | 220s | higher LR + slower decay |
+| triton, pop=8192, LR=0.020, decay=0.95, **20ep** | **2.63** | **13.84** | **433s** | **best EGGROLL** |
 
 ### Speed vs quality tradeoff (bf16, alpha=0.20, no momentum, no accum)
 
@@ -143,6 +159,27 @@ For a (m,n) weight matrix, perturb with σ*outer(b,a) using m+n random values in
 of m*n. Total vec_dim=2306 vs 66K full params = 28.8x compression. This is the core
 EGGROLL technique — confirmed it works for transformers (attention + FFN + embeddings).
 
+### 10. Fused Triton kernel — 4.7x speedup on forward pass
+Replaced the vmap+lax.scan approach with a single Triton kernel that processes ALL
+perturbation members in parallel via the CUDA grid. Grid: (HALF_POP, BATCH, 2).
+Each thread block handles one perturbation × one batch sequence × one sign direction.
+
+Key techniques:
+- Full transformer forward pass fused (embedding→LN→attention→FFN→output→CE)
+- Perturbations applied on-the-fly via rank-1 decomposition (no materialized perturbed weights)
+- K-tiled FFN (BLOCK_K=64) to manage register pressure for D_FF=256
+- Full (128,128) attention scores in-register (num_warps=8 for enough registers)
+- bf16 matmuls with f32 accumulation for softmax/LN precision
+
+Profiling showed forward passes are 99% of training time. The kernel eliminates ALL
+intermediate HBM writes (~100MB per forward pass × 4096 passes per round = ~400GB
+bandwidth savings per round). Validated against JAX: max relative error 0.01%.
+
+### 11. More epochs (20 instead of 10) — additional −0.04 loss
+With the kernel speedup, 20 epochs costs 433s (same time budget as old 10-epoch run).
+The model is still improving monotonically at epoch 20, suggesting even more epochs
+would help if time permits.
+
 ### 9. Per-subgroup Winsorized z-score (from MNIST, works here too)
 K=8 subgroups, clip ±2.0. Split fitness differences into groups, normalize each
 independently, clip outliers. Same as MNIST — no need to change.
@@ -191,6 +228,14 @@ simultaneous transformer forward passes due to memory bandwidth saturation.
 ### 8. Temperature T=3.0
 Too smooth — the gradient signal becomes too weak. val_loss=3.14 vs 2.70 with T=2.0.
 The fitness landscape becomes nearly flat and ES can't estimate useful gradients.
+
+### 10. Adam-like adaptive LR (second moment scaling)
+Maintaining per-parameter running variance of ES gradients and dividing updates by
+sqrt(variance) (like Adam) causes catastrophic divergence. The v buffer starts at
+zero, making 1/sqrt(v+eps) enormous in early training. Even with eps=1e-8, the
+effective LR in the first batch is ~10000x the base LR. Would need warm-up or
+non-zero initialization, but fundamentally ES gradient variance is too high for
+Adam-style scaling.
 
 ### 9. Low alpha with momentum (alpha=0.10, momentum=0.5)
 Momentum alone isn't enough regularization. Still need high alpha for smooth fitness
