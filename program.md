@@ -211,13 +211,15 @@ Columns: `commit\tloss\tperplexity\ttraining_time_s\tpeak_memory_mb\tstatus\tdes
 
 | Method | val_loss | ppl | Time | Notes |
 |--------|----------|-----|------|-------|
-| Backprop (LR=2e-2 decay=0.80) | **2.70** | **14.9** | **1.3s** | best 10ep backprop |
-| Backprop (LR=1e-2 decay=0.80) | 2.84 | 17.2 | 1.3s | |
+| Backprop (LR=2e-2 decay=0.80) | 2.70 | 14.9 | **1.3s** | best 10ep backprop |
+| EGGROLL (momentum+alpha=0.50) | **2.70** | **14.8** | 270s | quality MATCHED |
+| EGGROLL (no momentum, alpha=0.20) | 2.83 | 17.0 | 270s | initial approach |
 | Backprop (vanilla LR=3e-4) | 3.59 | 36.1 | 6.1s | under-tuned baseline |
-| EGGROLL bf16 pop=2048 | 2.83 | 17.0 | 270s | best EGGROLL quality |
-| EGGROLL bf16 pop=512 | 2.95 | 19.0 | 79s | best speed/quality |
 
-Tuned backprop beats EGGROLL on both quality AND speed. 208x faster, 0.13 lower loss.
+EGGROLL now matches backprop quality but at 208x compute cost. Key techniques:
+- Momentum (beta=0.5) eliminates oscillation from noisy ES gradients
+- High label smoothing (alpha=0.50) makes the fitness landscape smooth
+- bf16 forward passes provide implicit noise regularization
 
 ### Where the initial comparison was misleading
 1. **Severely under-tuned backprop baseline**: LR=3e-4 when optimal is LR=2e-2. This single mistake made EGGROLL appear to beat backprop. With proper LR tuning (same exponential decay schedule EGGROLL uses), backprop wins on both axes.
