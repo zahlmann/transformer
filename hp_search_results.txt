@@ -1,0 +1,6 @@
+half_pop=2560 sigma=0.02 lr=0.01 alpha=0.5 val_loss=2.5615 time=112.7s
+half_pop=2560 sigma=0.015 lr=0.01 alpha=0.5 val_loss=2.5624 time=105.5s
+half_pop=2560 sigma=0.02 lr=0.012 alpha=0.5 val_loss=2.6197 time=105.7s
+half_pop=2560 sigma=0.02 lr=0.01 alpha=0.4 val_loss=2.5812 time=105.6s
+half_pop=3072 sigma=0.02 lr=0.012 alpha=0.5 val_loss=2.5537 time=129.9s
+half_pop=3072 sigma=0.015 lr=0.01 alpha=0.5 val_loss=2.5058 time=127.1s

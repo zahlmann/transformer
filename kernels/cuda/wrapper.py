@@ -7,7 +7,6 @@ a Python API matching the Triton version (fused_transformer_ce_both).
 Usage:
     from kernels.cuda.wrapper import fused_transformer_ce_both_cuda
 
-    # Same interface as the Triton version:
     ce_pos, ce_neg = fused_transformer_ce_both_cuda(
         token_emb, pos_emb, ln1_scale, ln1_bias,
         wq, wk, wv, wo,
@@ -26,8 +25,10 @@ import struct
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import core
-from jax.interpreters import mlir, xla
+from jax._src import core
+from jax._src.interpreters import mlir as mlir_impl
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import stablehlo
 from jaxlib import xla_client
 
 # ─── Load the compiled CUDA library ───
@@ -48,20 +49,100 @@ def _ensure_registered():
             f"Expected: {_lib_path}"
         )
     _lib = ctypes.CDLL(_lib_path)
-    # Get function pointer for the XLA custom call entry point
     fn_ptr = ctypes.cast(
         _lib.fused_transformer_ce_cuda,
         ctypes.c_void_p
     ).value
-    # Register with XLA
+    # Create PyCapsule wrapping the function pointer (required by JAX 0.9+)
+    PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+    PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    PyCapsule_New.restype = ctypes.py_object
+    capsule = PyCapsule_New(fn_ptr, b"xla._CUSTOM_CALL_TARGET", None)
     xla_client.register_custom_call_target(
         b"fused_transformer_ce_cuda",
-        fn_ptr,
+        capsule,
         platform="gpu",
+        api_version=0,
     )
     _registered = True
 
 
+# ─── JAX Primitive ───
+_fused_ce_p = core.Primitive("fused_transformer_ce_cuda")
+_fused_ce_p.multiple_results = True
+
+
+def _abstract_eval(
+    token_emb, pos_emb, ln1_scale, ln1_bias,
+    wq, wk, wv, wo,
+    ln2_scale, ln2_bias,
+    ffn_up, ffn_up_bias, ffn_down, ffn_down_bias,
+    ln_final_scale, ln_final_bias, output_proj,
+    vecs, x, y,
+    *, half_pop, batch, sigma, alpha, temperature,
+):
+    return (
+        core.ShapedArray((half_pop, batch), jnp.float32),
+        core.ShapedArray((half_pop, batch), jnp.float32),
+    )
+
+_fused_ce_p.def_abstract_eval(_abstract_eval)
+
+
+def _jax_dtype_to_ir_type(dtype):
+    """Convert JAX dtype to MLIR IR type."""
+    if dtype == jnp.bfloat16:
+        return ir.BF16Type.get()
+    elif dtype == jnp.float32:
+        return ir.F32Type.get()
+    elif dtype == jnp.int32:
+        return ir.IntegerType.get_signless(32)
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _lowering(ctx,
+    token_emb, pos_emb, ln1_scale, ln1_bias,
+    wq, wk, wv, wo,
+    ln2_scale, ln2_bias,
+    ffn_up, ffn_up_bias, ffn_down, ffn_down_bias,
+    ln_final_scale, ln_final_bias, output_proj,
+    vecs, x, y,
+    *, half_pop, batch, sigma, alpha, temperature,
+):
+    """MLIR lowering: emit stablehlo.custom_call for the CUDA kernel."""
+    # Pack scalars into opaque struct: {half_pop, batch, sigma, alpha, temperature}
+    opaque = ir.StringAttr.get(struct.pack("iifff", half_pop, batch, sigma, alpha, temperature))
+
+    f32 = ir.F32Type.get()
+    out_types = [
+        ir.RankedTensorType.get([half_pop, batch], f32),
+        ir.RankedTensorType.get([half_pop, batch], f32),
+    ]
+
+    # Only tensor operands (no scalars in the buffer list)
+    operands = [
+        token_emb, pos_emb, ln1_scale, ln1_bias,
+        wq, wk, wv, wo,
+        ln2_scale, ln2_bias,
+        ffn_up, ffn_up_bias, ffn_down, ffn_down_bias,
+        ln_final_scale, ln_final_bias, output_proj,
+        vecs, x, y,
+    ]
+
+    result = stablehlo.custom_call(
+        result=out_types,
+        inputs=operands,
+        call_target_name="fused_transformer_ce_cuda",
+        backend_config=opaque,
+        api_version=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 2),
+    )
+
+    return list(result)
+
+mlir_impl.register_lowering(_fused_ce_p, _lowering, platform="gpu")
+
+
+# ─── Public API ───
 def fused_transformer_ce_both_cuda(
     token_emb, pos_emb, ln1_scale, ln1_bias,
     wq, wk, wv, wo,
@@ -70,126 +151,29 @@ def fused_transformer_ce_both_cuda(
     ln_final_scale, ln_final_bias, output_proj,
     vecs, x, y, sigma, alpha, temperature,
 ):
-    """Launch the CUDA kernel. Same interface as the Triton version.
-
-    Returns (partial_ce_pos, partial_ce_neg) each of shape (HALF_POP, BATCH).
-    """
+    """Launch the CUDA kernel. Same interface as the Triton version."""
     _ensure_registered()
 
-    HALF_POP = vecs.shape[0]
-    BATCH = x.shape[0]
     VOCAB_PAD = 128
-
-    # Pad output projection to VOCAB_PAD
     output_proj_padded = jnp.pad(
         output_proj, [(0, 0), (0, VOCAB_PAD - output_proj.shape[1])]
     )
 
-    # Cast weights to bf16 (matching Triton wrapper)
-    token_emb_bf = token_emb.astype(jnp.bfloat16)
-    pos_emb_bf = pos_emb.astype(jnp.bfloat16)
-    ln1_scale_bf = ln1_scale.astype(jnp.bfloat16)
-    ln1_bias_bf = ln1_bias.astype(jnp.bfloat16)
-    wq_bf = wq.astype(jnp.bfloat16)
-    wk_bf = wk.astype(jnp.bfloat16)
-    wv_bf = wv.astype(jnp.bfloat16)
-    wo_bf = wo.astype(jnp.bfloat16)
-    ln2_scale_bf = ln2_scale.astype(jnp.bfloat16)
-    ln2_bias_bf = ln2_bias.astype(jnp.bfloat16)
-    ffn_up_bf = ffn_up.astype(jnp.bfloat16)
-    ffn_up_bias_bf = ffn_up_bias.astype(jnp.bfloat16)
-    ffn_down_bf = ffn_down.astype(jnp.bfloat16)
-    ffn_down_bias_bf = ffn_down_bias.astype(jnp.bfloat16)
-    ln_final_scale_bf = ln_final_scale.astype(jnp.bfloat16)
-    ln_final_bias_bf = ln_final_bias.astype(jnp.bfloat16)
-    output_proj_bf = output_proj_padded.astype(jnp.bfloat16)
+    HALF_POP = vecs.shape[0]
+    BATCH = x.shape[0]
 
-    # Pack kernel parameters as opaque bytes
-    opaque = struct.pack("ii", HALF_POP, BATCH)
-
-    # Call via XLA custom_call
-    # Note: the custom_call convention passes all operands as input buffers,
-    # and the output shapes are specified separately.
-    result_shapes = [
-        jax.ShapeDtypeStruct((HALF_POP, BATCH), jnp.float32),  # ce_pos
-        jax.ShapeDtypeStruct((HALF_POP, BATCH), jnp.float32),  # ce_neg
-    ]
-
-    # Use jax.pure_callback or custom_call primitive
-    # For XLA custom_call, we need to use the lower-level API:
-    ce_pos, ce_neg = jax.pure_callback(
-        lambda *args: _call_cuda_kernel(*args, half_pop=HALF_POP, batch=BATCH),
-        [jnp.zeros((HALF_POP, BATCH), jnp.float32)] * 2,
-        token_emb_bf, pos_emb_bf, ln1_scale_bf, ln1_bias_bf,
-        wq_bf, wk_bf, wv_bf, wo_bf,
-        ln2_scale_bf, ln2_bias_bf,
-        ffn_up_bf, ffn_up_bias_bf, ffn_down_bf, ffn_down_bias_bf,
-        ln_final_scale_bf, ln_final_bias_bf, output_proj_bf,
+    bf = jnp.bfloat16
+    return _fused_ce_p.bind(
+        token_emb.astype(bf), pos_emb.astype(bf),
+        ln1_scale.astype(bf), ln1_bias.astype(bf),
+        wq.astype(bf), wk.astype(bf), wv.astype(bf), wo.astype(bf),
+        ln2_scale.astype(bf), ln2_bias.astype(bf),
+        ffn_up.astype(bf), ffn_up_bias.astype(bf),
+        ffn_down.astype(bf), ffn_down_bias.astype(bf),
+        ln_final_scale.astype(bf), ln_final_bias.astype(bf),
+        output_proj_padded.astype(bf),
         vecs,
         x.astype(jnp.int32), y.astype(jnp.int32),
-        jnp.float32(sigma), jnp.float32(alpha), jnp.float32(temperature),
+        half_pop=HALF_POP, batch=BATCH,
+        sigma=float(sigma), alpha=float(alpha), temperature=float(temperature),
     )
-
-    return ce_pos, ce_neg
-
-
-def _call_cuda_kernel(*args, half_pop, batch):
-    """Direct CUDA kernel call (for pure_callback).
-
-    NOTE: This is a placeholder. The proper approach is to use
-    xla_client custom_call which runs on GPU without host roundtrip.
-    See the _register_custom_call_lowering function below for the
-    production implementation.
-
-    For the production version, replace fused_transformer_ce_both_cuda
-    with a proper JAX primitive that lowers to XLA custom_call.
-    """
-    raise NotImplementedError(
-        "Direct callback not implemented. Use the XLA custom_call "
-        "primitive approach instead. See comments in this file."
-    )
-
-
-# ─── Production approach: JAX primitive with XLA custom_call lowering ───
-#
-# The proper way to call CUDA from JAX (no host roundtrip):
-#
-# 1. Define a JAX primitive:
-#    _fused_ce_p = core.Primitive("fused_transformer_ce_cuda")
-#    _fused_ce_p.multiple_results = True
-#
-# 2. Define abstract eval (shape inference):
-#    @_fused_ce_p.def_abstract_eval
-#    def _fused_ce_abstract(token_emb, pos_emb, ..., vecs, x, y, sigma, alpha, temp):
-#        half_pop = vecs.shape[0]
-#        batch = x.shape[0]
-#        return (
-#            core.ShapedArray((half_pop, batch), jnp.float32),
-#            core.ShapedArray((half_pop, batch), jnp.float32),
-#        )
-#
-# 3. Define MLIR lowering (XLA custom_call):
-#    def _fused_ce_lowering(ctx, token_emb, pos_emb, ..., vecs, x, y, sigma, alpha, temp):
-#        opaque = struct.pack("ii", half_pop, batch)
-#        out_types = [
-#            mlir.ir.RankedTensorType.get([half_pop, batch], mlir.ir.F32Type.get()),
-#            mlir.ir.RankedTensorType.get([half_pop, batch], mlir.ir.F32Type.get()),
-#        ]
-#        result = mlir.custom_call(
-#            "fused_transformer_ce_cuda",
-#            result_types=out_types,
-#            operands=[token_emb, pos_emb, ..., vecs, x, y, sigma, alpha, temp],
-#            backend_config=opaque,
-#            api_version=2,  # typed FFI
-#        ).results
-#        return result
-#
-#    mlir.register_lowering(_fused_ce_p, _fused_ce_lowering, platform="gpu")
-#
-# This is the approach used by jax-triton internally. The exact MLIR API
-# depends on the JAX version. For JAX 0.9.2, check:
-#   from jax.interpreters import mlir
-#   help(mlir.custom_call)
-#
-# The next agent should implement this lowering to get full GPU-native
-# execution without host synchronization.

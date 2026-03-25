@@ -107,6 +107,36 @@ that degrades quality beyond this threshold is rejected.
 - **Per-batch float() sync removal**: No speed gain (XLA handles pipelining through data deps).
 - **VOCAB_PAD reduction** (128→80): Triton requires power-of-2 arange sizes. Can't reduce.
 
+## What Did NOT Work (Speed Session 2026-03-25 part 2)
+
+- **Triton FlashAttention via tl.gather** (308ms vs 285ms baseline, SLOWER): Triton 3.6
+  supports tl.ravel + tl.gather + tl.reshape to extract KV tile rows from register-resident
+  tensors. BLOCK_KV=64 gave 278ms isolated kernel benchmark but 181s full training (worse
+  than 176s baseline). The gather operation compiles to cross-thread register shuffles that
+  add more overhead than the register pressure reduction saves.
+- **Tiled output projection** (287ms vs 285ms, no improvement): Tiling the (128,128) logits
+  matrix with online log-sum-exp for CE loss. Loop overhead negates register savings.
+- **FFN pipelining** (tl.range num_stages=2): 545ms, much slower. Dynamic loop with
+  pipelining doesn't work for the FFN body structure.
+- **HALF_POP=3072 HP search** (val_loss 2.56 3-seed avg, FAIL): Searched sigma
+  [0.012-0.025], lr [0.008-0.015], alpha [0.4-0.6], sigma_decay [0.995-1.0], LR schedules
+  (cosine, warmup+cosine). Best single-seed was 2.4946 (sigma=0.018) but 3-seed avg is
+  2.5638. Population reduction not viable without algorithmic changes.
+- **CUDA kernel (scalar FP32)** (3860ms vs 271ms Triton, 14x SLOWER): Full CUDA kernel
+  with FlashAttention via shared memory. Correctness validated (max diff 0.0004). But
+  without WMMA tensor cores, scalar FP32 can't compete with Triton's bf16 tensor cores.
+
+## What IS Ready (for next session)
+
+- **CUDA kernel infrastructure**: Full kernel in `kernels/cuda/fused_transformer_ce.cu`
+  (664 lines), JAX XLA custom_call binding in `kernels/cuda/wrapper.py`. Builds, runs,
+  produces correct output. Only missing WMMA tensor cores for the big matmuls.
+  - Build: `make -C kernels/cuda/`
+  - Test: `uv run python -c "..."` (see test_kernel.py)
+  - Uses: PyCapsule for custom_call registration, scalars packed in opaque struct
+  - Key fix: scalars (sigma, alpha, temperature) must be in opaque struct, NOT as
+    separate GPU buffer operands (XLA 0.9.2 can't handle scalar GPU buffers)
+
 ---
 
 ## What to Try Next (SPEED — reduce the 43x gap)
@@ -115,88 +145,109 @@ that degrades quality beyond this threshold is rejected.
 (register pressure from the 128×128 attention matrix). Focus on reducing register
 pressure or changing the computation structure.
 
-### HIGH PRIORITY: CUDA C++ kernel with FlashAttention tiling
+## What to Try Next — CUDA Kernel Optimization (for next agent)
 
-**The CUDA C++ scaffolding is ready.** A skeleton kernel, Makefile, Python wrapper,
-and test script are in `kernels/cuda/`. The Triton kernel cannot do FlashAttention
-because Triton lacks shared memory control and can't slice register-resident 2D
-tensors. CUDA C++ solves both problems.
+### Profiling Commands (run these first!)
+```bash
+# Kernel time breakdown
+uv run profile_triton.py   # shows kernel/gradient/vecgen split
 
-**How to implement the CUDA kernel:**
+# Triton register usage (look for num_regs, spill_stores, spill_loads):
+TRITON_CACHE_DIR=/tmp/triton_debug uv run benchmark.py
+# Then: find /tmp/triton_debug -name "*.json" | xargs grep num_regs
 
-1. **Start without FlashAttention** — port the Triton kernel logic to CUDA C++ line
-   by line. Use `kernels/fused_transformer_ce.py` as reference. Get the test passing
-   (`uv run kernels/cuda/test_kernel.py` compares CUDA vs Triton output).
+# CUDA kernel profiling:
+make -C kernels/cuda/
+# Register usage:
+nvcc -O3 -arch=sm_89 --ptxas-options=-v -c kernels/cuda/fused_transformer_ce.cu -o /dev/null 2>&1
+# GPU profiling:
+ncu --target-processes all uv run python -c "..." 2>&1 | head -50
+```
 
-2. **Add FlashAttention** — replace the full (128, 128) attention score computation:
-   - Compute K, V for the full sequence → store to shared memory (32KB per head)
-   - `__syncthreads()`
-   - For each query tile (BLOCK_Q=32 query positions):
-     * Compute Q_tile by having each thread compute Q for its assigned rows
-     * For each KV tile (BLOCK_KV=32): load from shared mem, compute scores
-       (32×32), apply causal mask, online softmax update
-     * Finalize attention output for this tile
-   - This reduces the attention tensor from (128,128)=16K to (32,32)=1K elements
+### Bottleneck Analysis
 
-3. **Wire it into JAX** — the wrapper.py has a placeholder. Complete the XLA
-   custom_call lowering (see comments in wrapper.py). The `.so` is already built
-   and `xla_client.register_custom_call_target` is ready.
+The Triton kernel at 274ms processes 1,048,576 blocks (4096×128×2).
+- 80 SMs on RTX 4080 SUPER, likely 1 block/SM occupancy → 13,107 waves
+- Per wave: 274ms/13107 ≈ 21μs (matches compute estimates)
+- 255 registers/thread (at the max), with 340 bytes spill
 
-4. **Benchmark** — replace the kernel call in `train_eggroll_triton.py` and run
-   `uv run benchmark.py`.
+**Two (128, 128) matrices cause register pressure:**
+1. Attention scores: Q(128,32) @ K(128,32)^T = (128,128) → softmax → (128,128) weights
+2. Output logits: h_final(128,64) @ W_out(64,128) = (128,128) → CE loss
 
-**Build:** `make -C kernels/cuda/`
-**Test:** `uv run kernels/cuda/test_kernel.py`
-**Docs:** `cuda_kernels_docs/cuda_cpp/` has CUDA programming guide, tensor cores,
-and JAX FFI reference.
+Each (128,128) f32 matrix = 64KB. With 128 threads = 512 bytes = 128 regs/thread.
+The attention matrix alone uses 50% of the 255-register budget.
 
----
+**Compute breakdown** (per forward pass, FLOPs):
+- QKV projections: 3.1M (16.5%)
+- Attention (scores + V_acc): 4.2M (22.3%)
+- O projection: 1.0M (5.3%)
+- FFN up+down: 8.4M (44.6%)
+- Output projection: 2.1M (11.1%)
+Total: 18.9M FLOPs. At 204.9 TFLOPS peak: theoretical 97ms. Actual 274ms = 35% utilization.
 
-### MEDIUM PRIORITY: Other approaches (if CUDA C++ is too complex)
+### CUDA Kernel Infrastructure (READY TO USE)
 
-1. **Tile attention over query positions in Triton**: Instead of computing full
-   (128, 128) attention scores, compute (BLOCK_Q, 128) tiles. Use online softmax.
+**Files:**
+- `kernels/cuda/fused_transformer_ce.cu` — Full kernel with WMMA + FlashAttention
+- `kernels/cuda/wrapper.py` — JAX XLA custom_call binding
+- `kernels/cuda/Makefile` — Build system
+- `kernels/cuda/test_kernel.py` — Correctness test vs Triton
 
-   **Challenge**: Q, K, V are computed on-the-fly from register-resident h_norm.
-   Tiling requires either: (a) storing h_norm to shared memory and loading tiles,
-   or (b) recomputing QKV per tile (wastes compute but reduces registers).
+**Build/Test/Run:**
+```bash
+make -C kernels/cuda/
+uv run python -c "
+from kernels.cuda.wrapper import fused_transformer_ce_both_cuda as cuda_kernel
+# Must call from @jax.jit (no eager eval rule)
+"
+```
 
-   The MNIST kernel doesn't have attention, so no reference implementation exists.
-   Study FlashAttention papers (Dao et al. 2022) for the online softmax algorithm.
+**Current CUDA kernel issues (WHY it's 11x slower):**
+1. **WMMA shared memory staging overhead**: Each WMMA matmul does:
+   registers → shared memory (bf16) → WMMA fragments → shared memory (f32) → registers.
+   This is 4 memory transactions per matmul vs Triton's 0 (Triton keeps everything in registers).
+2. **52.5KB shared memory limits occupancy** to 1 block/SM (100KB SM limit).
+3. **Non-WMMA code is scalar FP32**: Q projection, O projection, FlashAttention,
+   perturbation math, layer norms, GELU, CE loss all use scalar loops.
 
-2. **Tile attention over key/value positions**: Alternative tiling axis. Process
-   (128, BLOCK_KV) attention blocks with online softmax. Requires K, V to be
-   available in tiles — need shared memory or recomputation.
+### Creative Approaches for the Next Agent
 
-### MEDIUM PRIORITY: Batch tiling (non-unrolled)
+1. **Use PTX inline assembly for matmuls** instead of WMMA. PTX `mma.sync` instructions
+   give more control over data movement. Can keep data in registers (no shared memory
+   staging). Study: NVIDIA PTX ISA guide, `mma.sync.aligned.m16n8k16.row.col.f32.bf16`.
 
-3. **Batch tiling with dynamic loop**: The `tl.static_range(2)` attempt caused Triton
-   compile timeout because the unrolled code was too large. Try instead:
-   - Use Triton's `tl.range()` (non-unrolled loop) if available
-   - Or write a C++/CUDA kernel wrapper that handles the batch loop
-   - Or use Pallas (JAX native Triton alternative) which may have cheaper JIT
+2. **Use CUTLASS templates** (install CUTLASS first: `pip install nvidia-cutlass` or
+   clone from github). CUTLASS provides optimized matmul templates that handle register
+   allocation, shared memory tiling, and tensor core usage. Can be integrated into a
+   fused kernel via CUTLASS's "epilogue fusion" API.
 
-### LOWER PRIORITY
+3. **Persistent kernel in Triton** with global memory K/V scratch:
+   - Launch 160-256 blocks (2 per SM)
+   - Each block processes multiple (perturbation, batch, sign) items sequentially
+   - Store K/V to a per-block scratch buffer (160 × 32KB = 5MB in L2 cache)
+   - Load K/V tiles for FlashAttention from L2-cached scratch
+   - This avoids the tl.gather overhead that killed the Triton FlashAttention attempt
 
-4. **Split kernel into attention + FFN**: Separate the fused kernel into two smaller
-   kernels. Trade HBM traffic for better occupancy. The intermediate (h after attention)
-   is 128×64×4 = 32KB per perturbation member. With 4096 members × 2 signs × 32KB =
-   256MB through HBM. At 700 GB/s, that's ~0.4ms per batch — potentially worth it
-   if the occupancy improvement is significant.
+4. **Triton cooperative kernel** (tl.range with warp_specialize=True):
+   - Triton 3.6 has experimental warp specialization
+   - Assign 2 warps to matmul (tensor cores) and 2 warps to non-matmul (scalar)
+   - Requires Blackwell GPU (SM 100+) — NOT available on Ada SM 89
 
-5. **Population reduction below 4096**: All attempts failed quality threshold (3-seed
-   avg ≤ 2.50). Best was HALF_POP=3072+sigma=0.015 at 2.506. Could revisit with:
-   - Different optimizer (e.g., AdaGrad, RMSProp)
-   - Gradient accumulation across batches
-   - Better fitness shaping (rank-based, top-k selection)
+5. **Reduce the two (128,128) matrices** by restructuring computation:
+   - For attention: already tried FlashAttention via tl.gather (8% slower due to gather)
+   - For output proj: already tried tiled CE with online log-sum-exp (no improvement)
+   - Untried: compute output projection in bf16 accumulator (output_dtype=tl.bfloat16
+     in tl.dot) to halve register footprint. The CE loss needs f32 but could convert
+     after the matmul.
 
-6. **All-in-one JIT via lax.scan**: Wrap all epochs and batches in a single JIT.
-   Python loop overhead is only ~6ms total (negligible). Main benefit would be if
-   XLA can optimize kernel scheduling or overlap operations.
+6. **Different thread mapping**: Instead of 128 threads per block processing one
+   (perturbation, batch, sign), try 256 threads processing two batch elements.
+   This shares perturbation vector loads across 2 sequences.
 
-### ALREADY ELIMINATED
+### ALREADY ELIMINATED (don't repeat)
 
-These have been tried and don't work — don't repeat:
+These have ALL been tried and don't work:
 - FP8 tensor cores (slower + quality loss)
 - num_warps=2 (much slower), num_warps=8 (baseline), num_warps=16 (slower)
 - BLOCK_K=64 (baseline), BLOCK_K=32 (current, marginal improvement)
@@ -204,6 +255,18 @@ These have been tried and don't work — don't repeat:
 - CPU pre-shuffle (no speed gain)
 - Per-batch float() sync removal (no speed gain)
 - Adaptive HALF_POP (quality fails on seed 7)
+- Triton FlashAttention via tl.gather/tl.ravel/tl.reshape (8% slower, gather overhead)
+- Tiled output projection with online log-sum-exp CE (no improvement)
+- FFN pipelining via tl.range num_stages=2 (2x slower)
+- Split kernel into attn + ffn_ce (12% slower, HBM scratch traffic)
+- HALF_POP=3072/3584 with HP search (quality fails 3-seed threshold)
+- LR schedules (cosine, warmup+cosine) at HALF_POP=3072 (no quality improvement)
+- Rank-based fitness shaping (gradient scaling issues, diverged)
+- maxnreg via monkey-patched jax_triton (doesn't affect compilation due to caching)
+- bf16 attention weights (no speed improvement)
+- num_stages=1/2/3 (no difference, kernel is compute-bound)
+- CUDA scalar kernel (14x slower without tensor cores)
+- CUDA WMMA kernel (11x slower, shared memory staging overhead + scalar non-matmul code)
 
 ---
 

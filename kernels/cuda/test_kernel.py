@@ -60,10 +60,18 @@ def test_correctness():
     print(f"  ce_pos shape: {ce_pos_triton.shape}, mean: {float(ce_pos_triton.mean()):.4f}")
     print(f"  ce_neg shape: {ce_neg_triton.shape}, mean: {float(ce_neg_triton.mean()):.4f}")
 
-    # Run CUDA kernel
+    # Run CUDA kernel (must be jit-compiled; custom call has no eager eval rule)
     try:
         from kernels.cuda.wrapper import fused_transformer_ce_both_cuda as cuda_kernel
-        ce_pos_cuda, ce_neg_cuda = cuda_kernel(
+
+        @jax.jit
+        def run_cuda(te, pe, l1s, l1b, wq, wk, wv, wo, l2s, l2b,
+                     fu, fub, fd, fdb, lfs, lfb, op, vecs, x, y):
+            return cuda_kernel(te, pe, l1s, l1b, wq, wk, wv, wo,
+                             l2s, l2b, fu, fub, fd, fdb, lfs, lfb, op,
+                             vecs, x, y, SIGMA, ALPHA, TEMPERATURE)
+
+        ce_pos_cuda, ce_neg_cuda = run_cuda(
             params["token_emb"], params["pos_emb"],
             params["layer0.ln1.scale"], params["layer0.ln1.bias"],
             params["layer0.attn.q"], params["layer0.attn.k"],
@@ -73,7 +81,7 @@ def test_correctness():
             params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
             params["ln_final.scale"], params["ln_final.bias"],
             params["output_proj"],
-            vecs, x, y, SIGMA, ALPHA, TEMPERATURE,
+            vecs, x, y,
         )
 
         print(f"\nCUDA kernel:")
