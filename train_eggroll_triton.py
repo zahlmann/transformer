@@ -36,14 +36,14 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 4096
-SIGMA_START = 0.04
+SIGMA_START = 0.03
 SIGMA_DECAY = 0.998
-LR_START = 0.020
+LR_START = 0.015
 LR_DECAY = 0.95
 ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
-MOMENTUM = 0.5
+MOMENTUM = 0.6
 N_ACCUM = 1
 
 
