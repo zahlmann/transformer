@@ -50,10 +50,15 @@ train_backprop_adam.py        — backprop Adam baseline (LR=3e-3, val_loss=1.84
 train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL (speed target)
 train_eggroll_optimized.py    — JAX vmap EGGROLL (slower reference)
 kernels/fused_transformer_ce.py — Triton kernel: full transformer forward + CE loss
+kernels/cuda/                 — CUDA C++ kernel scaffolding (see below)
+kernels/cuda/fused_transformer_ce.cu — CUDA kernel skeleton (TODO: implement body)
+kernels/cuda/wrapper.py       — Python/JAX binding for CUDA kernel
+kernels/cuda/test_kernel.py   — correctness test: CUDA vs Triton output
+kernels/cuda/Makefile          — build: make -C kernels/cuda/
 validate_kernel.py            — validates Triton kernel output vs JAX forward pass
 benchmark_kernel.py           — benchmarks Triton vs JAX vmap speed
-profile_eggroll.py            — time breakdown profiler
-cuda_kernels_docs/            — Triton + jax-triton documentation
+profile_triton.py             — time breakdown profiler (kernel vs gradient vs vec gen)
+cuda_kernels_docs/            — Triton + jax-triton + CUDA C++ documentation
 results.tsv                   — experiment log
 ```
 
@@ -110,11 +115,47 @@ that degrades quality beyond this threshold is rejected.
 (register pressure from the 128×128 attention matrix). Focus on reducing register
 pressure or changing the computation structure.
 
-### HIGH PRIORITY: FlashAttention-style attention tiling
+### HIGH PRIORITY: CUDA C++ kernel with FlashAttention tiling
 
-1. **Tile attention over query positions**: Instead of computing full (128, 128) attention
-   scores, compute (BLOCK_Q, 128) tiles. Use online softmax for each query block.
-   Reduces attention tensor from 16K to ~4K elements = ~48 fewer registers/thread.
+**The CUDA C++ scaffolding is ready.** A skeleton kernel, Makefile, Python wrapper,
+and test script are in `kernels/cuda/`. The Triton kernel cannot do FlashAttention
+because Triton lacks shared memory control and can't slice register-resident 2D
+tensors. CUDA C++ solves both problems.
+
+**How to implement the CUDA kernel:**
+
+1. **Start without FlashAttention** — port the Triton kernel logic to CUDA C++ line
+   by line. Use `kernels/fused_transformer_ce.py` as reference. Get the test passing
+   (`uv run kernels/cuda/test_kernel.py` compares CUDA vs Triton output).
+
+2. **Add FlashAttention** — replace the full (128, 128) attention score computation:
+   - Compute K, V for the full sequence → store to shared memory (32KB per head)
+   - `__syncthreads()`
+   - For each query tile (BLOCK_Q=32 query positions):
+     * Compute Q_tile by having each thread compute Q for its assigned rows
+     * For each KV tile (BLOCK_KV=32): load from shared mem, compute scores
+       (32×32), apply causal mask, online softmax update
+     * Finalize attention output for this tile
+   - This reduces the attention tensor from (128,128)=16K to (32,32)=1K elements
+
+3. **Wire it into JAX** — the wrapper.py has a placeholder. Complete the XLA
+   custom_call lowering (see comments in wrapper.py). The `.so` is already built
+   and `xla_client.register_custom_call_target` is ready.
+
+4. **Benchmark** — replace the kernel call in `train_eggroll_triton.py` and run
+   `uv run benchmark.py`.
+
+**Build:** `make -C kernels/cuda/`
+**Test:** `uv run kernels/cuda/test_kernel.py`
+**Docs:** `cuda_kernels_docs/cuda_cpp/` has CUDA programming guide, tensor cores,
+and JAX FFI reference.
+
+---
+
+### MEDIUM PRIORITY: Other approaches (if CUDA C++ is too complex)
+
+1. **Tile attention over query positions in Triton**: Instead of computing full
+   (128, 128) attention scores, compute (BLOCK_Q, 128) tiles. Use online softmax.
 
    **Challenge**: Q, K, V are computed on-the-fly from register-resident h_norm.
    Tiling requires either: (a) storing h_norm to shared memory and loading tiles,
