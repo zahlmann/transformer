@@ -35,7 +35,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-HALF_POP = 8192
+HALF_POP = 4096
 SIGMA_START = 0.02
 SIGMA_DECAY = 0.998
 LR_START = 0.010
