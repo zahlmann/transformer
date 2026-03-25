@@ -38,13 +38,14 @@ TEMPERATURE = 2.0
 HALF_POP = 4096
 SIGMA_START = 0.03
 SIGMA_DECAY = 0.998
-LR_START = 0.015
-LR_DECAY = 0.95
+LR_START = 0.006
+LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.6
-N_ACCUM = 1
+ADAM_BETA2 = 0.99
+ADAM_EPS = 1e-6
 
 
 def winsorized_zscore(fitness_diffs):
@@ -87,61 +88,60 @@ def train(seed=42):
 
     from kernels.fused_transformer_ce import fused_transformer_ce_both
 
-    def train_one_batch(params, momentum_buf, key, x, y, sigma, lr):
-        def one_es_round(carry, _):
-            key_r = carry
-            key_r, vec_key = jax.random.split(key_r)
-            if HALF_POP <= total_vec_dim:
-                raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
-                Q, _ = jnp.linalg.qr(raw)
-                vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
-            else:
-                vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        key, vec_key = jax.random.split(key)
+        if HALF_POP <= total_vec_dim:
+            raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
+            Q, _ = jnp.linalg.qr(raw)
+            vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+        else:
+            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
-            ce_pos, ce_neg = fused_transformer_ce_both(
-                params["token_emb"], params["pos_emb"],
-                params["layer0.ln1.scale"], params["layer0.ln1.bias"],
-                params["layer0.attn.q"], params["layer0.attn.k"],
-                params["layer0.attn.v"], params["layer0.attn.o"],
-                params["layer0.ln2.scale"], params["layer0.ln2.bias"],
-                params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
-                params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
-                params["ln_final.scale"], params["ln_final.bias"],
-                params["output_proj"],
-                vecs, x, y, sigma, ALPHA, TEMPERATURE,
-            )
+        ce_pos, ce_neg = fused_transformer_ce_both(
+            params["token_emb"], params["pos_emb"],
+            params["layer0.ln1.scale"], params["layer0.ln1.bias"],
+            params["layer0.attn.q"], params["layer0.attn.k"],
+            params["layer0.attn.v"], params["layer0.attn.o"],
+            params["layer0.ln2.scale"], params["layer0.ln2.bias"],
+            params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
+            params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
+            params["ln_final.scale"], params["ln_final.bias"],
+            params["output_proj"],
+            vecs, x, y, sigma, ALPHA, TEMPERATURE,
+        )
 
-            fp = ce_pos.sum(axis=1) / x.shape[0]
-            fn = ce_neg.sum(axis=1) / x.shape[0]
-            diffs = fp - fn
-            shaped = winsorized_zscore(diffs)
-            scale = 1.0 / (2.0 * sigma * HALF_POP)
-
-            round_grads = {}
-            for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
-                v = vecs[:, offset:offset + vec_dim]
-                if is_2d:
-                    m, n = shape
-                    round_grads[pkey] = scale * (v[:, :m] * shaped[:, None]).T @ v[:, m:]
-                else:
-                    round_grads[pkey] = scale * (v * shaped[:, None]).sum(axis=0)
-            return key_r, (round_grads, jnp.mean(fp))
-
-        key, (all_grads, all_losses) = lax.scan(one_es_round, key, None, length=N_ACCUM)
+        fp = ce_pos.sum(axis=1) / x.shape[0]
+        fn = ce_neg.sum(axis=1) / x.shape[0]
+        diffs = fp - fn
+        shaped = winsorized_zscore(diffs)
+        scale = 1.0 / (2.0 * sigma * HALF_POP)
 
         new_params = {}
         new_momentum = {}
+        new_v = {}
+        t = step + 1  # 1-indexed for bias correction
         for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
-            avg_grad = jnp.mean(all_grads[pkey], axis=0)
+            v_pert = vecs[:, offset:offset + vec_dim]
+            if is_2d:
+                m, n = shape
+                g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
+            else:
+                g = scale * (v_pert * shaped[:, None]).sum(axis=0)
             lr_s = lr_scale_arr[idx]
-            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + avg_grad
-            new_params[pkey] = params[pkey] - lr * lr_s * new_momentum[pkey]
+            # First moment (momentum)
+            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
+            # Second moment (Adam)
+            new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
+            # Bias correction
+            m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
+            v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
+            new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
-        return new_params, new_momentum, key, jnp.mean(all_losses)
+        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
     @jax.jit
-    def train_batch(params, momentum_buf, key, x, y, sigma, lr):
-        return train_one_batch(params, momentum_buf, key, x, y, sigma, lr)
+    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr)
 
     @jax.jit
     def eval_loss(params, x, y):
@@ -161,6 +161,8 @@ def train(seed=42):
     print("=" * 20)
 
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
+    v_buf = jax.tree.map(jnp.zeros_like, params)
+    step = jnp.int32(0)
 
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
@@ -176,8 +178,8 @@ def train(seed=42):
         eloss = 0.0
         for bi in range(n_batches):
             s = bi * BATCH_SIZE
-            params, momentum_buf, key, pl = train_batch(
-                params, momentum_buf, key,
+            params, momentum_buf, v_buf, step, key, pl = train_batch(
+                params, momentum_buf, v_buf, step, key,
                 sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
             eloss += float(pl)
         eloss /= n_batches
