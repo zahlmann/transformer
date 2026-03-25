@@ -176,7 +176,7 @@ def _fused_transformer_ce_kernel(
     h_dot_bfd = tl.zeros((_SEQ,), dtype=tl.float32)
     a_fd = tl.load(vecs_ptr + vb + OFF_FD + _D_FF + offs_d)
 
-    for k in tl.static_range(0, _D_FF, _BLOCK_K):
+    for k in tl.range(0, _D_FF, _BLOCK_K):
         offs_k = k + tl.arange(0, _BLOCK_K)
 
         wu_tile = tl.load(ffn_up_ptr + offs_d[:, None] * _D_FF + offs_k[None, :]).to(tl.bfloat16)
