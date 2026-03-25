@@ -23,7 +23,7 @@ N_LAYERS = 1
 CONTEXT_LEN = 128
 BATCH_SIZE = 128
 EPOCHS = 10
-LR = 3e-4
+LR = 0.30   # tuned: gives val_loss=2.45 at 10 epochs
 SEED = 42
 
 
