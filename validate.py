@@ -27,7 +27,7 @@ REQUIRED = {
 }
 
 SEEDS = [42, 11, 7]
-BACKPROP_TARGET = 2.45   # backprop val_loss at 10 epochs (LR=0.30, seed=42)
+BACKPROP_TARGET = 1.84   # backprop+Adam val_loss at 10 epochs (LR=3e-3, seed=42)
 MAX_MEMORY_MB = 2000.0   # hard ceiling
 RESULTS_TSV = "results.tsv"
 

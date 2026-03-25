@@ -9,8 +9,8 @@ You work autonomously — run experiments, log results, and keep going.*
 
 ## Current State (2026-03-25)
 
-**Goal: match backprop val_loss (2.45) at 10 epochs, same architecture.**
-**EGGROLL BEATS BACKPROP: val_loss=2.37 (3-seed avg) vs backprop 2.45.** Gap = −0.08.
+**Goal: match backprop+Adam val_loss (1.84) at 10 epochs, same architecture.**
+**Best EGGROLL 10ep: val_loss=2.37 (3-seed avg).** Gap = 0.53 to backprop+Adam.
 
 Best config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020, LR_DECAY=0.95,
 momentum=0.5, alpha=0.50, Gaussian vectors, N_ACCUM=1.
@@ -75,12 +75,13 @@ results.tsv                   — experiment log (tab-separated)
 
 ### Backprop baselines
 
-| LR | val_loss | ppl | Time | Notes |
-|----|----------|-----|------|-------|
-| 3e-4 | 3.59 | 36.1 | 6.1s | initial under-tuned |
-| 2e-2 | 2.70 | 14.9 | 1.3s | |
-| 1e-1 | 2.50 | 12.2 | 1.3s | |
-| **3e-1** | **2.45** | **11.6** | **1.3s** | **ceiling — target to match** |
+| Optimizer | LR | val_loss | ppl | Time | Memory | Notes |
+|-----------|-----|----------|-----|------|--------|-------|
+| SGD | 3e-1 | 2.45 | 11.6 | 1.3s | 300MB | best SGD |
+| Adam | 3e-4 | 2.27 | 9.7 | 5.6s | 160MB | |
+| Adam | 1e-3 | 1.93 | 6.9 | 4.1s | 160MB | |
+| **Adam** | **3e-3** | **1.84** | **6.3** | **4.1s** | **160MB** | **ceiling — target to match** |
+| Adam | 1e-2 | 1.91 | 6.8 | 4.1s | 160MB | |
 
 ### EGGROLL results (10 epochs, bf16)
 
@@ -97,7 +98,8 @@ results.tsv                   — experiment log (tab-separated)
 | triton, pop=8192, Adam (0.9, 0.999), σ=0.02, LR=0.010 | 2.50 | 12.2 | 220s | |
 | triton, **pop=16384**, Adam (0.9, 0.999), σ=0.02, LR=0.010 | **2.37** | **10.7** | **444s** | **BEATS BACKPROP (3-seed)** |
 
-**EGGROLL BEATS BACKPROP: 2.37 vs 2.45 = −0.08 (3-seed validated)**
+**Note: EGGROLL beats vanilla SGD backprop (2.37 vs 2.45) but NOT backprop+Adam (1.84).**
+**Current gap to fair target: 2.37 − 1.84 = 0.53**
 
 ### What did NOT work (at more epochs — invalid approach)
 

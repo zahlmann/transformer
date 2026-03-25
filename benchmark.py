@@ -12,8 +12,8 @@ import re
 import time
 
 BACKPROP_BASELINE = {
-    "val_loss": 2.45,    # backprop with LR=0.30, seed=42, 10 epochs
-    "training_time_s": 1.3,
+    "val_loss": 1.84,    # backprop+Adam with LR=3e-3, seed=42, 10 epochs
+    "training_time_s": 4.1,
 }
 
 
