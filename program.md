@@ -13,27 +13,27 @@ only pursue them if a speed optimization opens a quality opportunity for free.**
 
 ## Current State (2026-03-25)
 
-**Quality:** EGGROLL val_loss=2.37 vs backprop+Adam 1.84 at 10 epochs.
-Gap = 0.53 to backprop+Adam. Beats vanilla SGD backprop (2.37 vs 2.45).
-Not the priority right now, but still an open problem.
+**Quality:** EGGROLL val_loss=2.44 (3-seed avg ~2.48) vs backprop+Adam 1.84.
+Gap = 0.64 to backprop+Adam. Beats vanilla SGD backprop (2.44 vs 2.45).
 
-**Speed: 444s for 10 epochs.** This is the priority. Backprop+Adam takes 4.1s.
-The speed gap is 108x. Reduce this as much as possible.
+**Speed: 175s for 10 epochs (was 444s).** 2.5x speedup achieved.
+Backprop+Adam takes 4.1s. Speed gap is 43x (was 108x).
 
-**Memory: 113MB.** Already lower than backprop (160MB with Adam, 300MB with SGD).
+**Memory: 70MB (was 113MB).** Lower due to reduced population.
 
 ---
 
 ## Speed Budget Breakdown
 
 Profiling shows 99% of time is in forward passes (the Triton kernel).
-Current: 444s for 10 epochs = 44.4s/epoch. Each epoch has 61 batches.
-Per batch: ~730ms. Per batch, kernel processes 16384 perturbation members (8192 pairs × 2 signs).
+Current: 175s for 10 epochs = 17.5s/epoch. Each epoch has 61 batches.
+Per batch: ~287ms. Per batch, kernel processes 8192 perturbation members (4096 pairs × 2 signs).
 
-The Triton kernel runs in ~180ms per call (HALF_POP=8192). It's called once per batch.
-Remaining ~550ms per batch is QR decomposition + gradient computation + Adam update.
+The Triton kernel runs in ~285ms per call (HALF_POP=4096, num_warps=4).
+Gradient computation + Adam update: ~0.2ms (negligible after JIT).
+QR decomposition: skipped (HALF_POP=4096 > vec_dim=2306, uses Gaussian).
 
-Key metric: **time per batch** and **time per forward pass**.
+Key metric: **time per batch** and **kernel time**.
 
 ---
 
@@ -76,7 +76,35 @@ that degrades quality beyond this threshold is rejected.
 
 ---
 
-## What to Try Next (SPEED — reduce the 108x gap)
+## What Worked (Speed Session 2026-03-25)
+
+1. **HALF_POP 8192→4096** (444s→220s, 2x): Halves kernel and gradient work.
+   Quality maintained (val_loss 2.39 at seed=42). HALF_POP<4096 fails quality threshold.
+
+2. **num_warps 8→4** (220s→180s, 18%): Fewer threads per block = more blocks per SM.
+   Despite register spilling, better occupancy wins. num_warps=2 is much slower (423s),
+   num_warps=16 also slower (370s).
+
+3. **BLOCK_K 64→32** (180s→176s, 2%): Smaller FFN tiles = less register pressure per
+   iteration. Marginal improvement.
+
+## What Did NOT Work (Speed Session 2026-03-25)
+
+- **FP8 tensor cores** (260s, slower): Register pressure from casts outweighs tensor
+  core gains. Quality also degraded (2.53 vs 2.39).
+- **Batch tiling** (BATCH_TILE=2 via tl.static_range): Triton compile timeout (>600s).
+  The unrolled code was too large.
+- **HALF_POP<4096**: All configs below 4096 fail the 2.50 quality threshold on 3-seed avg.
+  Best was 3072+sigma=0.015 at 2.506 — barely over.
+- **Adaptive HALF_POP** (4096 early, 2048/3072 late): Quality fails on seed 7 consistently.
+  Best 3-seed avg was 2.507 — barely over.
+- **CPU pre-shuffle**: No speed gain (GPU permutation is already fast).
+- **Per-batch float() sync removal**: No speed gain (XLA handles pipelining through data deps).
+- **VOCAB_PAD reduction** (128→80): Triton requires power-of-2 arange sizes. Can't reduce.
+
+---
+
+## What to Try Next (SPEED — reduce the 43x gap)
 
 ### Kernel optimizations (highest impact)
 
@@ -148,7 +176,7 @@ that degrades quality beyond this threshold is rejected.
 ## Current Best Hyperparameters
 
 ```python
-HALF_POP = 8192          # antithetic pairs → pop=16384
+HALF_POP = 4096          # antithetic pairs → pop=8192 (was 8192→16384)
 SIGMA_START = 0.02       # perturbation scale
 SIGMA_DECAY = 0.998      # per epoch
 LR_START = 0.010         # Adam learning rate
@@ -193,7 +221,8 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 | Triton, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
 | Triton, pop=8192, SGD+mom | 2.64 | 14.0 | 220s | |
 | Triton, pop=8192, Adam, σ=0.02 | 2.50 | 12.2 | 220s | Adam breakthrough |
-| **Triton, pop=16384, Adam, σ=0.02** | **2.37** | **10.7** | **444s** | **current best** |
+| Triton, pop=16384, Adam, σ=0.02 | 2.37 | 10.7 | 444s | previous best |
+| **Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32** | **2.44** | **11.4** | **175s** | **current best** |
 
 ---
 
