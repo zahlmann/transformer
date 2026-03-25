@@ -41,7 +41,7 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $<
 	@echo "Built $@ (SM $(SM))"
-	@echo "Shared memory per block: $$(python3 -c 'print(128*32*4*2 + 128*4, "bytes =", (128*32*4*2 + 128*4)/1024, "KB")')"
+	@echo "Shared memory per block: $$(python3 -c 'print(128*64*2 + 64*32*2 + 128*32*4*2 + 128*4, "bytes =", (128*64*2 + 64*32*2 + 128*32*4*2 + 128*4)/1024, "KB (WMMA layout)")')"
 
 clean:
 	rm -f $(TARGET)
