@@ -145,35 +145,41 @@ that degrades quality beyond this threshold is rejected.
 (register pressure from the 128×128 attention matrix). Focus on reducing register
 pressure or changing the computation structure.
 
-### HIGH PRIORITY: Add WMMA tensor cores to the CUDA kernel
+### COMPLETED BUT UNSUCCESSFUL: CUDA C++ kernel with WMMA + FlashAttention
 
-**The CUDA kernel is COMPLETE and CORRECT but needs tensor cores for speed.**
-The scalar FP32 kernel (3860ms) is 14x slower than Triton (271ms). The JAX binding
-works. The only missing piece is WMMA for the big matmuls.
+**Tried and failed.** The CUDA kernel with WMMA tensor cores (3141ms) and
+FlashAttention via shared memory is still 11x slower than Triton (274ms).
 
-**Current state:** `kernels/cuda/fused_transformer_ce.cu` (664 lines) has the full
-forward pass with FlashAttention tiling via shared memory. Validated against Triton
-(max diff 0.0004). Build: `make -C kernels/cuda/`. JAX binding in `wrapper.py` uses
-stablehlo.custom_call with PyCapsule + scalars in opaque struct.
+**Why Triton wins:** Triton automatically uses tensor cores for ALL tl.dot
+operations and optimizes the entire kernel holistically (register allocation,
+instruction scheduling, memory access patterns). A hand-written CUDA kernel
+can't match this because:
+- WMMA requires shared memory staging (load from global → shared → WMMA fragments → shared → thread registers), adding overhead
+- The 52.5KB shared memory for WMMA limits occupancy to 1 block/SM (same as Triton)
+- Non-WMMA code (Q/O projection, FlashAttention, perturbation, LN, CE) runs as slow scalar FP32
 
-**How to add WMMA:**
+**Infrastructure exists** (if someone finds a way to make CUDA competitive):
+- Build: `make -C kernels/cuda/`
+- JAX binding: `kernels/cuda/wrapper.py` (XLA custom_call, PyCapsule, scalars-in-opaque)
+- Correctness: validated (max diff 0.0005 vs Triton)
 
-1. **Identify the hot matmuls** — These account for ~80% of compute:
-   - QKV projection: h_norm @ W = (128,64) × (64,32) per head, 6 total
-   - FFN up: h_norm2 @ W_up = (128,64) × (64,32) per tile, 8 tiles
-   - FFN down: act @ W_down = (128,32) × (32,64) per tile, 8 tiles
-   - Output proj: h_final @ W_out = (128,64) × (64,128)
+### What to try next (beyond current approach)
 
-2. **WMMA tile: 16×16×16 bf16** — For (128,64) × (64,32):
-   - M_tiles=8, K_tiles=4, N_tiles=2 → 64 WMMA operations
-   - 4 warps handle 16 operations each
-   - Input must be in shared memory (h_norm bf16: 16KB, weight tile: 4KB)
-   - Output: WMMA fragment registers → store to shared memory → load per-thread
+The Triton kernel at 175s/10 epochs is near-optimal for this hardware (RTX 4080
+SUPER) and algorithm (EGGROLL with HALF_POP=4096). Further speed improvements require:
 
-3. **Shared memory budget** — 48KB target for 2 blocks/SM occupancy:
-   - h_norm bf16 (128×64×2=16KB) + weight tile (4KB) + K/V (32KB) = 52KB
-   - Tight but feasible. Process QKV sequentially, reuse h_norm space after.
-   - Or: use bf16 for K/V in shared memory (saves 16KB)
+1. **Different ES algorithm**: CMA-ES or natural gradient ES needs fewer population
+   members (100-500 instead of 4096) for the same gradient quality. This would
+   reduce kernel work by 4-40x. Major algorithmic change.
+
+2. **Gradient accumulation**: Process smaller populations per batch but accumulate
+   over multiple batches. Quality unclear.
+
+3. **Different hardware**: A100/H100 with more SMs and higher tensor core throughput.
+
+4. **Mixed-precision perturbation**: Store perturbation vectors in bf16 instead of
+   f32. Saves memory bandwidth but risks quality (sigma=0.02 perturbations have
+   limited precision in bf16).
 
 4. **Keep FlashAttention scalar** — The attention score computation (Q @ K_tile^T)
    and V accumulation (scores @ V_tile) are small (32×32 tiles) and can stay scalar.
