@@ -6,18 +6,18 @@ quality. Focus on speed and memory optimization — kernel fusion, fp8, populati
 reduction, compilation tricks, anything that reduces wall-clock time. You work
 autonomously — run experiments, log results, and keep going.*
 
-**Your sole focus is SPEED OPTIMIZATION. Do not work on quality improvements.**
+**Your priority is SPEED OPTIMIZATION. Quality improvements are secondary —
+only pursue them if a speed optimization opens a quality opportunity for free.**
 
 ---
 
 ## Current State (2026-03-25)
 
-**Quality: DONE.** EGGROLL val_loss=2.37 vs backprop+Adam 1.84 at 10 epochs.
-There is a quality gap but closing it requires fundamental ES algorithm research
-beyond the scope of this work. The current quality is good enough — EGGROLL beats
-vanilla SGD backprop (2.37 vs 2.45).
+**Quality:** EGGROLL val_loss=2.37 vs backprop+Adam 1.84 at 10 epochs.
+Gap = 0.53 to backprop+Adam. Beats vanilla SGD backprop (2.37 vs 2.45).
+Not the priority right now, but still an open problem.
 
-**Speed: 444s for 10 epochs.** This is the bottleneck. Backprop+Adam takes 4.1s.
+**Speed: 444s for 10 epochs.** This is the priority. Backprop+Adam takes 4.1s.
 The speed gap is 108x. Reduce this as much as possible.
 
 **Memory: 113MB.** Already lower than backprop (160MB with Adam, 300MB with SGD).
