@@ -297,6 +297,6 @@ def fused_transformer_ce_both(
         grid=(HALF_POP, BATCH, 2),
         HALF_POP=HALF_POP,
         BATCH=BATCH,
-        num_warps=8,
+        num_warps=4,
         num_stages=1,
     )
