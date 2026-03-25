@@ -17,8 +17,9 @@ only pursue them if a speed optimization opens a quality opportunity for free.**
    under "ALREADY ELIMINATED", then delete the code.
 4. **No sweep/search scripts on main** — run them on branches, record results
    in this file, delete the scripts before merging.
-5. **Kernel code** — only the working fused Triton kernel in `kernels/`. Experimental
-   kernel variants (CUDA, split kernel, etc.) live on branches only.
+5. **Kernel code** — the fused Triton kernel in `kernels/` is production. The CUDA
+   kernel in `kernels/cuda/` is working infrastructure (correct, JAX binding works,
+   needs speed optimization). Keep both. Delete truly broken experiments only.
 6. **Keep**: data.py, model.py, benchmark.py, validate.py, profile_triton.py,
    validate_kernel.py, results.tsv, program.md, README.md
 
