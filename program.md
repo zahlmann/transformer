@@ -10,7 +10,7 @@ You work autonomously — run experiments, log results, and keep going.*
 ## Current State (2026-03-25)
 
 **Goal: match backprop val_loss (2.45) at 10 epochs, same architecture.**
-**Best EGGROLL 10ep: val_loss=2.64.** Gap = 0.19.
+**Best EGGROLL 10ep: val_loss=2.60.** Gap = 0.15.
 
 Best config: `train_eggroll_triton.py` with HALF_POP=4096, LR=0.020, LR_DECAY=0.95,
 momentum=0.5, alpha=0.50, Gaussian vectors, N_ACCUM=1.
@@ -91,9 +91,10 @@ results.tsv                   — experiment log (tab-separated)
 | bf16, pop=2048, alpha=0.50, mom=0.5 | 2.70 | 14.8 | 270s | alpha+momentum |
 | bf16, pop=4096 (accum=2), ortho QR | 2.67 | 14.4 | 540s | best JAX vmap |
 | triton kernel, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
-| triton, pop=8192, LR=0.020, decay=0.95 | **2.64** | **14.0** | **220s** | **best 10ep** |
+| triton, pop=8192, LR=0.020, decay=0.95 | 2.64 | 14.0 | 220s | best SGD+momentum |
+| triton, pop=8192, **Adam** (β1=0.6, β2=0.99), LR=0.006, σ=0.03 | **2.60** | **13.5** | **219s** | **best 10ep** |
 
-**Current gap: 2.64 − 2.45 = 0.19**
+**Current gap: 2.60 − 2.45 = 0.15**
 
 ### What did NOT work (at more epochs — invalid approach)
 
@@ -133,6 +134,13 @@ Eliminates all HBM intermediate writes. Validated: max rel error 0.01%.
 ### 8. Per-subgroup Winsorized z-score
 K=8 subgroups, clip ±2.0. Same as MNIST.
 
+### 10. Adam optimizer with bias correction (−0.04 loss)
+Proper Adam (β1=0.6, β2=0.99, eps=1e-6) with bias correction. The earlier attempt
+without bias correction diverged because v starts at zero → 1/sqrt(v+eps) is enormous.
+Bias correction: m_hat = m/(1-β1^t), v_hat = v/(1-β2^t) handles the cold start.
+Key: no LR decay needed (Adam self-adjusts). LR=0.006 is optimal (tested 0.003-0.012).
+Note β1=0.6 matches the momentum parameter — Adam's first moment IS the momentum.
+
 ### 9. Higher population with kernel speed
 Kernel enables pop=8192 in 220s (was 540s for pop=4096 without kernel). Larger pop
 gives −0.03 loss at 10 epochs.
@@ -149,9 +157,15 @@ gives −0.03 loss at 10 epochs.
 6. **Nested lax.scan for epoch** — 32s JIT, no speed gain
 7. **Large POP_CHUNK** — memory saturation at >16
 8. **T=3.0** — gradient signal too weak
-9. **Adam-like adaptive LR** — catastrophic divergence (v starts at zero)
+9. **Adam WITHOUT bias correction** — catastrophic divergence (v starts at zero).
+   Adam WITH bias correction works well — see "What Worked" #10.
 10. **Cosine LR schedule** — no improvement over exponential decay
 11. **More epochs** — invalid comparison; backprop also improves with more epochs
+12. **Per-parameter gradient clipping** — clips gradient norms to 1.0, massively degrades
+    quality (2.92 vs 2.64). Winsorized z-score already controls gradient magnitude.
+13. **Within-batch guided perturbations** — split pop into 25% explore + 75% guided.
+    Rank-1 SVD of rough gradient for guide direction. Result: 2.66, within noise of
+    baseline. The rough gradient from 1024 explore perturbations is too noisy to guide.
 
 ---
 
