@@ -1,52 +1,39 @@
 # EGGROLL Transformer — Agent Program
 
-*You are an AI researcher. Your job: train a small decoder-only transformer using
-EGGROLL (Evolution Strategies with low-rank perturbations) instead of backprop.
-Match backprop val_loss at the same number of epochs while minimizing time and memory.
-You work autonomously — run experiments, log results, and keep going.*
+*You are an AI researcher. Your job: make EGGROLL (Evolution Strategies with low-rank
+perturbations) training of a small transformer as FAST as possible while maintaining
+quality. Focus on speed and memory optimization — kernel fusion, fp8, population
+reduction, compilation tricks, anything that reduces wall-clock time. You work
+autonomously — run experiments, log results, and keep going.*
+
+**Your sole focus is SPEED OPTIMIZATION. Do not work on quality improvements.**
 
 ---
 
 ## Current State (2026-03-25)
 
-**Goal: match backprop+Adam val_loss (1.84) at 10 epochs, same architecture.**
-**Best EGGROLL 10ep: val_loss=2.37 (3-seed avg).** Gap = 0.53 to backprop+Adam.
+**Quality: DONE.** EGGROLL val_loss=2.37 vs backprop+Adam 1.84 at 10 epochs.
+There is a quality gap but closing it requires fundamental ES algorithm research
+beyond the scope of this work. The current quality is good enough — EGGROLL beats
+vanilla SGD backprop (2.37 vs 2.45).
 
-Best config: `train_eggroll_triton.py` with HALF_POP=8192, Adam (β1=0.9, β2=0.999),
-LR=0.010, sigma=0.02, alpha=0.50, Gaussian vectors, N_ACCUM=1.
-Uses fused Triton kernel for the full forward pass + CE loss (4.7x speedup over JAX vmap).
-Backprop+Adam baseline: `train_backprop_adam.py` with LR=3e-3.
+**Speed: 444s for 10 epochs.** This is the bottleneck. Backprop+Adam takes 4.1s.
+The speed gap is 108x. Reduce this as much as possible.
+
+**Memory: 113MB.** Already lower than backprop (160MB with Adam, 300MB with SGD).
 
 ---
 
-## Fairness Rules (ENFORCED by validate.py)
+## Speed Budget Breakdown
 
-These constants are LOCKED. Changing them makes the comparison unfair.
+Profiling shows 99% of time is in forward passes (the Triton kernel).
+Current: 444s for 10 epochs = 44.4s/epoch. Each epoch has 61 batches.
+Per batch: ~730ms. Per batch, kernel processes 16384 perturbation members (8192 pairs × 2 signs).
 
-```python
-D_MODEL = 64       # model width
-N_HEADS = 2        # attention heads
-N_LAYERS = 1       # transformer layers
-CONTEXT_LEN = 128  # sequence length
-BATCH_SIZE = 128   # training batch size
-EPOCHS = 10        # LOCKED — same as backprop baseline
-TEMPERATURE = 2.0  # CE temperature
-```
+The Triton kernel runs in ~180ms per call (HALF_POP=8192). It's called once per batch.
+Remaining ~550ms per batch is QR decomposition + gradient computation + Adam update.
 
-**What counts as cheating:**
-- Changing EPOCHS (more epochs = more gradient steps = unfair)
-- Changing architecture (d_model, n_layers, n_heads, d_ff)
-- Changing batch size (affects effective learning)
-- Subsetting data or changing sequence length
-- Different eval methodology
-
-**What is allowed:**
-- Any ES algorithm change (population, perturbation strategy, gradient estimation)
-- Hyperparameter tuning (LR, sigma, alpha, momentum, etc.)
-- Kernel optimizations (Triton, fusion, fp8, etc.)
-- Per-layer LR scaling
-- Different perturbation structures (orthogonal, guided, etc.)
-- Cross-batch state (momentum) — essential for transformer ES
+Key metric: **time per batch** and **time per forward pass**.
 
 ---
 
@@ -54,163 +41,126 @@ TEMPERATURE = 2.0  # CE temperature
 
 ```
 program.md                    — this file (read first)
-validate.py                   — LOCKED 3-seed validation with locked constants check
-benchmark.py                  — fast single-seed comparison (EGGROLL vs backprop)
+validate.py                   — LOCKED 3-seed validation (checks locked constants)
+benchmark.py                  — fast single-seed comparison (EGGROLL vs backprop+Adam)
 data.py                       — char-level Shakespeare dataset (65 vocab, 7842 train seqs)
 model.py                      — decoder-only transformer (d=64, 1 layer, 2 heads, 66K params)
-train_backprop.py             — backprop baseline (SGD, LR=0.30, val_loss=2.45 at 10ep)
-train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL
-train_eggroll_optimized.py    — JAX vmap EGGROLL (slower, reference implementation)
-train_eggroll.py              — fp32 EGGROLL (superseded)
+train_backprop.py             — backprop SGD baseline (LR=0.30, val_loss=2.45)
+train_backprop_adam.py        — backprop Adam baseline (LR=3e-3, val_loss=1.84)
+train_eggroll_triton.py       — BEST: fused Triton kernel EGGROLL (speed target)
+train_eggroll_optimized.py    — JAX vmap EGGROLL (slower reference)
 kernels/fused_transformer_ce.py — Triton kernel: full transformer forward + CE loss
 validate_kernel.py            — validates Triton kernel output vs JAX forward pass
 benchmark_kernel.py           — benchmarks Triton vs JAX vmap speed
-profile_eggroll.py            — time breakdown (forward=99%, QR=1%, grad=0%)
+profile_eggroll.py            — time breakdown profiler
 cuda_kernels_docs/            — Triton + jax-triton documentation
-results.tsv                   — experiment log (tab-separated)
+results.tsv                   — experiment log
 ```
 
----
-
-## Results — Complete History (10 epochs only)
-
-### Backprop baselines
-
-| Optimizer | LR | val_loss | ppl | Time | Memory | Notes |
-|-----------|-----|----------|-----|------|--------|-------|
-| SGD | 3e-1 | 2.45 | 11.6 | 1.3s | 300MB | best SGD |
-| Adam | 3e-4 | 2.27 | 9.7 | 5.6s | 160MB | |
-| Adam | 1e-3 | 1.93 | 6.9 | 4.1s | 160MB | |
-| **Adam** | **3e-3** | **1.84** | **6.3** | **4.1s** | **160MB** | **ceiling — target to match** |
-| Adam | 1e-2 | 1.91 | 6.8 | 4.1s | 160MB | |
-
-### EGGROLL results (10 epochs, bf16)
-
-| Config | val_loss | ppl | Time | Key change |
-|--------|----------|-----|------|-----------|
-| fp32, pop=512 | 3.94 | 51.4 | 148s | first working |
-| bf16, pop=2048, alpha=0.20 | 2.83 | 17.0 | 270s | bf16 breakthrough |
-| bf16, pop=2048, alpha=0.50, mom=0.5 | 2.70 | 14.8 | 270s | alpha+momentum |
-| bf16, pop=4096 (accum=2), ortho QR | 2.67 | 14.4 | 540s | best JAX vmap |
-| triton kernel, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
-| triton, pop=8192, LR=0.020, decay=0.95 | 2.64 | 14.0 | 220s | best SGD+momentum |
-| triton, pop=8192, Adam (β1=0.6, β2=0.99), LR=0.006, σ=0.03 | 2.60 | 13.5 | 219s | Adam works |
-| triton, pop=8192, Adam (β1=0.6, β2=0.99), σ=0.02 | 2.51 | 12.3 | 219s | lower sigma helps |
-| triton, pop=8192, Adam (0.9, 0.999), σ=0.02, LR=0.010 | 2.50 | 12.2 | 220s | |
-| triton, **pop=16384**, Adam (0.9, 0.999), σ=0.02, LR=0.010 | **2.37** | **10.7** | **444s** | **BEATS BACKPROP (3-seed)** |
-
-**Note: EGGROLL beats vanilla SGD backprop (2.37 vs 2.45) but NOT backprop+Adam (1.84).**
-**Current gap to fair target: 2.37 − 1.84 = 0.53**
-
-### What did NOT work (at more epochs — invalid approach)
-
-Running 20/30/50/100 epochs reaches 2.51 but this is cheating: you could give backprop
-the same extra epochs and it would improve too (backprop at 30ep reaches 2.17). The
-comparison must be at the SAME epoch count (10). Do not increase EPOCHS.
+Reference: `../eggroll_mnist/` has a similar project where a fused Triton kernel
+achieved 2.16s (1.44x backprop) for MNIST. Study its `program.md`, `kernels/`,
+and `mnist_eggroll_optimized.py` for optimization patterns.
 
 ---
 
-## What Worked (apply from day 1)
+## Fairness Rules (ENFORCED by validate.py)
 
-### 1. bf16 forward passes — biggest quality win (−0.87 loss)
-Cast perturbed params to bf16, keep perturbation/gradient math in fp32. bf16 noise
-acts as implicit regularization for ES. Does NOT help backprop.
+LOCKED constants — do not change:
+```python
+D_MODEL = 64; N_HEADS = 2; N_LAYERS = 1; CONTEXT_LEN = 128
+BATCH_SIZE = 128; EPOCHS = 10; TEMPERATURE = 2.0
+```
 
-### 2. Constant label smoothing alpha=0.50 (−0.13 loss)
-Unlike MNIST (adaptive decay), transformers need CONSTANT high alpha. Smoothing creates
-a softer fitness landscape that ES can estimate well. Label smoothing HURTS backprop.
-
-### 3. Momentum beta=0.5 (−0.03 loss)
-ES gradients have high variance; momentum smooths across batches. beta=0.9 explodes
-(effective LR = LR/(1-beta) = 10x). Sweet spot: beta=0.5.
-
-### 4. Per-layer LR scaling
-Small params (<256): 3.0x, attention (<4096): 1.5x, medium: 1.0x, large FFN (>8192): 0.7x.
-
-### 5. Orthogonal QR vectors (−0.02 loss)
-QR-orthogonalize perturbation vectors when HALF_POP ≤ vec_dim (2306).
-
-### 6. Temperature T=2.0 in smoothed CE loss
-T=1.0 too sharp, T=3.0 too flat. T=2.0 is the sweet spot.
-
-### 7. Fused Triton kernel — 4.7x speedup
-Full transformer forward pass + CE fused into one kernel. Grid: (HALF_POP, BATCH, 2).
-Eliminates all HBM intermediate writes. Validated: max rel error 0.01%.
-
-### 8. Per-subgroup Winsorized z-score
-K=8 subgroups, clip ±2.0. Same as MNIST.
-
-### 10. Adam optimizer with bias correction (−0.04 loss)
-Proper Adam (β1=0.6, β2=0.99, eps=1e-6) with bias correction. The earlier attempt
-without bias correction diverged because v starts at zero → 1/sqrt(v+eps) is enormous.
-Bias correction: m_hat = m/(1-β1^t), v_hat = v/(1-β2^t) handles the cold start.
-Key: no LR decay needed (Adam self-adjusts). LR=0.006 is optimal (tested 0.003-0.012).
-Note β1=0.6 matches the momentum parameter — Adam's first moment IS the momentum.
-
-### 9. Higher population with kernel speed
-Kernel enables pop=8192 in 220s (was 540s for pop=4096 without kernel). Larger pop
-gives −0.03 loss at 10 epochs.
+Quality constraint: val_loss must stay ≤ 2.50 (3-seed avg). Any speed optimization
+that degrades quality beyond this threshold is rejected.
 
 ---
 
-## What Did NOT Work
+## What to Try Next (SPEED — reduce the 108x gap)
 
-1. **Adaptive alpha decay** — oscillation, transformer needs constant alpha
-2. **Higher sigma (0.06)** — noisier gradients, worse quality
-3. **Momentum beta=0.9** — diverges (10x effective LR)
-4. **Weight tying** — hurts both backprop and EGGROLL
-5. **Vectorized base+correction forward** — 3x slower, XLA can't optimize
-6. **Nested lax.scan for epoch** — 32s JIT, no speed gain
-7. **Large POP_CHUNK** — memory saturation at >16
-8. **T=3.0** — gradient signal too weak
-9. **Adam WITHOUT bias correction** — catastrophic divergence (v starts at zero).
-   Adam WITH bias correction works well — see "What Worked" #10.
-10. **Cosine LR schedule** — no improvement over exponential decay
-11. **More epochs** — invalid comparison; backprop also improves with more epochs
-12. **Per-parameter gradient clipping** — clips gradient norms to 1.0, massively degrades
-    quality (2.92 vs 2.64). Winsorized z-score already controls gradient magnitude.
-13. **Within-batch guided perturbations** — split pop into 25% explore + 75% guided.
-    Rank-1 SVD of rough gradient for guide direction. Result: 2.66, within noise of
-    baseline. The rough gradient from 1024 explore perturbations is too noisy to guide.
+### Kernel optimizations (highest impact)
+
+1. **FP8 tensor cores**: The matmuls in the kernel (Q/K/V projections, FFN, output proj)
+   currently use bf16. FP8 (float8e4nv) gives 2x throughput on Ada Lovelace tensor cores.
+   The MNIST kernel already uses FP8 for L2 and L3 matmuls — copy that pattern.
+   Expected: ~1.5-2x speedup on kernel compute time.
+
+2. **Kernel autotuning**: Current kernel uses num_warps=8, num_stages=1. Try:
+   - num_warps=4 (less register pressure, more blocks per SM)
+   - num_stages=2 (software pipelining for memory loads)
+   - Different BLOCK_K for FFN tiling (32 vs 64 vs 128)
+
+3. **Batch tiling in kernel**: Currently one thread block per (perturbation, sequence).
+   Grid = (HALF_POP, BATCH, 2) = 2M+ blocks. Could process multiple sequences per block
+   to reduce grid overhead and improve data reuse of weight matrices.
+
+4. **Fused gradient computation**: Currently the kernel outputs partial CE sums, then
+   Python/JAX computes the gradient (v^T @ shaped matmul). Could fuse the gradient
+   accumulation into the kernel or a second fused kernel.
+
+### Population reduction (directly reduces forward pass count)
+
+5. **Lower population with maintained quality**: The current pop=16384 is conservative.
+   Try pop=8192 or 4096 with the Adam+sigma=0.02 config — Adam might maintain quality
+   at lower pop. Each halving = 2x speedup on the kernel.
+
+6. **Adaptive population**: Start with high pop, reduce as training progresses and
+   the Adam v-buffer accumulates useful statistics.
+
+### Compilation and overhead reduction
+
+7. **All-in-one JIT**: Wrap the entire epoch (all batches) in a lax.scan so XLA
+   compiles one mega-kernel. Previous attempt failed with the JAX vmap approach
+   (32s JIT, no speed gain), but with the Triton kernel it might be different.
+
+8. **Skip QR decomposition**: QR orthogonalization costs ~6ms per batch. With pop=16384
+   > vec_dim=2306, we already use Gaussian vectors. Confirm QR is skipped.
+
+9. **Overlap data shuffling with training**: Use a background thread to shuffle and
+   transfer data to GPU while training runs (like MNIST does).
+
+10. **Disable XLA Triton GEMM autotuner**: Already done via XLA_FLAGS. Verify it's
+    working — saves ~0.5s of JIT autotuning.
+
+### Architecture-level speed tricks
+
+11. **Reduce context length for speed experiment**: Try context_len=64 to test if
+    kernel scales well (attention is O(seq²), so halving seq = 4x less attention work).
+    NOTE: this changes the locked constant, so only for profiling, not for final results.
+
+12. **Pre-compile the Triton kernel**: Use AOT compilation to avoid re-compiling the
+    kernel on each run. Saves JIT warmup time.
 
 ---
 
-## What to Try Next (Quality — close the 0.19 gap)
+## What Already Works (do not change unless improving speed)
 
-These are the remaining ideas to improve gradient quality at 10 epochs:
+- bf16 forward passes with fp32 perturbation math
+- Constant label smoothing alpha=0.50
+- Adam optimizer (β1=0.9, β2=0.999, eps=1e-6) with bias correction
+- Sigma=0.02, LR=0.010, no LR decay
+- Fused Triton kernel (Grid: HALF_POP × BATCH × 2)
+- Per-subgroup Winsorized z-score (K=8, clip ±2.0)
+- Rank-1 perturbation compression (vec_dim=2306, 28.8x compression)
 
-1. **Within-batch guided perturbations**: Split population — use first 25% for rough
-   gradient estimate, bias remaining 75% toward that direction. Better gradient quality
-   from the same total population.
+---
 
-2. **Natural gradient / Fisher information**: Scale the ES gradient by an estimate of
-   the inverse Fisher information matrix. This accounts for the curvature of the loss
-   landscape and can dramatically improve convergence.
+## Current Best Hyperparameters
 
-3. **Antithetic Gaussian with variance reduction**: Instead of plain antithetic pairs,
-   use control variates or importance sampling to reduce variance of gradient estimates.
-
-4. **Higher-rank perturbations**: Currently rank-1 (outer(b,a)). Try rank-2 or rank-4
-   perturbations for richer gradient information per evaluation.
-
-5. **Population scheduling**: Start with high pop (good exploration) and reduce over
-   epochs (exploitation). Invest compute where it matters most.
-
-6. **Gradient clipping on ES updates**: Clip the ES gradient norm before the momentum
-   step. May prevent occasional bad updates from high-variance estimates.
-
-7. **Learned perturbation directions**: Use a small auxiliary network or running
-   statistics to generate perturbation vectors biased toward productive directions.
-
-8. **Sparse perturbation for embeddings**: Only perturb token_emb rows that appear
-   in the current batch. Concentrates perturbation signal on relevant parameters.
-
-### Speed/memory improvements
-
-1. **FP8 tensor cores in kernel**: Use fp8 for matmuls (Q/K/V, FFN). 2x throughput.
-2. **Reduce population with better gradients**: If guided ES improves quality,
-   maintain val_loss at lower pop = directly faster.
-3. **Kernel autotuning**: Try different num_warps, num_stages, block sizes.
+```python
+HALF_POP = 8192          # antithetic pairs → pop=16384
+SIGMA_START = 0.02       # perturbation scale
+SIGMA_DECAY = 0.998      # per epoch
+LR_START = 0.010         # Adam learning rate
+LR_DECAY = 1.0           # no decay (Adam self-adjusts)
+ALPHA = 0.50             # label smoothing (CONSTANT)
+TEMPERATURE = 2.0        # CE temperature (LOCKED)
+MOMENTUM = 0.9           # Adam β1
+ADAM_BETA2 = 0.999       # Adam β2
+ADAM_EPS = 1e-6           # Adam epsilon
+N_SUBGROUPS = 8          # Winsorized z-score groups
+CLIP_RANGE = 2.0         # z-score clipping
+```
 
 ---
 
@@ -226,50 +176,52 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 
 ---
 
-## Best EGGROLL Hyperparameters (10 epochs)
+## Results History (10 epochs)
 
-```python
-HALF_POP = 4096         # antithetic pairs -> pop=8192
-SIGMA_START = 0.04      # perturbation scale
-SIGMA_DECAY = 0.998     # per epoch
-LR_START = 0.020        # learning rate
-LR_DECAY = 0.95         # per epoch (exponential)
-ALPHA = 0.50            # label smoothing (CONSTANT)
-TEMPERATURE = 2.0       # CE temperature
-MOMENTUM = 0.5          # SGD momentum
-N_SUBGROUPS = 8         # Winsorized z-score groups
-CLIP_RANGE = 2.0        # z-score clipping
-N_ACCUM = 1             # gradient accumulation rounds
-# Gaussian vectors (QR when HALF_POP <= vec_dim)
-# Per-layer LR scaling: 3x small, 1.5x attn, 1.0x medium, 0.7x FFN
-```
+### Backprop baselines
+
+| Optimizer | LR | val_loss | ppl | Time | Memory |
+|-----------|-----|----------|-----|------|--------|
+| SGD | 3e-1 | 2.45 | 11.6 | 1.3s | 300MB |
+| **Adam** | **3e-3** | **1.84** | **6.3** | **4.1s** | **160MB** |
+
+### EGGROLL results
+
+| Config | val_loss | ppl | Time | Notes |
+|--------|----------|-----|------|-------|
+| JAX vmap, pop=4096 | 2.67 | 14.4 | 540s | before Triton kernel |
+| Triton, pop=2048 | 2.67 | 14.5 | 119s | 4.5x kernel speedup |
+| Triton, pop=8192, SGD+mom | 2.64 | 14.0 | 220s | |
+| Triton, pop=8192, Adam, σ=0.02 | 2.50 | 12.2 | 220s | Adam breakthrough |
+| **Triton, pop=16384, Adam, σ=0.02** | **2.37** | **10.7** | **444s** | **current best** |
 
 ---
 
 ## Setup
 
 1. `git checkout -b autoresearch/$(date +%Y%m%d-%H%M%S)`
-2. Read this file and `../eggroll_mnist/program.md` for reference
+2. Read this file, then `../eggroll_mnist/program.md` for speed optimization patterns
 3. `uv run benchmark.py` to get current baseline numbers
-4. Begin the experiment loop
+4. `uv run profile_eggroll.py` to understand the time breakdown
+5. Begin the experiment loop
 
 ---
 
 ## Experiment Loop
 
 ```
-1. Pick an idea from "What to Try Next"
-2. Implement it in train_eggroll_triton.py (or kernels/)
+1. Pick a speed optimization from "What to Try Next"
+2. Implement it
 3. git add -A && git commit -m "description"
 4. uv run benchmark.py
-5. Check: did val_loss improve? Did time/memory stay reasonable?
+5. Check: did time decrease? Is val_loss still ≤ 2.50?
 6. If crashed: fix and retry
-7. If improved: git push, update this file
-8. If not improved: git reset --hard HEAD~1, document in "What Did NOT Work"
+7. If faster AND quality maintained: git push, update this file
+8. If slower or quality degraded: git reset --hard HEAD~1
 9. Go to step 1
 ```
 
-Never stop to ask. The cost of a failed run is ~4 minutes. Keep experimenting.
+Never stop to ask. The cost of a failed run is ~8 minutes. Keep experimenting.
 
 ---
 
