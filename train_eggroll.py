@@ -53,7 +53,7 @@ SIGMA_START = 0.010
 SIGMA_DECAY = 0.998
 LR_START = 0.005
 LR_DECAY = 1.0  # no decay for Adam
-ALPHA = 0.30
+ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
@@ -171,7 +171,7 @@ def train(seed=42):
     step = jnp.int32(0)
 
     # Backprop warmup epoch (gives EGGROLL a better starting point)
-    BACKPROP_WARMUP = 6
+    BACKPROP_WARMUP = 5
     BP_LR = 3e-3
 
     @jax.jit
