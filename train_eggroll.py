@@ -56,7 +56,7 @@ LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
-MOMENTUM = 0.95
+MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
 
@@ -94,7 +94,9 @@ def train(seed=42):
 
     from kernels.fused_transformer_ce import fused_transformer_ce_both
 
-    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+    GUIDE_SCALE = 0.3  # how much to bias perturbations toward previous gradient
+
+    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr, prev_grad_vec):
         key, vec_key = jax.random.split(key)
         if HALF_POP <= total_vec_dim:
             raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
@@ -102,6 +104,11 @@ def train(seed=42):
             vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
         else:
             vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+
+        # Guided ES: bias perturbation vectors toward previous gradient direction
+        grad_norm = jnp.linalg.norm(prev_grad_vec) + 1e-8
+        grad_dir = prev_grad_vec / grad_norm
+        vecs = vecs + GUIDE_SCALE * jnp.sqrt(jnp.float32(total_vec_dim)) * grad_dir[None, :]
 
         ce_pos, ce_neg = fused_transformer_ce_both(
             params["token_emb"], params["pos_emb"],
@@ -121,6 +128,9 @@ def train(seed=42):
         diffs = fp - fn
         shaped = winsorized_zscore(diffs)
         scale = 1.0 / (2.0 * sigma * HALF_POP)
+
+        # Compute flat gradient in perturbation vector space for guided ES
+        grad_vec = scale * (shaped @ vecs)  # shape: (vec_dim,)
 
         new_params = {}
         new_momentum = {}
@@ -143,11 +153,11 @@ def train(seed=42):
             v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
             new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
-        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
+        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp), grad_vec
 
     @jax.jit
-    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
-        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr)
+    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr, prev_grad_vec):
+        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr, prev_grad_vec)
 
     @jax.jit
     def eval_loss(params, x, y):
@@ -169,14 +179,13 @@ def train(seed=42):
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
     v_buf = jax.tree.map(jnp.zeros_like, params)
     step = jnp.int32(0)
+    prev_grad_vec = jnp.zeros(total_vec_dim)
 
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
-
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
-
 
     for epoch in range(EPOCHS):
         sigma, lr = sigmas[epoch], lrs_sched[epoch]
@@ -186,9 +195,9 @@ def train(seed=42):
         eloss = jnp.float32(0.0)
         for bi in range(n_batches):
             s = bi * BATCH_SIZE
-            params, momentum_buf, v_buf, step, key, pl = train_batch(
+            params, momentum_buf, v_buf, step, key, pl, prev_grad_vec = train_batch(
                 params, momentum_buf, v_buf, step, key,
-                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
+                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr, prev_grad_vec)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
