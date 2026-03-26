@@ -49,8 +49,8 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 4096
-SIGMA_START = 0.030
-SIGMA_DECAY = 0.998  # overridden below by cosine schedule
+SIGMA_START = 0.022
+SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
@@ -101,7 +101,14 @@ def train(seed=42):
             Q, _ = jnp.linalg.qr(raw)
             vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
         else:
-            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
+            # Hybrid: orthogonal basis (vec_dim) + random vectors (remainder)
+            k1, k2 = jax.random.split(vec_key)
+            raw = jax.random.normal(k1, (total_vec_dim, total_vec_dim))
+            Q, _ = jnp.linalg.qr(raw)
+            ortho_vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))  # (vec_dim, vec_dim)
+            extra = HALF_POP - total_vec_dim
+            rand_vecs = jax.random.normal(k2, (extra, total_vec_dim))
+            vecs = jnp.concatenate([ortho_vecs, rand_vecs], axis=0)
 
         ce_pos, ce_neg = fused_transformer_ce_both(
             params["token_emb"], params["pos_emb"],
@@ -173,9 +180,7 @@ def train(seed=42):
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
 
-    import math
-    SIGMA_END = 0.010
-    sigmas = [SIGMA_END + (SIGMA_START - SIGMA_END) * 0.5 * (1 + math.cos(math.pi * e / (EPOCHS - 1))) for e in range(EPOCHS)]
+    sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
 
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
