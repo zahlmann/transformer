@@ -54,11 +54,11 @@ SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
-N_SUBGROUPS = 8
+N_SUBGROUPS = 16
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
-ADAM_EPS = 1e-8
+ADAM_EPS = 1e-6
 
 
 def winsorized_zscore(fitness_diffs):
