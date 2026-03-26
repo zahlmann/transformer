@@ -51,7 +51,7 @@ TEMPERATURE = 2.0
 HALF_POP = 4096
 SIGMA_START = 0.022
 SIGMA_DECAY = 0.998
-LR_START = 0.010
+LR_START = 0.015
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
 N_SUBGROUPS = 8
@@ -175,14 +175,7 @@ def train(seed=42):
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
 
-    # LR schedule: cosine decay from LR_MAX to LR_MIN (no warmup)
-    import math
-    LR_MAX = 0.020
-    LR_MIN = 0.002
-    lrs_sched = []
-    for e in range(EPOCHS):
-        progress = e / (EPOCHS - 1)
-        lrs_sched.append(LR_MIN + (LR_MAX - LR_MIN) * 0.5 * (1 + math.cos(math.pi * progress)))
+    lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
 
     for epoch in range(EPOCHS):
