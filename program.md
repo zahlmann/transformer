@@ -392,6 +392,9 @@ These have ALL been tried and don't work:
 - FlashAttention recompute for tile 1 with restructured liveness (still 255 regs)
 - Dynamic head loop for tile 1 only (151ms but still 255 regs)
 - jax.lax.scan epoch loop (154s, no improvement — dispatch overhead negligible vs kernel time)
+- HALF_POP=3840/3968/4032 with dynamic head + sigma 0.022-0.028 (3-seed avg 2.51-2.53, FAIL)
+- Adaptive label smoothing α_decay=0.70 (val_loss 2.72, quality destroyed)
+- Adaptive label smoothing α_decay=0.95 (val_loss 2.47 at seed=42, worse than constant α=0.50)
 
 ---
 
