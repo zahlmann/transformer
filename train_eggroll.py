@@ -49,7 +49,7 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 8192
-SIGMA_START = 0.008
+SIGMA_START = 0.006
 SIGMA_DECAY = 0.998
 LR_START = 0.005
 LR_DECAY = 1.0  # no decay for Adam
