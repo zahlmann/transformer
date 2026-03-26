@@ -26,15 +26,15 @@ Closing the val_loss gap from 2.49 to 1.84 is the main challenge. Speed regressi
 
 ---
 
-## Current State (2026-03-26)
+## Current State (2026-03-26, quality session)
 
-**Quality:** EGGROLL val_loss=2.49 (3-seed avg 2.490) vs backprop+Adam 1.84.
-Gap = 0.65 to backprop+Adam. Beats vanilla SGD backprop (2.49 vs 2.45).
+**Quality:** EGGROLL val_loss=2.38 (3-seed avg 2.376) vs backprop+Adam 1.84.
+Gap = 0.54 to backprop+Adam (was 0.65). Improved from 2.49 via HALF_POP=7168.
 
-**Speed: 153s for 10 epochs (was 156s, was 175s, was 444s).** 2.90x total speedup achieved.
-Backprop+Adam takes 4.1s. Speed gap is 37x (was 38x, was 43x, was 108x).
+**Speed: 272s for 10 epochs (was 153s at HALF_POP=4096).** Slower due to larger population,
+but within the 300s quality budget. Backprop+Adam takes 4.1s.
 
-**Memory: 70MB (was 113MB).** Lower due to reduced population.
+**Memory: 103MB (was 70MB).** Higher due to larger population.
 
 ---
 
@@ -165,6 +165,12 @@ that. Speed may regress moderately (up to ~200s) if quality improves significant
   outweighs any occupancy benefit. Kernel is too compute-bound for spill-induced occupancy.
 - **Fewer batches per epoch** (48 batches: 123s but 2.56 val_loss; 56 batches: 144s but 2.51):
   Reducing gradient updates degrades quality faster than it saves time.
+
+## What Worked (Quality Session 2026-03-26)
+
+7. **HALF_POP=7168, sigma=0.020** (2.49→2.38, 3-seed avg 2.490→2.376): Larger population
+   directly improves gradient quality. Optimal sigma shifted from 0.022 to 0.020 at this
+   population size. Time increased from 153s to 272s (within 300s quality budget).
 
 ## What Worked (Speed Session 2026-03-26)
 
@@ -417,8 +423,8 @@ These have ALL been tried and don't work:
 ## Current Best Hyperparameters
 
 ```python
-HALF_POP = 4096          # antithetic pairs → pop=8192 (was 8192→16384)
-SIGMA_START = 0.022      # perturbation scale (was 0.02, compensates for dynamic head loop)
+HALF_POP = 7168          # antithetic pairs → pop=14336 (was 4096→8192)
+SIGMA_START = 0.020      # perturbation scale (was 0.022, tuned for HALF_POP=7168)
 SIGMA_DECAY = 0.998      # per epoch
 LR_START = 0.010         # Adam learning rate
 LR_DECAY = 1.0           # no decay (Adam self-adjusts)
@@ -465,7 +471,8 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 | Triton, pop=16384, Adam, σ=0.02 | 2.37 | 10.7 | 444s | previous best |
 | Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32 | 2.44 | 11.4 | 175s | previous best |
 | Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32, FFN tl.range | 2.41 | 11.1 | 156s | previous best |
-| **Triton, pop=8192, Adam, σ=0.022, nw=4, BK=32, FFN+head tl.range** | **2.49** | **12.1** | **153s** | **current best** |
+| Triton, pop=8192, Adam, σ=0.022, nw=4, BK=32, FFN+head tl.range | 2.49 | 12.1 | 153s | previous best |
+| **Triton, pop=14336, Adam, σ=0.020, nw=4, BK=32, FFN+head tl.range** | **2.38** | **10.8** | **272s** | **current best (3-seed avg 2.376)** |
 
 ---
 
