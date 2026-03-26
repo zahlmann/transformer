@@ -48,7 +48,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-HALF_POP = 2304  # ~vec_dim (2306), divisible by N_SUBGROUPS=8, uses QR orthogonal
+HALF_POP = 4096
 SIGMA_START = 0.022
 SIGMA_DECAY = 0.998
 LR_START = 0.010
@@ -56,7 +56,7 @@ LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
-MOMENTUM = 0.9
+MOMENTUM = 0.95
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
 
@@ -101,14 +101,7 @@ def train(seed=42):
             Q, _ = jnp.linalg.qr(raw)
             vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
         else:
-            # Hybrid: orthogonal basis (vec_dim) + random vectors (remainder)
-            k1, k2 = jax.random.split(vec_key)
-            raw = jax.random.normal(k1, (total_vec_dim, total_vec_dim))
-            Q, _ = jnp.linalg.qr(raw)
-            ortho_vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))  # (vec_dim, vec_dim)
-            extra = HALF_POP - total_vec_dim
-            rand_vecs = jax.random.normal(k2, (extra, total_vec_dim))
-            vecs = jnp.concatenate([ortho_vecs, rand_vecs], axis=0)
+            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
         ce_pos, ce_neg = fused_transformer_ce_both(
             params["token_emb"], params["pos_emb"],
