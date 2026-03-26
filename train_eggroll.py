@@ -171,7 +171,7 @@ def train(seed=42):
     step = jnp.int32(0)
 
     # Backprop warmup epoch (gives EGGROLL a better starting point)
-    BACKPROP_WARMUP = 2
+    BACKPROP_WARMUP = 3
     BP_LR = 3e-3
 
     @jax.jit
