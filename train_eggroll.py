@@ -49,8 +49,8 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 4096
-SIGMA_START = 0.040
-SIGMA_DECAY = 0.85
+SIGMA_START = 0.030
+SIGMA_DECAY = 0.998  # overridden below by cosine schedule
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
@@ -173,7 +173,9 @@ def train(seed=42):
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
 
-    sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
+    import math
+    SIGMA_END = 0.010
+    sigmas = [SIGMA_END + (SIGMA_START - SIGMA_END) * 0.5 * (1 + math.cos(math.pi * e / (EPOCHS - 1))) for e in range(EPOCHS)]
 
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
