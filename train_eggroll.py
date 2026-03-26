@@ -49,7 +49,7 @@ TEMPERATURE = 2.0
 # TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 4096
-SIGMA_START = 0.022
+SIGMA_START = 0.015
 SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
@@ -171,7 +171,7 @@ def train(seed=42):
     step = jnp.int32(0)
 
     # Backprop warmup epoch (gives EGGROLL a better starting point)
-    BACKPROP_WARMUP = 1
+    BACKPROP_WARMUP = 2
     BP_LR = 3e-3
 
     @jax.jit
