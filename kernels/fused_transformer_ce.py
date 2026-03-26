@@ -116,7 +116,7 @@ def _fused_transformer_ce_kernel(
     o_pert = tl.zeros((_SEQ,), dtype=tl.float32)
     scale = 0.17677669529663689  # 1/sqrt(32) = 1/sqrt(D_HEAD)
 
-    for head in tl.static_range(2):
+    for head in tl.range(2):
         offs_head = head * _D_HEAD + tl.arange(0, _D_HEAD)
 
         # K
