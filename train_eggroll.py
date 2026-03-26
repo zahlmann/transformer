@@ -171,7 +171,7 @@ def train(seed=42):
     step = jnp.int32(0)
 
     # Backprop warmup epoch (gives EGGROLL a better starting point)
-    BACKPROP_WARMUP = 3
+    BACKPROP_WARMUP = 1
     BP_LR = 3e-3
 
     @jax.jit
@@ -216,7 +216,8 @@ def train(seed=42):
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
-    for epoch in range(EPOCHS):
+    ES_EPOCHS = EPOCHS - BACKPROP_WARMUP
+    for epoch in range(ES_EPOCHS):
         sigma, lr = sigmas[epoch], lrs_sched[epoch]
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
@@ -230,7 +231,7 @@ def train(seed=42):
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
-        print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
+        print(f"  Epoch {epoch+1+BACKPROP_WARMUP}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
     vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
