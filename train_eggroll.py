@@ -169,9 +169,6 @@ def train(seed=42):
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
     v_buf = jax.tree.map(jnp.zeros_like, params)
     step = jnp.int32(0)
-    SWA_START = 7  # average params from epoch 8, 9, 10
-    swa_params = None
-    swa_count = 0
 
     # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
@@ -192,31 +189,10 @@ def train(seed=42):
                 sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
-        # SWA: accumulate params from late epochs
-        if epoch >= SWA_START:
-            if swa_params is None:
-                swa_params = jax.tree.map(jnp.copy, params)
-            else:
-                swa_params = jax.tree.map(lambda s, p: s + p, swa_params, params)
-            swa_count += 1
-
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
 
-    # Use SWA-averaged params for final evaluation
-    if swa_params is not None and swa_count > 0:
-        swa_params = jax.tree.map(lambda s: s / swa_count, swa_params)
-        vl_swa = eval_loss(swa_params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
-        vl_raw = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
-        # Use whichever is better
-        if float(vl_swa) < float(vl_raw):
-            vl = vl_swa
-            print(f"  SWA improved: {float(vl_raw):.4f} -> {float(vl_swa):.4f}")
-        else:
-            vl = vl_raw
-            print(f"  SWA not better: raw={float(vl_raw):.4f} swa={float(vl_swa):.4f}")
-    else:
-        vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
+    vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
     vl.block_until_ready()
     total = time.perf_counter() - t_start
     ppl = float(jnp.exp(vl))
