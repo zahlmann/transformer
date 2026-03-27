@@ -414,6 +414,14 @@ These have ALL been tried and don't work:
 - Adam eps=1e-8: slightly worse than 1e-6
 - HALF_POP=3584 with 2x data passes: 2.42, worse than 7168×1 (gradient quality > quantity)
 - HALF_POP=8192 at sigma=0.020: 2.41 at 314s (over budget and seed-noisy)
+- Forward-mode AD via jax.jvp + lax.scan: exact directional derivatives but 12x slower per
+  direction than Triton kernel (sequential processing vs massive parallelism). N_DIRS=256 gives
+  val_loss=2.73 at 118s — much worse than kernel's HALF_POP=7168 at 2.31/272s. The kernel's
+  parallelism is the key advantage; forward-mode AD can't match it without a dual-number kernel.
+- Forward-mode AD with full-rank perturbations (no rank-1 compression): val_loss=2.75 at 118s.
+  WORSE than rank-1 — higher dimensionality (66K vs 2306) means sparser gradient coverage per
+  direction. Rank-1 compression is a feature, not a bug, for ES sample efficiency.
+- Forward-mode AD with chunked vmap (64/chunk): 3.6GB memory, 151s. OOM at full vmap (256).
 
 ---
 
