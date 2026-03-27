@@ -1,8 +1,7 @@
-"""EGGROLL ES training with forward-mode AD (JVP) for exact directional derivatives.
+"""EGGROLL ES training with fused Triton kernel for the full forward pass.
 
-Uses full-rank perturbations (no rank-1 compression) since JVP cost is independent
-of tangent structure. Each perturbation direction probes ALL gradient dimensions,
-giving much better gradient estimates per direction.
+Replaces vmap+scan with a single kernel launch per ES round that processes
+ALL perturbation members in parallel via the CUDA grid.
 
 Usage: uv run train_eggroll.py [--seed SEED]
 """
@@ -16,36 +15,55 @@ import jax
 import jax.numpy as jnp
 
 from data import prepare_data
-from model import init_transformer, transformer_forward_batch, count_params
+from model import init_transformer, count_params
+def build_param_spec(params):
+    """Build perturbation vector spec from model params (alphabetical key order)."""
+    spec = []
+    offset = 0
+    for key in sorted(params.keys()):
+        shape = params[key].shape
+        if len(shape) == 2:
+            vec_dim = shape[0] + shape[1]
+            spec.append((key, shape, offset, vec_dim, True))
+        elif len(shape) == 1:
+            vec_dim = shape[0]
+            spec.append((key, shape, offset, vec_dim, False))
+        else:
+            raise ValueError(f"Unexpected: {key} {shape}")
+        offset += vec_dim
+    return spec, offset
 
 # ══════════════════════════════════════════════════════════════
 # LOCKED CONSTANTS — do not change. Validated by validate.py.
+# Changing these makes the comparison to backprop unfair.
 # ══════════════════════════════════════════════════════════════
 D_MODEL = 64
 N_HEADS = 2
 N_LAYERS = 1
 CONTEXT_LEN = 128
 BATCH_SIZE = 128
-EPOCHS = 10
+EPOCHS = 10          # LOCKED — same as backprop baseline
 TEMPERATURE = 2.0
 
 # ══════════════════════════════════════════════════════════════
-# TUNABLE HYPERPARAMETERS
+# TUNABLE HYPERPARAMETERS — optimize these freely
 # ══════════════════════════════════════════════════════════════
-N_DIRS = 256         # number of random directions per batch
+HALF_POP = 7168
+SIGMA_START = 0.020
+SIGMA_DECAY = 0.998
 LR_START = 0.010
-LR_DECAY = 1.0
-ALPHA = 0.50         # label smoothing
+LR_DECAY = 1.0  # no decay for Adam
+ALPHA = 0.50
+N_SUBGROUPS = 8
+CLIP_RANGE = 2.0
 MOMENTUM = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPS = 1e-6
-N_SUBGROUPS = 8
-CLIP_RANGE = 2.0
 
 
-def winsorized_zscore(vals):
-    group_size = vals.shape[0] // N_SUBGROUPS
-    groups = vals[:N_SUBGROUPS * group_size].reshape(N_SUBGROUPS, group_size)
+def winsorized_zscore(fitness_diffs):
+    group_size = fitness_diffs.shape[0] // N_SUBGROUPS
+    groups = fitness_diffs[:N_SUBGROUPS * group_size].reshape(N_SUBGROUPS, group_size)
     means = jnp.mean(groups, axis=1, keepdims=True)
     stds = jnp.std(groups, axis=1, keepdims=True) + 1e-8
     z = (groups - means) / stds
@@ -63,91 +81,81 @@ def train(seed=42):
         init_key, vocab_size, d_model=D_MODEL, n_heads=N_HEADS,
         n_layers=N_LAYERS, context_len=CONTEXT_LEN,
     )
-
-    # Build flat param vector info (for full-rank perturbation)
-    param_keys = sorted(params.keys())
-    param_shapes = {k: params[k].shape for k in param_keys}
-    param_sizes = {k: params[k].size for k in param_keys}
-    total_params = sum(param_sizes.values())
-    # Build offset table
-    offsets = {}
-    off = 0
-    for k in param_keys:
-        offsets[k] = off
-        off += param_sizes[k]
-
+    spec, total_vec_dim = build_param_spec(params)
     n_batches = len(data["train_x"]) // BATCH_SIZE
+
     train_x = jnp.array(data["train_x"])
     train_y = jnp.array(data["train_y"])
     val_x = jnp.array(data["val_x"])
     val_y = jnp.array(data["val_y"])
 
-    def smoothed_ce_loss(params, x, y):
-        logits = transformer_forward_batch(params, config, x) / TEMPERATURE
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        n_classes = logits.shape[-1]
-        one_hot = jax.nn.one_hot(y, n_classes)
-        targets = (1 - ALPHA) * one_hot + ALPHA / n_classes
-        return -jnp.sum(targets * log_probs) / x.shape[0]
+    # uniform LR scaling (Adam handles per-param adaptation)
+    lr_scale_arr = jnp.ones(len(spec))
 
-    def flat_to_tangent(v_flat):
-        """Convert flat perturbation vector to param-shaped tangent dict."""
-        tangent = {}
-        for k in param_keys:
-            tangent[k] = v_flat[offsets[k]:offsets[k] + param_sizes[k]].reshape(param_shapes[k])
-        return tangent
+    from kernels.fused_transformer_ce import fused_transformer_ce_both
 
-    def compute_jvp_single(params, v_flat, x, y):
-        tangent = flat_to_tangent(v_flat)
-        _, dloss = jax.jvp(
-            lambda p: smoothed_ce_loss(p, x, y),
-            (params,), (tangent,)
-        )
-        return dloss
-
-    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, lr):
+    def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
         key, vec_key = jax.random.split(key)
-        vecs = jax.random.normal(vec_key, (N_DIRS, total_params))
+        if HALF_POP <= total_vec_dim:
+            raw = jax.random.normal(vec_key, (total_vec_dim, HALF_POP))
+            Q, _ = jnp.linalg.qr(raw)
+            vecs = Q.T * jnp.sqrt(jnp.float32(total_vec_dim))
+        else:
+            vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
-        # Compute directional derivatives via lax.scan (sequential JVP)
-        def scan_body(carry, v):
-            dloss = compute_jvp_single(carry, v, x, y)
-            return carry, dloss
-        _, dlosses = jax.lax.scan(scan_body, params, vecs)
+        ce_pos, ce_neg = fused_transformer_ce_both(
+            params["token_emb"], params["pos_emb"],
+            params["layer0.ln1.scale"], params["layer0.ln1.bias"],
+            params["layer0.attn.q"], params["layer0.attn.k"],
+            params["layer0.attn.v"], params["layer0.attn.o"],
+            params["layer0.ln2.scale"], params["layer0.ln2.bias"],
+            params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
+            params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
+            params["ln_final.scale"], params["ln_final.bias"],
+            params["output_proj"],
+            vecs, x, y, sigma, ALPHA, TEMPERATURE,
+        )
 
-        # Normalize directional derivatives
-        shaped = winsorized_zscore(dlosses)
-        scale = 1.0 / N_DIRS
+        fp = ce_pos.sum(axis=1) / x.shape[0]
+        fn = ce_neg.sum(axis=1) / x.shape[0]
+        diffs = fp - fn
+        shaped = winsorized_zscore(diffs)
+        scale = 1.0 / (2.0 * sigma * HALF_POP)
 
-        # Compute gradient for each parameter directly (full-rank, no rank-1 compression)
         new_params = {}
         new_momentum = {}
         new_v = {}
-        t = step + 1
-        for k in param_keys:
-            o = offsets[k]
-            s = param_sizes[k]
-            v_slice = vecs[:, o:o+s]  # (N_DIRS, param_size)
-            # g = (1/N) Σ shaped_i * v_i  — gradient in full parameter space
-            g = scale * (v_slice * shaped[:, None]).sum(axis=0).reshape(param_shapes[k])
-            new_momentum[k] = MOMENTUM * momentum_buf[k] + (1 - MOMENTUM) * g
-            new_v[k] = ADAM_BETA2 * v_buf[k] + (1 - ADAM_BETA2) * g ** 2
-            m_hat = new_momentum[k] / (1 - MOMENTUM ** t)
-            v_hat = new_v[k] / (1 - ADAM_BETA2 ** t)
-            new_params[k] = params[k] - lr * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
+        t = step + 1  # 1-indexed for bias correction
+        for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
+            v_pert = vecs[:, offset:offset + vec_dim]
+            if is_2d:
+                m, n = shape
+                g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
+            else:
+                g = scale * (v_pert * shaped[:, None]).sum(axis=0)
+            lr_s = lr_scale_arr[idx]
+            # First moment (momentum)
+            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
+            # Second moment (Adam)
+            new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
+            # Bias correction
+            m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
+            v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
+            new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
-        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(dlosses)
+        return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
     @jax.jit
-    def train_batch(params, momentum_buf, v_buf, step, key, x, y, lr):
-        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, lr)
+    def train_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        return train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr)
 
     @jax.jit
     def eval_loss(params, x, y):
-        from model import cross_entropy_loss
+        from model import transformer_forward_batch, cross_entropy_loss
         logits = transformer_forward_batch(params, config, x)
         return cross_entropy_loss(logits, y)
 
+    # Print locked constants for validate.py
     print("=== CONSTANTS ===")
     print(f"D_MODEL: {D_MODEL}")
     print(f"N_HEADS: {N_HEADS}")
@@ -157,17 +165,19 @@ def train(seed=42):
     print(f"EPOCHS: {EPOCHS}")
     print(f"TEMPERATURE: {TEMPERATURE}")
     print("=" * 20)
-    print(f"Forward-mode AD: N_DIRS={N_DIRS}, total_params={total_params}")
 
     momentum_buf = jax.tree.map(jnp.zeros_like, params)
     v_buf = jax.tree.map(jnp.zeros_like, params)
     step = jnp.int32(0)
 
+    # Training (JIT warmup happens on first batch — included in timing)
     t_start = time.perf_counter()
+
+    sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
     for epoch in range(EPOCHS):
-        lr = lrs_sched[epoch]
+        sigma, lr = sigmas[epoch], lrs_sched[epoch]
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
         sx, sy = train_x[perm], train_y[perm]
@@ -176,8 +186,8 @@ def train(seed=42):
             s = bi * BATCH_SIZE
             params, momentum_buf, v_buf, step, key, pl = train_batch(
                 params, momentum_buf, v_buf, step, key,
-                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], lr)
-            eloss = eloss + pl
+                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
+            eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
         print(f"  Epoch {epoch+1}/{EPOCHS}  proxy={float(eloss)/n_batches:.4f}  val_loss={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}  lr={lr:.4f}")
@@ -188,6 +198,7 @@ def train(seed=42):
     ppl = float(jnp.exp(vl))
     val_loss = float(vl)
 
+    # Measure peak memory
     mem_stats = jax.local_devices()[0].memory_stats()
     peak_mb = mem_stats["peak_bytes_in_use"] / 1e6 if mem_stats else 0.0
 
