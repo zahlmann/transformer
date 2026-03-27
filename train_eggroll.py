@@ -129,13 +129,28 @@ def train(seed=42):
         key, vec_key = jax.random.split(key)
         vecs = jax.random.normal(vec_key, (HALF_POP, total_vec_dim))
 
-        # Compute directional derivatives via lax.scan (sequential, memory-efficient)
-        def scan_body(carry, v):
-            tangent = vec_to_tangent(v)
-            dloss = compute_jvp(carry, tangent, x, y)
-            return carry, dloss
+        # Compute directional derivatives via chunked vmap + scan
+        n_chunks = HALF_POP // JVP_CHUNK
+        vecs_chunked = vecs.reshape(n_chunks, JVP_CHUNK, total_vec_dim)
 
-        _, dlosses = jax.lax.scan(scan_body, params, vecs)
+        def scan_chunk(carry, chunk):
+            # Build batched tangent for this chunk
+            batched_tangent = {}
+            for pkey, shape, offset, vec_dim, is_2d in spec:
+                if is_2d:
+                    m, n = shape
+                    u = chunk[:, offset:offset+m]
+                    w = chunk[:, offset+m:offset+m+n]
+                    batched_tangent[pkey] = u[:, :, None] * w[:, None, :]
+                else:
+                    batched_tangent[pkey] = chunk[:, offset:offset+vec_dim]
+            chunk_dlosses = jax.vmap(
+                lambda t: compute_jvp(carry, t, x, y)
+            )(batched_tangent)
+            return carry, chunk_dlosses
+
+        _, dlosses_chunks = jax.lax.scan(scan_chunk, params, vecs_chunked)
+        dlosses = dlosses_chunks.reshape(-1)
 
         # Normalize directional derivatives (like winsorized z-score for ES)
         shaped = winsorized_zscore(dlosses)
