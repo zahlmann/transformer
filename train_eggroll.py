@@ -112,9 +112,9 @@ def train(seed=42):
         # Directional derivatives: mean over batch items
         dlosses = ce_tangent.sum(axis=1) / x.shape[0]  # (N_DIRS,)
 
-        # Use raw directional derivatives (exact, no z-scoring needed)
-        shaped = dlosses
-        scale = 1.0 / N_DIRS
+        # Normalize and scale to match finite-diff gradient magnitude
+        shaped = winsorized_zscore(dlosses)
+        scale = 1.0 / (2.0 * 0.020 * N_DIRS)  # match finite-diff scaling for Adam compatibility
 
         new_params = {}
         new_momentum = {}
