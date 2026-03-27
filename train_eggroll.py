@@ -112,8 +112,8 @@ def train(seed=42):
         # Directional derivatives: mean over batch items
         dlosses = ce_tangent.sum(axis=1) / x.shape[0]  # (N_DIRS,)
 
-        # Normalize (same z-scoring as finite-difference version)
-        shaped = winsorized_zscore(dlosses)
+        # Use raw directional derivatives (exact, no z-scoring needed)
+        shaped = dlosses
         scale = 1.0 / N_DIRS
 
         new_params = {}
