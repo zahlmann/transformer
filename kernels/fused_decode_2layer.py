@@ -195,8 +195,21 @@ def _fused_decode_2layer(
 
 # ──────────────────────────────────────────────────────────────────────
 
-def fused_decode_2layer(params, config, token_id, pos, k_caches, v_caches, vocab_size):
+def prepare_decode_weights(params, config, vocab_size):
+    """Precompute bf16 weights + padded output proj once. Call before decode loop."""
+    vocab_pad = ((vocab_size + 127) // 128) * 128
+    pad_v = vocab_pad - vocab_size
+    w = {k: v.astype(jnp.bfloat16) for k, v in params.items()}
+    w["_output_proj_padded"] = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
+    w["_vocab_pad"] = vocab_pad
+    return w
+
+
+def fused_decode_2layer(w, config, token_id, pos, k_caches, v_caches, vocab_size):
     """Fully fused 2-layer decode: one kernel call per token.
+
+    Args:
+        w: precomputed bf16 weights from prepare_decode_weights()
 
     Returns: logits, [k_cache_l0, k_cache_l1], [v_cache_l0, v_cache_l1]
     """
@@ -205,30 +218,24 @@ def fused_decode_2layer(params, config, token_id, pos, k_caches, v_caches, vocab
     n_heads = config["n_heads"]
     d_ff = 4 * d_model
     max_seq = config["context_len"]
-    vocab_pad = ((vocab_size + 127) // 128) * 128
-    pad_v = vocab_pad - vocab_size
-
-    def bf(key):
-        return params[key].astype(jnp.bfloat16)
-
-    output_proj_padded = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
+    vocab_pad = w["_vocab_pad"]
 
     logits_pad, l0_k_new, l0_v_new, l1_k_new, l1_v_new = jt.triton_call(
         # Embedding
-        bf("token_emb"), bf("pos_emb"),
+        w["token_emb"], w["pos_emb"],
         # Layer 0
-        bf("layer0.ln1.scale"), bf("layer0.ln1.bias"),
-        bf("layer0.attn.q"), bf("layer0.attn.k"), bf("layer0.attn.v"), bf("layer0.attn.o"),
-        bf("layer0.ln2.scale"), bf("layer0.ln2.bias"),
-        bf("layer0.ffn.up"), bf("layer0.ffn.up_bias"), bf("layer0.ffn.down"), bf("layer0.ffn.down_bias"),
+        w["layer0.ln1.scale"], w["layer0.ln1.bias"],
+        w["layer0.attn.q"], w["layer0.attn.k"], w["layer0.attn.v"], w["layer0.attn.o"],
+        w["layer0.ln2.scale"], w["layer0.ln2.bias"],
+        w["layer0.ffn.up"], w["layer0.ffn.up_bias"], w["layer0.ffn.down"], w["layer0.ffn.down_bias"],
         # Layer 1
-        bf("layer1.ln1.scale"), bf("layer1.ln1.bias"),
-        bf("layer1.attn.q"), bf("layer1.attn.k"), bf("layer1.attn.v"), bf("layer1.attn.o"),
-        bf("layer1.ln2.scale"), bf("layer1.ln2.bias"),
-        bf("layer1.ffn.up"), bf("layer1.ffn.up_bias"), bf("layer1.ffn.down"), bf("layer1.ffn.down_bias"),
+        w["layer1.ln1.scale"], w["layer1.ln1.bias"],
+        w["layer1.attn.q"], w["layer1.attn.k"], w["layer1.attn.v"], w["layer1.attn.o"],
+        w["layer1.ln2.scale"], w["layer1.ln2.bias"],
+        w["layer1.ffn.up"], w["layer1.ffn.up_bias"], w["layer1.ffn.down"], w["layer1.ffn.down_bias"],
         # Final LN + output
-        bf("ln_final.scale"), bf("ln_final.bias"),
-        output_proj_padded,
+        w["ln_final.scale"], w["ln_final.bias"],
+        w["_output_proj_padded"],
         # Decode inputs
         jnp.int32(token_id), jnp.int32(pos),
         k_caches[0], v_caches[0],

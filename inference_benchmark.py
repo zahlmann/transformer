@@ -61,10 +61,11 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
         tokens.append(int(tok))
 
         if n_layers == 2:
-            from kernels.fused_decode_2layer import fused_decode_2layer
+            from kernels.fused_decode_2layer import fused_decode_2layer, prepare_decode_weights
+            w = prepare_decode_weights(params, config, vocab_size)
             for i in range(n_tokens - 1):
                 logits, k_caches, v_caches = fused_decode_2layer(
-                    params, config, tok, len(prompt) + i,
+                    w, config, tok, len(prompt) + i,
                     k_caches, v_caches, vocab_size)
                 tok = jnp.argmax(logits)
                 tokens.append(int(tok))
