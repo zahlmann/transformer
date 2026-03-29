@@ -226,8 +226,8 @@ def block_prefill(params, config, x, vocab_size):
     num_blocks = seq_len // 32
     vocab_pad = ((vocab_size + 127) // 128) * 128
 
-    def bf(key):
-        return params[key].astype(jnp.bfloat16)
+    # Precompute bf16 weights once (avoid repeated .astype in loop)
+    w = {k: v.astype(jnp.bfloat16) for k, v in params.items()}
 
     # Embedding (JAX — simple gather, not worth a kernel)
     h = (params["token_emb"][x] + params["pos_emb"][:seq_len]).astype(jnp.float32)
@@ -241,8 +241,8 @@ def block_prefill(params, config, x, vocab_size):
         # Kernel 1: LN + Q/K/V projections
         q_buf, k_cache, v_cache = jt.triton_call(
             h,
-            bf(f"{p}.ln1.scale"), bf(f"{p}.ln1.bias"),
-            bf(f"{p}.attn.q"), bf(f"{p}.attn.k"), bf(f"{p}.attn.v"),
+            w[f"{p}.ln1.scale"], w[f"{p}.ln1.bias"],
+            w[f"{p}.attn.q"], w[f"{p}.attn.k"], w[f"{p}.attn.v"],
             kernel=_proj_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct((n_heads, seq_len, d_head), jnp.float32),
@@ -259,7 +259,7 @@ def block_prefill(params, config, x, vocab_size):
         # Kernel 2: Attention + O projection + residual
         (h,) = jt.triton_call(
             h, q_buf, k_cache, v_cache,
-            bf(f"{p}.attn.o"),
+            w[f"{p}.attn.o"],
             kernel=_attn_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
@@ -272,9 +272,9 @@ def block_prefill(params, config, x, vocab_size):
         # Kernel 3: LN + FFN + residual
         (h,) = jt.triton_call(
             h,
-            bf(f"{p}.ln2.scale"), bf(f"{p}.ln2.bias"),
-            bf(f"{p}.ffn.up"), bf(f"{p}.ffn.up_bias"),
-            bf(f"{p}.ffn.down"), bf(f"{p}.ffn.down_bias"),
+            w[f"{p}.ln2.scale"], w[f"{p}.ln2.bias"],
+            w[f"{p}.ffn.up"], w[f"{p}.ffn.up_bias"],
+            w[f"{p}.ffn.down"], w[f"{p}.ffn.down_bias"],
             kernel=_ffn_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
@@ -290,7 +290,7 @@ def block_prefill(params, config, x, vocab_size):
 
     (logits_pad,) = jt.triton_call(
         h,
-        bf("ln_final.scale"), bf("ln_final.bias"),
+        w["ln_final.scale"], w["ln_final.bias"],
         output_proj_padded,
         kernel=_output_kernel,
         out_shape=[
