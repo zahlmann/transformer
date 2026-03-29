@@ -50,7 +50,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 7168
 # Population schedule: small pop early (fast, coarse gradients), large pop late (slow, precise)
-POP_SCHEDULE = [4096]*5 + [10240]*5  # small pop early, large pop late
+POP_SCHEDULE = [10240]*5 + [4096]*5  # large pop early (big jumps), small pop late
 SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
 LR_START = 0.010
