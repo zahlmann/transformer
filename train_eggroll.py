@@ -55,7 +55,8 @@ SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
-ALPHA = 0.10
+ALPHA = 0.50
+ALPHA_DECAY = 0.85  # per-epoch: 0.50 -> 0.10 over 10 epochs
 N_SUBGROUPS = 8
 CLIP_RANGE = 2.0
 MOMENTUM = 0.9
@@ -98,7 +99,7 @@ def train(seed=42):
 
     def make_train_fn(half_pop):
         """Create a JIT'd train function for a specific HALF_POP."""
-        def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr):
+        def train_one_batch(params, momentum_buf, v_buf, step, key, x, y, sigma, lr, alpha):
             key, vec_key = jax.random.split(key)
             if half_pop <= total_vec_dim:
                 raw = jax.random.normal(vec_key, (total_vec_dim, half_pop))
@@ -117,7 +118,7 @@ def train(seed=42):
                 params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
                 params["ln_final.scale"], params["ln_final.bias"],
                 params["output_proj"],
-                vecs, x, y, sigma, ALPHA, TEMPERATURE,
+                vecs, x, y, sigma, alpha, TEMPERATURE,
             )
 
             fp = ce_pos.sum(axis=1) / x.shape[0]
@@ -181,10 +182,11 @@ def train(seed=42):
     t_start = time.perf_counter()
 
     sigmas = [SIGMA_START * (SIGMA_DECAY ** e) for e in range(EPOCHS)]
+    alphas = [ALPHA * (ALPHA_DECAY ** e) for e in range(EPOCHS)]
     lrs_sched = [LR_START * (LR_DECAY ** e) for e in range(EPOCHS)]
 
     for epoch in range(EPOCHS):
-        sigma, lr = sigmas[epoch], lrs_sched[epoch]
+        sigma, lr, alpha_e = sigmas[epoch], lrs_sched[epoch], alphas[epoch]
         hp = pop_per_epoch[epoch]
         train_batch = train_fns[hp]
         key, sk = jax.random.split(key)
@@ -195,7 +197,7 @@ def train(seed=42):
             s = bi * BATCH_SIZE
             params, momentum_buf, v_buf, step, key, pl = train_batch(
                 params, momentum_buf, v_buf, step, key,
-                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr)
+                sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE], sigma, lr, alpha_e)
             eloss = eloss + pl  # no float() sync — let XLA pipeline batches
 
         vl = eval_loss(params, val_x[:BATCH_SIZE], val_y[:BATCH_SIZE])
