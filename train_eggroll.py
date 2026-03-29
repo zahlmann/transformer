@@ -50,9 +50,9 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 7168
 # Population schedule: small pop early (fast, coarse gradients), large pop late (slow, precise)
-POP_SCHEDULE = [10240]*5 + [4096]*5  # large pop early (big jumps), small pop late
-SIGMA_START = 0.020
-SIGMA_DECAY = 0.998
+POP_SCHEDULE = None  # uniform population
+SIGMA_START = 0.025
+SIGMA_DECAY = 0.92  # per-epoch: 0.025 -> 0.011 over 10 epochs
 LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.50
