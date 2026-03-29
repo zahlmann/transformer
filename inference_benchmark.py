@@ -51,21 +51,31 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
             tokens.append(int(tok))
         return tokens
     else:
-        # Larger model: multi-block kernels
+        # Larger model: multi-block prefill + fused decode
         from kernels.block_prefill import block_prefill
-        from kernels.block_decode import block_decode
 
         x = jnp.pad(prompt, (0, ctx_len - len(prompt))).astype(jnp.int32)
         logits, k_caches, v_caches = block_prefill(params, config, x, vocab_size)
         tokens = []
         tok = jnp.argmax(logits[len(prompt) - 1])
         tokens.append(int(tok))
-        for i in range(n_tokens - 1):
-            logits, k_caches, v_caches = block_decode(
-                params, config, tok, len(prompt) + i,
-                k_caches, v_caches, vocab_size)
-            tok = jnp.argmax(logits)
-            tokens.append(int(tok))
+
+        if n_layers == 2:
+            from kernels.fused_decode_2layer import fused_decode_2layer
+            for i in range(n_tokens - 1):
+                logits, k_caches, v_caches = fused_decode_2layer(
+                    params, config, tok, len(prompt) + i,
+                    k_caches, v_caches, vocab_size)
+                tok = jnp.argmax(logits)
+                tokens.append(int(tok))
+        else:
+            from kernels.block_decode import block_decode
+            for i in range(n_tokens - 1):
+                logits, k_caches, v_caches = block_decode(
+                    params, config, tok, len(prompt) + i,
+                    k_caches, v_caches, vocab_size)
+                tok = jnp.argmax(logits)
+                tokens.append(int(tok))
         return tokens
 
 
