@@ -81,14 +81,60 @@ Speedup:        4.0x
 
 ---
 
-## Next: Optimizations
+## Next Steps
 
-Once the basic kernels work (done), optimize:
-- **Quantization**: INT8 or FP8 weights for faster matmuls and lower memory
-- **FlashAttention-style tiling** for decode (if sequence gets long)
-- **Speculative decoding**: generate multiple candidate tokens in parallel
-- **Persistent kernel**: keep the kernel running and feed tokens via shared memory
-- **Batched decode**: process multiple sequences simultaneously
+### Phase A: Scale the Model
+
+The current model is tiny (66K params, char-level, 1 layer). The fused kernel technique
+works because everything fits in registers. Scaling up tests where this breaks and forces
+new techniques.
+
+**A1. BPE tokenization.** Switch from character-level (vocab=65) to subword tokens
+(tiktoken or sentencepiece, vocab=512-8192). This immediately improves text quality
+per parameter and is how real models work. The kernel needs a larger embedding table
+and output projection — the output projection matmul (d_model × vocab) may no longer
+fit in registers and will need tiling.
+
+**A2. Bigger model.** Scale d_model (64→128→256), add layers (1→2→4), increase context
+(128→512→1024). Key thresholds:
+- d_model=128: weights ~260KB in bf16, exceeds register file. Need multi-block tiling.
+- n_layers=2+: can't fuse everything into one kernel. Need one kernel per layer or
+  a persistent kernel that loops over layers.
+- context=512+: attention matrix (512×512 = 1MB) can't fit in registers. Need
+  FlashAttention-style tiled attention.
+
+**A3. More data.** TinyShakespeare (1MB) is too small for bigger models. Options:
+- TinyStories (~500MB) — simple English, good for small models
+- OpenWebText subset — real web text
+- FineWeb-Edu subset — high-quality educational text
+
+### Phase B: Kernel Optimizations
+
+**B1. Quantization.** INT8 or FP8 weights for the decode kernel. Halves memory
+bandwidth for weight loads. The decode kernel is memory-bound (loading KV cache +
+weights), so this should give ~1.5-2x speedup.
+
+**B2. Batched decode.** Process multiple sequences simultaneously. Each sequence
+has its own KV cache but shares weights. The decode kernel becomes a (batch, d_model)
+matmul instead of (1, d_model), which CAN use tensor cores.
+
+**B3. Persistent decode kernel.** Keep one kernel running permanently, feed it tokens
+via shared memory or global memory flags. Eliminates kernel launch overhead entirely
+(currently ~7µs per decode step × 64 steps = ~0.5ms).
+
+**B4. Speculative decoding.** Use the small model as a draft model: generate N candidate
+tokens in one batch, then verify. If the verification model is the same (self-speculative),
+this trades compute for latency.
+
+### Phase C: Multi-Layer Fusion
+
+For models with 2+ layers, the question is how to keep data in fast memory between layers:
+- **Option 1: One kernel per layer.** Intermediate activations go through HBM between
+  layers but stay in registers within each layer. Simple, composable.
+- **Option 2: Shared memory handoff.** Write activations to shared memory at end of
+  layer, read them back for next layer. Stays on-chip but limited to ~164KB.
+- **Option 3: Persistent kernel.** One kernel that loops over layers, keeping activations
+  in registers. Most complex but eliminates all intermediate memory traffic.
 
 ---
 
