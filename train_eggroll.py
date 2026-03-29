@@ -50,7 +50,7 @@ TEMPERATURE = 2.0
 # ══════════════════════════════════════════════════════════════
 HALF_POP = 7168
 # Population schedule: small pop early (fast, coarse gradients), large pop late (slow, precise)
-POP_SCHEDULE = None  # set to list of 10 HALF_POP values to enable, e.g. [4096]*5 + [10240]*5
+POP_SCHEDULE = [4096]*5 + [10240]*5  # small pop early, large pop late
 SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
 LR_START = 0.010
@@ -107,45 +107,42 @@ def train(seed=42):
             else:
                 vecs = jax.random.normal(vec_key, (half_pop, total_vec_dim))
 
-        ce_pos, ce_neg = fused_transformer_ce_both(
-            params["token_emb"], params["pos_emb"],
-            params["layer0.ln1.scale"], params["layer0.ln1.bias"],
-            params["layer0.attn.q"], params["layer0.attn.k"],
-            params["layer0.attn.v"], params["layer0.attn.o"],
-            params["layer0.ln2.scale"], params["layer0.ln2.bias"],
-            params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
-            params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
-            params["ln_final.scale"], params["ln_final.bias"],
-            params["output_proj"],
-            vecs, x, y, sigma, ALPHA, TEMPERATURE,
-        )
+            ce_pos, ce_neg = fused_transformer_ce_both(
+                params["token_emb"], params["pos_emb"],
+                params["layer0.ln1.scale"], params["layer0.ln1.bias"],
+                params["layer0.attn.q"], params["layer0.attn.k"],
+                params["layer0.attn.v"], params["layer0.attn.o"],
+                params["layer0.ln2.scale"], params["layer0.ln2.bias"],
+                params["layer0.ffn.up"], params["layer0.ffn.up_bias"],
+                params["layer0.ffn.down"], params["layer0.ffn.down_bias"],
+                params["ln_final.scale"], params["ln_final.bias"],
+                params["output_proj"],
+                vecs, x, y, sigma, ALPHA, TEMPERATURE,
+            )
 
-        fp = ce_pos.sum(axis=1) / x.shape[0]
-        fn = ce_neg.sum(axis=1) / x.shape[0]
-        diffs = fp - fn
-        shaped = winsorized_zscore(diffs)
-        scale = 1.0 / (2.0 * sigma * half_pop)
+            fp = ce_pos.sum(axis=1) / x.shape[0]
+            fn = ce_neg.sum(axis=1) / x.shape[0]
+            diffs = fp - fn
+            shaped = winsorized_zscore(diffs)
+            scale = 1.0 / (2.0 * sigma * half_pop)
 
-        new_params = {}
-        new_momentum = {}
-        new_v = {}
-        t = step + 1  # 1-indexed for bias correction
-        for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
-            v_pert = vecs[:, offset:offset + vec_dim]
-            if is_2d:
-                m, n = shape
-                g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
-            else:
-                g = scale * (v_pert * shaped[:, None]).sum(axis=0)
-            lr_s = lr_scale_arr[idx]
-            # First moment (momentum)
-            new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
-            # Second moment (Adam)
-            new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
-            # Bias correction
-            m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
-            v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
-            new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
+            new_params = {}
+            new_momentum = {}
+            new_v = {}
+            t = step + 1
+            for idx, (pkey, shape, offset, vec_dim, is_2d) in enumerate(spec):
+                v_pert = vecs[:, offset:offset + vec_dim]
+                if is_2d:
+                    m, n = shape
+                    g = scale * (v_pert[:, :m] * shaped[:, None]).T @ v_pert[:, m:]
+                else:
+                    g = scale * (v_pert * shaped[:, None]).sum(axis=0)
+                lr_s = lr_scale_arr[idx]
+                new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
+                new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
+                m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
+                v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
+                new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
             return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
