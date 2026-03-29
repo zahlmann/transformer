@@ -53,7 +53,7 @@ HALF_POP = 7168
 POP_SCHEDULE = None  # uniform population
 SIGMA_START = 0.020
 SIGMA_DECAY = 0.998
-LR_START = 0.10  # SGD needs higher LR than Adam
+LR_START = 0.010
 LR_DECAY = 1.0  # no decay for Adam
 ALPHA = 0.10
 N_SUBGROUPS = 8
@@ -138,10 +138,11 @@ def train(seed=42):
                 else:
                     g = scale * (v_pert * shaped[:, None]).sum(axis=0)
                 lr_s = lr_scale_arr[idx]
-                # SGD with momentum (Nesterov-style)
-                new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + g
-                new_v[pkey] = v_buf[pkey]  # unused for SGD, keep for interface compat
-                new_params[pkey] = params[pkey] - lr * lr_s * (MOMENTUM * new_momentum[pkey] + g)
+                new_momentum[pkey] = MOMENTUM * momentum_buf[pkey] + (1 - MOMENTUM) * g
+                new_v[pkey] = ADAM_BETA2 * v_buf[pkey] + (1 - ADAM_BETA2) * g ** 2
+                m_hat = new_momentum[pkey] / (1 - MOMENTUM ** t)
+                v_hat = new_v[pkey] / (1 - ADAM_BETA2 ** t)
+                new_params[pkey] = params[pkey] - lr * lr_s * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
 
             return new_params, new_momentum, new_v, step + 1, key, jnp.mean(fp)
 
