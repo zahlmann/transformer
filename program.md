@@ -92,10 +92,11 @@ BPE (vocab=1024, tiled output — 8 tiles of 128):
   Speedup:        4.35x
 
 Phase A2: d_model=128, n_heads=4, n_layers=2, vocab=1024, 674K params:
-  Multi-block (3 launches/step):   335 tok/s, 1.89x
-  + fused decode (1 launch/step):  454 tok/s, 2.58x
-  + precomputed bf16 weights:      713 tok/s, 3.90x
-  JAX baseline:                    183 tok/s
+  Multi-block (3 launches/step):   335 tok/s,  1.89x
+  + fused decode (1 launch/step):  454 tok/s,  2.58x
+  + precomputed bf16 weights:      713 tok/s,  3.95x
+  + in-kernel cache updates:      2504 tok/s, 13.98x
+  JAX baseline:                    179 tok/s
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
@@ -168,17 +169,18 @@ kernels/block_decode.py:
 
 ### Phase B: Kernel Optimizations
 
+- ~~**Persistent kernel**: eliminate launch overhead~~ DONE — fused 2-layer decode
+  into single kernel (3→1 launch/step, 35% speedup)
+- ~~**Precompute weights**: avoid per-step dtype conversion~~ DONE — 57% speedup
 - **Quantization**: INT8/FP8 weights for decode (memory-bound, ~1.5-2x speedup)
 - **Batched decode**: multiple sequences share weights, enables tensor cores
-- **Persistent kernel**: eliminate launch overhead
 - **Speculative decoding**: trade compute for latency
 
-### Phase C: Multi-Layer Fusion
+### Phase C: Multi-Layer Fusion — DONE
 
-For 2+ layers, keep data in fast memory between layers:
-- One kernel per layer (simple, HBM between layers)
-- Shared memory handoff (stays on-chip, ~164KB limit)
-- Persistent kernel (loop over layers in registers, most complex)
+Fused 2-layer decode kernel keeps h in registers between layers (no HBM round-trip).
+Prefill still uses separate kernels per stage (HBM between stages) due to inter-block
+synchronization requirements.
 
 ---
 
@@ -268,3 +270,11 @@ inference_benchmark.py              — speed comparison benchmark
 15. **Never convert dtypes inside the decode loop.** `.astype(bf16)` creates a new JAX
     array every call. With 28 weight tensors × 63 steps = 1764 allocations → 57% slowdown.
     Precompute bf16 weights once before the loop.
+
+16. **Fold KV cache updates into the kernel.** `.at[:, pos, :].set()` creates a new array
+    copy every call. 4 caches × 0.27ms = 1.09ms per step — 73% of decode time!
+    Having the kernel write full updated caches directly gave 3.6x speedup.
+
+17. **For small models, host overhead > GPU compute.** The GPU kernel takes 0.4ms per
+    decode step, but Python/JAX dispatch, dtype conversions, and array scatters added
+    1.1ms. Eliminating all host-side overhead gave 7.5x improvement (335→2504 tok/s).
