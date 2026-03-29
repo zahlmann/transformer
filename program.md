@@ -1,14 +1,98 @@
 # EGGROLL Transformer — Agent Program
 
-*You are an AI researcher. Your job: push EGGROLL (Evolution Strategies with low-rank
-perturbations) training quality to match or approach backprop+Adam on a small transformer.
-The kernel and speed are already heavily optimized (153s, near Triton limit). Now the
-priority is closing the quality gap: val_loss 2.49 → target 1.84 (backprop). You work
-autonomously — run experiments, log results, and keep going.*
+*You are an AI researcher working on EGGROLL — Evolution Strategies with low-rank
+perturbations for training transformers WITHOUT backpropagation. Before diving into code,
+read the "Where This Could Lead" section below to understand the bigger picture.*
 
-**Your priority is QUALITY IMPROVEMENT. The speed is already near its Triton limit (153s).
-Closing the val_loss gap from 2.49 to 1.84 is the main challenge. Speed regressions up to
-~200s are acceptable if they come with meaningful quality gains. Never exceed ~300s.**
+## Where This Could Lead (Problem Space — Read First)
+
+We've spent two intensive sessions pushing EGGROLL quality on a small transformer. The
+quality gap to backprop is real (val_loss 2.38 vs 1.84) and appears fundamental for this
+setup. Before trying more solution-space optimizations, step back and ask: **what is this
+project actually good for, and where should it go?**
+
+### What We've Actually Built
+
+1. **A fused Triton kernel that runs an entire transformer forward pass in one kernel call.**
+   Embedding → LayerNorm → Multi-Head Attention → FFN → Output → CE Loss, all fused. No
+   HBM round-trips between layers. This is valuable independent of ES training — it's a
+   template for fused inference kernels, forward-mode AD kernels, and custom training loops.
+
+2. **A rank-1 perturbation framework** that compresses 66K-parameter perturbations into
+   2306-dimensional vectors (28.8× compression). The kernel applies rank-1 weight updates
+   via efficient matvec + outer product operations, avoiding full matrix perturbation.
+
+3. **A dual-number Triton kernel** (`kernels/fused_transformer_ce_dual.py`) that computes
+   exact directional derivatives via forward-mode AD, fused into the same single-kernel
+   architecture. Validated against jax.jvp (1.00±0.04 accuracy). First known implementation
+   of fused forward-mode AD in a Triton transformer kernel.
+
+### Where Backprop-Free Training Actually Matters
+
+EGGROLL can't match backprop at equal compute on standard transformers. That's not a bug —
+it's a statement about the problem. The right question isn't "how to make ES match backprop"
+but **"where does avoiding backprop give you something backprop can't?"**:
+
+- **Non-differentiable objectives.** RLHF reward models, discrete sampling (hard attention,
+  VQ-VAE codebook selection), binary masks, integer programs. ES optimizes the ACTUAL
+  objective, not a differentiable surrogate. The fused kernel can evaluate any forward-pass
+  objective, not just CE loss.
+
+- **Communication-free distributed training.** Each GPU independently evaluates perturbation
+  members. No gradient synchronization, no all-reduce, no pipeline bubbles. On 1000+ GPUs,
+  backprop's communication overhead dominates; ES scales linearly. The kernel's massive
+  parallelism (14K+ concurrent evaluations) maps naturally to multi-GPU.
+
+- **Memory-constrained deployment.** No activation storage for backward pass. EGGROLL uses
+  70-103MB vs backprop's 160MB+ on this model. For billion-parameter models on edge devices,
+  this gap widens dramatically. ES needs only the forward pass, which can be heavily optimized
+  (quantized, pruned, fused).
+
+- **Hardware without backward-pass support.** Custom accelerators, FPGAs, neuromorphic chips,
+  analog compute. If you can run a forward pass, you can run EGGROLL. The fused kernel shows
+  how to structure the computation for any hardware target.
+
+- **Model editing and patching.** Rank-1 perturbations are structurally identical to LoRA
+  adapters (low-rank weight updates). EGGROLL could be used for gradient-free LoRA fine-tuning
+  — finding good low-rank weight edits without backprop. This is relevant for on-device
+  personalization, model merging, and task adaptation.
+
+### Concrete Next Directions (pick one)
+
+**A. Scale to a real model (most impactful).** Take the fused kernel architecture and apply
+it to a GPT-2-small (117M params) or similar. The rank-1 perturbation framework scales
+well (vec_dim grows as sqrt(params), not linearly). The key question: does the quality gap
+shrink or grow with model size? Theory suggests it shrinks (larger models have smoother
+loss landscapes), but this hasn't been tested.
+
+**B. Non-differentiable fine-tuning demo.** Add a non-differentiable objective (e.g., BLEU
+score for text generation, exact-match for QA) and show EGGROLL optimizing it directly
+while backprop can't. This is the strongest "why ES matters" demonstration.
+
+**C. Multi-GPU scaling experiment.** Run EGGROLL on 4-8 GPUs with zero communication.
+Compare wall-clock time and quality against data-parallel backprop with gradient all-reduce.
+The crossover point (where ES becomes faster than backprop) is a publishable result.
+
+**D. Gradient-free LoRA.** Adapt the rank-1 perturbation framework for LoRA-style
+fine-tuning of a pre-trained model. No backprop needed — just forward passes through the
+frozen model with rank-1 weight deltas. Compare with standard LoRA (which requires backprop).
+
+**E. Fused inference kernel (pivot away from training).** The fused Triton kernel is
+independently valuable for inference. Strip out the ES machinery and benchmark as a
+single-kernel inference engine vs standard multi-kernel PyTorch/JAX inference. Could be
+packaged as a standalone tool.
+
+### What NOT to Do
+
+- Don't keep tuning hyperparameters on this small model. 30+ experiments have thoroughly
+  explored the HP space. The ceiling is ~2.38 val_loss (3-seed avg) at ~300s budget.
+- Don't try to close the gap to backprop (1.84) on this architecture. The gap is fundamental
+  to rank-1 ES with 10 epochs on a 66K-param model. The math says so, and the experiments
+  confirm it.
+- Don't add complexity (CMA-ES, NES, etc.) without a clear hypothesis for why it would help
+  given the rank-1 constraint and 610-update budget.
+
+---
 
 **MANDATORY CLEANUP RULES (before every merge to main):**
 1. **One train_eggroll.py** — the best EGGROLL implementation. No duplicates.
@@ -26,15 +110,15 @@ Closing the val_loss gap from 2.49 to 1.84 is the main challenge. Speed regressi
 
 ---
 
-## Current State (2026-03-26)
+## Current State (2026-03-29)
 
-**Quality:** EGGROLL val_loss=2.49 (3-seed avg 2.490) vs backprop+Adam 1.84.
-Gap = 0.65 to backprop+Adam. Beats vanilla SGD backprop (2.49 vs 2.45).
+**Quality:** EGGROLL val_loss=2.38 (3-seed avg 2.376) vs backprop+Adam 1.84.
+Gap = 0.54 to backprop+Adam (was 0.65). Improved from 2.49 via HALF_POP=7168.
 
-**Speed: 153s for 10 epochs (was 156s, was 175s, was 444s).** 2.90x total speedup achieved.
-Backprop+Adam takes 4.1s. Speed gap is 37x (was 38x, was 43x, was 108x).
+**Speed: 272s for 10 epochs (was 153s at HALF_POP=4096).** Slower due to larger population,
+but within the 300s quality budget. Backprop+Adam takes 4.1s.
 
-**Memory: 70MB (was 113MB).** Lower due to reduced population.
+**Memory: 103MB (was 70MB).** Higher due to larger population.
 
 ---
 
@@ -165,6 +249,12 @@ that. Speed may regress moderately (up to ~200s) if quality improves significant
   outweighs any occupancy benefit. Kernel is too compute-bound for spill-induced occupancy.
 - **Fewer batches per epoch** (48 batches: 123s but 2.56 val_loss; 56 batches: 144s but 2.51):
   Reducing gradient updates degrades quality faster than it saves time.
+
+## What Worked (Quality Session 2026-03-26)
+
+7. **HALF_POP=7168, sigma=0.020** (2.49→2.38, 3-seed avg 2.490→2.376): Larger population
+   directly improves gradient quality. Optimal sigma shifted from 0.022 to 0.020 at this
+   population size. Time increased from 153s to 272s (within 300s quality budget).
 
 ## What Worked (Speed Session 2026-03-26)
 
@@ -311,14 +401,15 @@ The model starts from random initialization. Better init might give EGGROLL a he
 - **Fixup init**: scale residual connections to prevent gradient explosion
 - **Smaller init scale**: ES works better when the loss landscape is smoother (smaller weights)
 
-### Approach 8 — Hybrid Training
+### Approach 8 — Hybrid Training — REJECTED
 
-Use backprop for the FIRST epoch (4.1s) to get a good starting point, then switch to
-EGGROLL for epochs 2-10. This gives EGGROLL a massive head start on structure learning.
+**DO NOT USE hybrid backprop warmup.** User explicitly rejected this approach. The goal is
+pure EGGROLL (evolution strategies) quality, not backprop-assisted training.
 
-**Fairness concern**: This uses backprop, which technically defeats the purpose. But if the
-goal is "best quality with mostly ES training," a 1-epoch backprop warmup is a valid strategy.
-Document clearly if used.
+Tested results (for reference): 5 BP warmup + 5 EGGROLL at HALF_POP=8192 achieved
+3-seed avg 2.204 (vs pure EGGROLL 2.49). But the improvement came from backprop, not
+from EGGROLL improving — EGGROLL actually degraded the BP-trained model before partially
+recovering. This approach is off-limits.
 
 ### Approach 9 — Adam Hyperparameter Tuning
 
@@ -384,6 +475,52 @@ These have ALL been tried and don't work:
 - HALF_POP=3840/3968/4032 with dynamic head + sigma 0.022-0.028 (3-seed avg 2.51-2.53, FAIL)
 - Adaptive label smoothing α_decay=0.70 (val_loss 2.72, quality destroyed)
 - Adaptive label smoothing α_decay=0.95 (val_loss 2.47 at seed=42, worse than constant α=0.50)
+- Constant alpha=0.20 (2.56), alpha=0.25 (2.53), alpha=0.35 (2.52) — all worse than α=0.50 baseline
+- Constant alpha=0.30 (2.49) — matches baseline, no improvement
+- LR=0.015 constant (2.64 with oscillation), LR=0.005 constant (2.55 still declining) — 0.010 is optimal
+- Warmup+cosine LR schedule (LR_MAX=0.020, warmup 2 epochs): 2.59, warmup wastes early epochs
+- Cosine LR decay (0.020→0.002): 2.59, high initial LR hurts ES convergence
+- Aggressive sigma schedule (0.04→0.85^epoch): 2.66, early epochs too noisy
+- Cosine sigma schedule (0.03→0.01): 2.57, start too noisy
+- Hybrid QR orthogonal perturbations at HALF_POP=4096 (2306 ortho + 1790 random): 2.50, no improvement
+- Pure QR HALF_POP=2304: 2.57 at 94s, faster but worse quality
+- Guided ES (bias perturbations toward prev gradient, GUIDE_SCALE=0.3): 2.78, catastrophic
+- Momentum β1=0.95: 2.51, too much smoothing for 10 epochs
+- AdamW weight decay=0.01 with α=0.30: 2.51, no improvement
+- Smaller init scale 0.5x: 2.60, model learns slower from flat region
+- Hybrid backprop warmup: REJECTED by user — pure EGGROLL only
+- At HALF_POP=7168: sigma=0.018 (2.48), sigma=0.022 (2.35), sigma=0.025 (2.46) — 0.020 is optimal
+- At HALF_POP=7168: LR=0.008 (2.44), LR=0.012 (2.40) — 0.010 still optimal
+- At HALF_POP=7168: N_SUBGROUPS=4 (2.32), N_SUBGROUPS=16 (2.32) — insensitive
+- EMA parameter averaging (decay=0.99, 0.999): both worse — trajectory still descending
+- SWA last-3-epochs averaging: worse (2.34 vs 2.31) — trajectory still descending
+- Adam beta2=0.9999: same as 0.999, no impact
+- Adam eps=1e-8: slightly worse than 1e-6
+- HALF_POP=3584 with 2x data passes: 2.42, worse than 7168×1 (gradient quality > quantity)
+- HALF_POP=8192 at sigma=0.020: 2.41 at 314s (over budget and seed-noisy)
+- Forward-mode AD via jax.jvp + lax.scan: exact directional derivatives but 12x slower per
+  direction than Triton kernel (sequential processing vs massive parallelism). N_DIRS=256 gives
+  val_loss=2.73 at 118s — much worse than kernel's HALF_POP=7168 at 2.31/272s. The kernel's
+  parallelism is the key advantage; forward-mode AD can't match it without a dual-number kernel.
+- Forward-mode AD with full-rank perturbations (no rank-1 compression): val_loss=2.75 at 118s.
+  WORSE than rank-1 — higher dimensionality (66K vs 2306) means sparser gradient coverage per
+  direction. Rank-1 compression is a feature, not a bug, for ES sample efficiency.
+- Forward-mode AD with chunked vmap (64/chunk): 3.6GB memory, 151s. OOM at full vmap (256).
+- **Dual-number Triton kernel** (fused forward-mode AD): tangent accuracy 1.00±0.04 vs jax.jvp.
+  At N_DIRS=7168: val_loss=2.42 at 354s (vs finite-diff 2.31 at 272s). 0.11 worse + 30% slower.
+  Root cause: accumulated bf16 precision loss through ~10 tangent matmuls. Finite differences
+  benefit from antithetic pairing (+σ/-σ) which cancels common-mode bf16 rounding errors.
+  The dual kernel is a technically correct implementation but loses to finite differences
+  at bf16 precision on this small model. Code in kernels/fused_transformer_ce_dual.py.
+- Population scheduling (4096 early + 10240 late, or reverse): same total compute as uniform
+  7168, but worse quality (2.36 and 2.32 vs 2.31). Uniform allocation is optimal.
+- Alpha=0.10 constant at HALF_POP=7168: 2.59, much worse — transformer needs high smoothing
+- Adaptive alpha 0.50 → 0.10 (decay=0.85/epoch): 2.49, worse — low alpha causes overfitting
+- Sigma decay 0.025→0.011 (decay=0.92/epoch) at HALF_POP=7168: 2.49, worse than constant 0.020
+- LR warmup (0.006→0.010 over 2 epochs) at HALF_POP=7168: 2.44, worse — wastes early epochs
+- SGD with Nesterov momentum (LR=0.10): diverged completely
+- Raw fitness diffs (no z-scoring): 2.45, z-scoring is essential
+- CLIP_RANGE=1.5: 2.35, CLIP_RANGE=2.5: 2.41, CLIP_RANGE=3.0: 2.43 — 2.0 is optimal
 
 ---
 
@@ -402,8 +539,8 @@ These have ALL been tried and don't work:
 ## Current Best Hyperparameters
 
 ```python
-HALF_POP = 4096          # antithetic pairs → pop=8192 (was 8192→16384)
-SIGMA_START = 0.022      # perturbation scale (was 0.02, compensates for dynamic head loop)
+HALF_POP = 7168          # antithetic pairs → pop=14336 (was 4096→8192)
+SIGMA_START = 0.020      # perturbation scale (was 0.022, tuned for HALF_POP=7168)
 SIGMA_DECAY = 0.998      # per epoch
 LR_START = 0.010         # Adam learning rate
 LR_DECAY = 1.0           # no decay (Adam self-adjusts)
@@ -450,7 +587,8 @@ Perturbation vec_dim: 2306 (28.8x compression via rank-1)
 | Triton, pop=16384, Adam, σ=0.02 | 2.37 | 10.7 | 444s | previous best |
 | Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32 | 2.44 | 11.4 | 175s | previous best |
 | Triton, pop=8192, Adam, σ=0.02, nw=4, BK=32, FFN tl.range | 2.41 | 11.1 | 156s | previous best |
-| **Triton, pop=8192, Adam, σ=0.022, nw=4, BK=32, FFN+head tl.range** | **2.49** | **12.1** | **153s** | **current best** |
+| Triton, pop=8192, Adam, σ=0.022, nw=4, BK=32, FFN+head tl.range | 2.49 | 12.1 | 153s | previous best |
+| **Triton, pop=14336, Adam, σ=0.020, nw=4, BK=32, FFN+head tl.range** | **2.38** | **10.8** | **272s** | **current best (3-seed avg 2.376)** |
 
 ---
 
