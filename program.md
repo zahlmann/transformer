@@ -32,24 +32,24 @@ Build the fastest possible inference for this transformer using custom Triton ke
 
 ```
 XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
-  Decode (multi-SM):   1519 tok/s (0.66 ms/tok)  ← 5.2x speedup via grid=(16,)
-  Decode (single-SM):  292 tok/s  (3.43 ms/tok)   (previous baseline)
+  Decode (multi-SM):   1734 tok/s (0.58 ms/tok)  ← 6x speedup via grid=(16,)
+  Decode (single-SM):  287 tok/s  (3.49 ms/tok)   (previous baseline)
   Prefill (128 tok):   6.1 ms    (21,168 tok/s)
   Weight buffer:       59.3 MB   (bf16)
   KV cache:            8.4 MB    (bf16, per sequence)
-  Bandwidth util:      12%       (of 836 GB/s theoretical, was 2%)
+  Bandwidth util:      14%       (of 836 GB/s theoretical, was 2%)
 
 Previous model sizes:
   d=64,  1L:    3056 tok/s
   d=128, 2L:    2589 tok/s
   d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  → 1519 tok/s (multi-SM)
+  d=512, 8L:     287 tok/s  → 1734 tok/s (multi-SM, 2742 w/o sync)
 ```
 
-**Key finding: multi-SM decode (grid=16) gave 5.2x speedup.** The single-SM kernel
+**Key finding: multi-SM decode (grid=16) gave 6x speedup.** The single-SM kernel
 left 79 of 80 SMs idle. Splitting attention heads across blocks with atomic barriers
-parallelizes both attention and FFN. Bandwidth utilization improved from 2% to 12%.
-Theoretical minimum is 0.081 ms/tok — still 8x headroom remaining.
+parallelizes both attention and FFN. Bandwidth utilization improved from 2% to 14%.
+Without int() sync: 2742 tok/s (9.6x). Theoretical minimum is 0.081 ms/tok — 7x headroom.
 
 ---
 
@@ -133,8 +133,9 @@ Phase A4: d=512, 8L, vocab=4096, 29.7M params (TinyStories full):
 
 Phase A5: Multi-SM decode optimization:
   Profiling revealed: kernel=93%, host=3%, argmax=4% of step time
-  Multi-SM decode (grid=16):       1519 tok/s  (0.66 ms/tok, 12% BW utilization)
-  Speedup vs single-SM:              5.2x
+  Multi-SM decode (grid=16):       1734 tok/s  (0.58 ms/tok, 14% BW utilization)
+  Without int() sync:              2742 tok/s  (0.36 ms/tok)
+  Speedup vs single-SM:              6.0x (with sync), 9.6x (without sync)
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.

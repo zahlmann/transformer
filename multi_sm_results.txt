@@ -1,6 +1,8 @@
-# Multi-SM decode test — 2026-03-31 00:38
-single_sm_ms: 231.5
-multi_sm_ms: 42.2
-speedup: 5.49
-single_tok_s: 276
-multi_tok_s: 1517
+# Multi-SM decode test — 2026-03-31 00:59
+single_sm_ms: 223.4
+multi_sm_sync_ms: 38.0
+multi_sm_no_sync_ms: 23.3
+speedup_sync: 5.87
+speedup_no_sync: 9.57
+multi_sync_tok_s: 1682
+multi_no_sync_tok_s: 2742

@@ -30,7 +30,7 @@ from model import count_params
 from kernels.block_prefill import block_prefill
 from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
-from kernels.multi_sm_decode import multi_sm_decode_nlayer, allocate_workspace
+from kernels.multi_sm_decode import multi_sm_decode_nlayer
 
 
 def load_params():
@@ -69,11 +69,7 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
     kv_tmp = kv_packed
     t = tok
     for i in range(5):
-        ws = allocate_workspace(config) if use_multi_sm else None
-        if use_multi_sm:
-            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size, workspace=ws)
-        else:
-            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
+        logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
         t = jnp.argmax(logits)
         _ = int(t)
 
@@ -85,11 +81,7 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
         tokens = []
         t0 = time.perf_counter()
         for i in range(n_tokens):
-            if use_multi_sm:
-                ws = allocate_workspace(config)
-                logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size, workspace=ws)
-            else:
-                logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
+            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
             t = jnp.argmax(logits)
             tokens.append(int(t))
         times.append(time.perf_counter() - t0)

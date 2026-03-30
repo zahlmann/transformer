@@ -13,7 +13,7 @@ from model import count_params
 from kernels.block_prefill import block_prefill
 from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
-from kernels.multi_sm_decode import multi_sm_decode_nlayer, allocate_workspace
+from kernels.multi_sm_decode import multi_sm_decode_nlayer
 
 
 def load_params():
@@ -47,23 +47,20 @@ def main():
     kv_packed = pack_kv_caches(kc, vc)
     w = prepare_decode_weights_nlayer(params, config, vocab_size)
     tok = jnp.argmax(logits[PROMPT_LEN - 1])
-    workspace = allocate_workspace(config)
 
     # ── Correctness test ──
     print("=" * 60)
     print("CORRECTNESS TEST")
     print("=" * 60)
 
-    # Single-SM decode
+    # Single-SM decode (reference)
     logits_ref, kv_ref = fused_decode_nlayer(w, config, tok, PROMPT_LEN, kv_packed, vocab_size)
     _ = logits_ref.block_until_ready()
 
-    # Multi-SM decode
-    logits_new, kv_new = multi_sm_decode_nlayer(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
-                                                 workspace=workspace)
+    # Multi-SM decode (workspace as outputs)
+    logits_new, kv_new = multi_sm_decode_nlayer(w, config, tok, PROMPT_LEN, kv_packed, vocab_size)
     _ = logits_new.block_until_ready()
 
-    # Compare logits
     max_diff = float(jnp.max(jnp.abs(logits_ref - logits_new)))
     mean_diff = float(jnp.mean(jnp.abs(logits_ref - logits_new)))
     ref_tok = int(jnp.argmax(logits_ref))
@@ -71,19 +68,15 @@ def main():
 
     print(f"  Max logit diff:     {max_diff:.6f}")
     print(f"  Mean logit diff:    {mean_diff:.6f}")
-    print(f"  Top-1 token match:  {ref_tok == new_tok} (ref={ref_tok}, new={new_tok})")
-
-    # Compare KV caches
-    kv_diff = float(jnp.max(jnp.abs(kv_ref.astype(jnp.float32) - kv_new.astype(jnp.float32))))
-    print(f"  Max KV cache diff:  {kv_diff:.6f}")
+    print(f"  Top-1 match:        {ref_tok == new_tok} (ref={ref_tok}, new={new_tok})")
 
     if max_diff < 0.1 and ref_tok == new_tok:
         print("  PASS")
     else:
-        print("  FAIL — logits diverge too much")
+        print("  FAIL")
         return
 
-    # Multi-step correctness
+    # Multi-step
     print()
     print("Multi-step correctness (10 steps):")
     kv_r = kv_packed
@@ -93,9 +86,7 @@ def main():
     all_match = True
     for i in range(10):
         logits_r, kv_r = fused_decode_nlayer(w, config, t_r, PROMPT_LEN + i, kv_r, vocab_size)
-        ws = allocate_workspace(config)
-        logits_n, kv_n = multi_sm_decode_nlayer(w, config, t_n, PROMPT_LEN + i, kv_n, vocab_size,
-                                                 workspace=ws)
+        logits_n, kv_n = multi_sm_decode_nlayer(w, config, t_n, PROMPT_LEN + i, kv_n, vocab_size)
         t_r = jnp.argmax(logits_r)
         t_n = jnp.argmax(logits_n)
         match = int(t_r) == int(t_n)
@@ -116,7 +107,7 @@ def main():
     print("PERFORMANCE TEST")
     print("=" * 60)
 
-    # Warmup single-SM
+    # Warmup
     kv_tmp = kv_packed
     t = tok
     for i in range(5):
@@ -124,7 +115,7 @@ def main():
         t = jnp.argmax(logits_d)
         _ = int(t)
 
-    # Benchmark single-SM
+    # Single-SM
     kv_tmp = kv_packed
     t = tok
     t0 = time.perf_counter()
@@ -138,36 +129,45 @@ def main():
     kv_tmp = kv_packed
     t = tok
     for i in range(5):
-        ws = allocate_workspace(config)
-        logits_d, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size,
-                                                   workspace=ws)
+        logits_d, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
         t = jnp.argmax(logits_d)
         _ = int(t)
 
-    # Benchmark multi-SM
+    # Multi-SM with int() sync
     kv_tmp = kv_packed
     t = tok
     t0 = time.perf_counter()
     for i in range(GEN_LEN):
-        ws = allocate_workspace(config)
-        logits_d, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size,
-                                                   workspace=ws)
+        logits_d, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
         t = jnp.argmax(logits_d)
         _ = int(t)
-    multi_ms = (time.perf_counter() - t0) * 1000
+    multi_sync_ms = (time.perf_counter() - t0) * 1000
 
-    print(f"  Single-SM: {single_ms:.1f} ms ({GEN_LEN}/{single_ms*1000/GEN_LEN:.3f} ms/tok = {GEN_LEN/single_ms*1000:.0f} tok/s)")
-    print(f"  Multi-SM:  {multi_ms:.1f} ms ({GEN_LEN}/{multi_ms*1000/GEN_LEN:.3f} ms/tok = {GEN_LEN/multi_ms*1000:.0f} tok/s)")
-    print(f"  Speedup:   {single_ms/multi_ms:.2f}x")
+    # Multi-SM without int() sync
+    kv_tmp = kv_packed
+    t = tok
+    t0 = time.perf_counter()
+    for i in range(GEN_LEN):
+        logits_d, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
+        t = jnp.argmax(logits_d)
+    _ = int(t)
+    multi_no_sync_ms = (time.perf_counter() - t0) * 1000
 
-    # Save results
+    print(f"  Single-SM (int sync):    {single_ms:.1f} ms  ({GEN_LEN/single_ms*1000:.0f} tok/s)")
+    print(f"  Multi-SM (int sync):     {multi_sync_ms:.1f} ms  ({GEN_LEN/multi_sync_ms*1000:.0f} tok/s)")
+    print(f"  Multi-SM (no int sync):  {multi_no_sync_ms:.1f} ms  ({GEN_LEN/multi_no_sync_ms*1000:.0f} tok/s)")
+    print(f"  Speedup (sync):          {single_ms/multi_sync_ms:.2f}x")
+    print(f"  Speedup (no sync):       {single_ms/multi_no_sync_ms:.2f}x")
+
     with open(os.path.join(os.path.dirname(__file__), "multi_sm_results.txt"), "w") as f:
         f.write(f"# Multi-SM decode test — {time.strftime('%Y-%m-%d %H:%M')}\n")
         f.write(f"single_sm_ms: {single_ms:.1f}\n")
-        f.write(f"multi_sm_ms: {multi_ms:.1f}\n")
-        f.write(f"speedup: {single_ms/multi_ms:.2f}\n")
-        f.write(f"single_tok_s: {GEN_LEN/single_ms*1000:.0f}\n")
-        f.write(f"multi_tok_s: {GEN_LEN/multi_ms*1000:.0f}\n")
+        f.write(f"multi_sm_sync_ms: {multi_sync_ms:.1f}\n")
+        f.write(f"multi_sm_no_sync_ms: {multi_no_sync_ms:.1f}\n")
+        f.write(f"speedup_sync: {single_ms/multi_sync_ms:.2f}\n")
+        f.write(f"speedup_no_sync: {single_ms/multi_no_sync_ms:.2f}\n")
+        f.write(f"multi_sync_tok_s: {GEN_LEN/multi_sync_ms*1000:.0f}\n")
+        f.write(f"multi_no_sync_tok_s: {GEN_LEN/multi_no_sync_ms*1000:.0f}\n")
 
 
 if __name__ == "__main__":

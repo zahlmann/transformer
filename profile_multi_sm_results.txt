@@ -1,0 +1,6 @@
+# Multi-SM profiling — 2026-03-31 00:43
+total_per_step_ms: 0.704
+gpu_kernel_ms: 0.444
+argmax_sync_ms: 0.077
+host_overhead_ms: 0.183
+workspace_alloc_ms: 0.1841
