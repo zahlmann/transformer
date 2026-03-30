@@ -26,27 +26,30 @@ Build the fastest possible inference for this transformer using custom Triton ke
 10. AdamW + LR warmup + cosine decay training improvements
 11. Speculative decoding with parallel verification kernel
 12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
+13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
 
 ### Current Performance (RTX 4080 Super)
 
 ```
 XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
-  Decode:              287 tok/s  (3.48 ms/tok)
-  Prefill (128 tok):   6.3 ms    (20,460 tok/s)
+  Decode (multi-SM):   1519 tok/s (0.66 ms/tok)  ← 5.2x speedup via grid=(16,)
+  Decode (single-SM):  292 tok/s  (3.43 ms/tok)   (previous baseline)
+  Prefill (128 tok):   6.1 ms    (21,168 tok/s)
   Weight buffer:       59.3 MB   (bf16)
   KV cache:            8.4 MB    (bf16, per sequence)
-  Bandwidth util:      2%        (of 836 GB/s theoretical)
+  Bandwidth util:      12%       (of 836 GB/s theoretical, was 2%)
 
 Previous model sizes:
   d=64,  1L:    3056 tok/s
   d=128, 2L:    2589 tok/s
   d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  ← current focus
+  d=512, 8L:     287 tok/s  → 1519 tok/s (multi-SM)
 ```
 
-**Key finding: the GPU is 98% idle.** Theoretical minimum is 0.081 ms/tok at full
-bandwidth, we achieve 3.48 ms/tok. The bottleneck is kernel launch overhead and
-dispatch latency, not memory bandwidth or compute.
+**Key finding: multi-SM decode (grid=16) gave 5.2x speedup.** The single-SM kernel
+left 79 of 80 SMs idle. Splitting attention heads across blocks with atomic barriers
+parallelizes both attention and FFN. Bandwidth utilization improved from 2% to 12%.
+Theoretical minimum is 0.081 ms/tok — still 8x headroom remaining.
 
 ---
 
@@ -128,6 +131,11 @@ Phase A3: d=256, 4L, vocab=4096, 5.3M params (TinyStories):
 Phase A4: d=512, 8L, vocab=4096, 29.7M params (TinyStories full):
   Fused N-layer decode:             287 tok/s  (3.48 ms/tok, 2% BW utilization)
 
+Phase A5: Multi-SM decode optimization:
+  Profiling revealed: kernel=93%, host=3%, argmax=4% of step time
+  Multi-SM decode (grid=16):       1519 tok/s  (0.66 ms/tok, 12% BW utilization)
+  Speedup vs single-SM:              5.2x
+
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
 - Python dispatch overhead per jt.triton_call is ~0.4ms. Fusing all decode
@@ -135,8 +143,11 @@ Key findings:
 - .astype(bf16) per decode step created 1764 unnecessary allocations.
   Precomputing once gave another 57% speedup.
 - In-kernel KV cache updates were the biggest single win (3.6x).
-- At d=512, bandwidth utilization is only 2%. The GPU is 98% idle.
-  Theoretical min at 836 GB/s is 0.081 ms/tok vs achieved 3.48 ms/tok.
+- At d=512 single-SM, bandwidth utilization was only 2%. GPU was 98% idle.
+- Multi-SM decode with atomic barriers: 5.2x speedup (287→1519 tok/s).
+  Splits attention heads across 16 blocks, distributes FFN across all blocks.
+  Uses release/acquire atomics for cross-block synchronization.
+  Bandwidth utilization improved from 2% to 12%.
 ```
 
 ---
@@ -501,7 +512,9 @@ kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
 kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
+kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS,) with atomic barriers
 profile_kernels.py                  — primary profiling tool (run after every change)
+profile_host_overhead.py            — detailed host vs GPU timing breakdown
 inference_benchmark.py              — quick throughput benchmark
 baseline_metrics.txt                — current numbers to beat
 ```
@@ -611,3 +624,28 @@ baseline_metrics.txt                — current numbers to beat
     (MAX_SEQ, D_HEAD) = (512, 32) cache at once overflows shared memory (139KB > 101KB).
     Online softmax with KV_TILE=64 tiles the cache: each tile loads (64, 32) = 4KB.
     Same algorithm as FlashAttention but for the M=1 single-token case.
+
+27. **At d=512, the GPU kernel is 93% of step time, not host overhead.** Profiling
+    showed: kernel=3.35ms (93%), argmax+sync=0.13ms (4%), host=0.11ms (3%). The
+    original hypothesis that Python dispatch was the bottleneck was wrong at this
+    model scale. Host overhead matters for small models (d≤128) but is negligible
+    at d=512 where the kernel dominates.
+
+28. **Multi-SM decode with atomic barriers gives 5.2x speedup.** grid=(N_HEADS=16,)
+    instead of grid=(1,) — each block handles one attention head, and all blocks
+    split the FFN. Uses `tl.atomic_add` with `sem='release'/'acquire', scope='gpu'`
+    for cross-block barriers. Two barriers per layer: one after attention (before
+    FFN), one after FFN (before next layer). All blocks redundantly compute LN and
+    reductions (32KB from L2, negligible cost). 287→1519 tok/s, 2%→12% BW utilization.
+
+29. **Redundant computation is cheaper than synchronization.** In the multi-SM kernel,
+    all 16 blocks independently compute LayerNorm and reduce the 16 partial results
+    (16×512 f32 = 32KB reads). This is redundant but costs only ~1µs per block from
+    L2 cache. The alternative — having one block compute and broadcast — would need
+    an additional barrier (~5µs) plus the serial bottleneck.
+
+30. **Use tl.range (not static_range) for the layer loop in large kernels.** With 8
+    layers and the full multi-SM kernel body (attention + FFN + barriers + reductions),
+    `tl.static_range` unrolls the loop at compile time, creating enormous IR that takes
+    10+ minutes to compile. `tl.range` compiles the loop body once and executes it
+    dynamically — identical runtime performance, 10x faster compilation.

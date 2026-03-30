@@ -30,6 +30,7 @@ from model import count_params
 from kernels.block_prefill import block_prefill
 from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
+from kernels.multi_sm_decode import multi_sm_decode_nlayer, allocate_workspace
 
 
 def load_params():
@@ -59,13 +60,20 @@ def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
     return np.median(times) * 1000, logits, kc, vc
 
 
-def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10):
+def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10,
+                   use_multi_sm=True):
     """Measure decode throughput."""
+    decode_fn = multi_sm_decode_nlayer if use_multi_sm else fused_decode_nlayer
+
     # Warmup
     kv_tmp = kv_packed
     t = tok
     for i in range(5):
-        logits, kv_tmp = fused_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+        ws = allocate_workspace(config) if use_multi_sm else None
+        if use_multi_sm:
+            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size, workspace=ws)
+        else:
+            logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
         t = jnp.argmax(logits)
         _ = int(t)
 
@@ -77,7 +85,11 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
         tokens = []
         t0 = time.perf_counter()
         for i in range(n_tokens):
-            logits, kv_tmp = fused_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+            if use_multi_sm:
+                ws = allocate_workspace(config)
+                logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size, workspace=ws)
+            else:
+                logits, kv_tmp = decode_fn(w, config, t, start_pos + i, kv_tmp, vocab_size)
             t = jnp.argmax(logits)
             tokens.append(int(t))
         times.append(time.perf_counter() - t0)
@@ -176,9 +188,10 @@ def main():
     w = prepare_decode_weights_nlayer(params, config, vocab_size)
     tok = jnp.argmax(logits[PROMPT_LEN - 1])
 
-    print(f"--- Decode ({GEN_LEN} tokens) ---")
+    # Multi-SM decode (primary)
+    print(f"--- Decode: Multi-SM ({GEN_LEN} tokens, grid={n_heads}) ---")
     decode_ms, tokens = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
-                                        n_tokens=GEN_LEN, n_runs=args.n_runs)
+                                        n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=True)
     tok_per_s = GEN_LEN / decode_ms * 1000
     ms_per_tok = decode_ms / GEN_LEN
     print(f"Total:            {decode_ms:.1f} ms")
@@ -186,10 +199,22 @@ def main():
     print(f"Throughput:       {tok_per_s:.0f} tok/s")
     print()
 
+    # Single-SM decode (reference)
+    print(f"--- Decode: Single-SM ({GEN_LEN} tokens, grid=1) ---")
+    decode_ms_old, _ = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
+                                       n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=False)
+    tok_per_s_old = GEN_LEN / decode_ms_old * 1000
+    ms_per_tok_old = decode_ms_old / GEN_LEN
+    print(f"Total:            {decode_ms_old:.1f} ms")
+    print(f"Per token:        {ms_per_tok_old:.3f} ms/tok")
+    print(f"Throughput:       {tok_per_s_old:.0f} tok/s")
+    print(f"Multi-SM speedup: {decode_ms_old / decode_ms:.2f}x")
+    print()
+
     # End-to-end
     total_ms = prefill_ms + decode_ms
     total_tokens = PROMPT_LEN + GEN_LEN
-    print(f"--- End-to-End ---")
+    print(f"--- End-to-End (Multi-SM) ---")
     print(f"Total:            {total_ms:.1f} ms for {total_tokens} tokens")
     print(f"Decode tok/s:     {tok_per_s:.0f}")
     print(f"Generated text:   {decode_fn(tokens)[:200]}...")
@@ -217,6 +242,8 @@ def main():
         "prefill_ms": round(prefill_ms, 2),
         "decode_tok_s": round(tok_per_s, 0),
         "decode_ms_per_tok": round(ms_per_tok, 3),
+        "decode_tok_s_single_sm": round(tok_per_s_old, 0),
+        "multi_sm_speedup": round(decode_ms_old / decode_ms, 2),
         "weight_buffer_mb": round(mem["weight_buffer_mb"], 1),
         "kv_cache_mb": round(mem["kv_cache_mb"], 1),
         "bandwidth_util_pct": round(bandwidth_util, 0),
