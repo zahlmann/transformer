@@ -413,7 +413,7 @@ uv run inference_benchmark.py                                     # inference sp
 
 ```
 program.md                          — this file (read first)
-inference_guide.md                  — ground-up explanation of GPU kernels + this project
+repo_explained_from_zero.md                  — ground-up explanation of GPU kernels + this project
 README.md                           — project overview
 model.py                            — JAX transformer model (inference baseline)
 train_backprop.py                   — AdamW training with LR schedule
@@ -424,11 +424,7 @@ kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
 kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
-kernels/verify_decode.py            — parallel batch verification kernel (speculative decode)
 inference_benchmark.py              — speed comparison benchmark
-speculative_decode.py               — speculative decoding benchmark (draft+target)
-draft_weights.pkl                   — draft model weights (d=128, 1L, 1.3M params)
-target_weights.pkl                  — target model weights (d=256, 4L, 5.3M params)
 ```
 
 ---

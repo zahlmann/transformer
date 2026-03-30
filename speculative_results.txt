@@ -1,5 +1,0 @@
-Draft:  d=128 l=1 params=1,279,360
-Target: d=256 l=4 params=5,318,144
-Standard: 1395 tok/s (91.8ms)
-K=2 seq: 707 tok/s, par: 715 tok/s, kernel_speedup=1.01x, acc=50.0%
-K=4 seq: 488 tok/s, par: 632 tok/s, kernel_speedup=1.30x, acc=35.9%

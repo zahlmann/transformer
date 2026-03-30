@@ -58,10 +58,6 @@ Fully fused N-layer kernel processes all layers in one launch using packed weigh
 - **tl.dot projections** — avoids register overflow at d=512 by tiling internally
 - **Tiled KV decode** — online softmax over KV_TILE=64 for large context (512+)
 
-### Speculative Decoding
-
-Draft model (d=128, 1L) proposes tokens, target model (d=256, 4L) verifies in parallel via custom batch verification kernel. Key finding: diminishing returns when both models are already fast from fused kernels.
-
 ### Training
 
 AdamW with linear warmup + cosine decay. Full TinyStories (487M BPE tokens, vocab=4096). Chunked tokenization to handle 1.9GB text without OOM.
@@ -81,7 +77,7 @@ XL:     d=512, h=16, l=8, vocab=4096, 29.7M params  (TinyStories full)
 
 ```
 program.md                              agent program (read first for context)
-inference_guide.md                      ground-up explanation of GPU kernels
+repo_explained_from_zero.md                      ground-up explanation of GPU kernels
 model.py                                JAX transformer (inference baseline)
 train_backprop.py                       AdamW training with LR schedule
 data.py                                 Shakespeare + TinyStories + BPE tokenizer
@@ -91,7 +87,5 @@ kernels/block_prefill.py                multi-block prefill + FlashAttention (d_
 kernels/block_decode.py                 per-layer decode (d_model>=128)
 kernels/fused_decode_2layer.py          fully fused 2-layer decode
 kernels/fused_decode_nlayer.py          fully fused N-layer decode (packed weights/caches)
-kernels/verify_decode.py                parallel batch verification (speculative decode)
 inference_benchmark.py                  speed comparison benchmark
-speculative_decode.py                   speculative decoding benchmark
 ```

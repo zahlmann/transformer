@@ -6,3 +6,4 @@ results.tsv
 *.log
 .python-version
 kernels/cuda/*.so
+*.pkl
