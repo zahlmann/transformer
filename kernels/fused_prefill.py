@@ -11,13 +11,12 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-SEQ       = tl.constexpr(128)
-D_MODEL   = tl.constexpr(64)
-D_HEAD    = tl.constexpr(32)
-D_FF      = tl.constexpr(256)
-VOCAB     = tl.constexpr(65)
-VOCAB_PAD = tl.constexpr(128)  # pad to power-of-2 for tl.dot alignment
-BLOCK_K   = tl.constexpr(32)
+SEQ        = tl.constexpr(128)
+D_MODEL    = tl.constexpr(64)
+D_HEAD     = tl.constexpr(32)
+D_FF       = tl.constexpr(256)
+BLOCK_K    = tl.constexpr(32)
+VOCAB_TILE = tl.constexpr(128)  # tile size for output projection loop
 
 
 @triton.jit
@@ -34,6 +33,9 @@ def _prefill_kernel(
     x_ptr,
     # Outputs
     logits_ptr, k_cache_ptr, v_cache_ptr,
+    # Constexpr parameters for variable vocab
+    VOCAB_SIZE: tl.constexpr,
+    VOCAB_PAD: tl.constexpr,
 ):
     pos = tl.arange(0, SEQ)
     d = tl.arange(0, D_MODEL)
@@ -99,29 +101,36 @@ def _prefill_kernel(
     hcf = h - mean_f
     h_final = lnf_s[None, :] * hcf * tl.math.rsqrt(tl.sum(hcf * hcf, axis=1)[:, None] / D_MODEL + 1e-5) + lnf_b[None, :]
 
-    # ── Output Projection ──
-    v = tl.arange(0, VOCAB_PAD)
-    logits = tl.dot(h_final.to(tl.bfloat16), tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + v[None, :]).to(tl.bfloat16)).to(tl.float32)
-    logits = tl.where(v[None, :] < VOCAB, logits, -1e9)
-    tl.store(logits_ptr + pos[:, None] * VOCAB_PAD + v[None, :], logits)
+    # ── Output Projection (tiled over vocab dimension) ──
+    for v_start in tl.range(0, VOCAB_PAD, VOCAB_TILE):
+        vv = v_start + tl.arange(0, VOCAB_TILE)
+        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.bfloat16)
+        tile_logits = tl.dot(h_final.to(tl.bfloat16), out_w).to(tl.float32)
+        tile_logits = tl.where(vv[None, :] < VOCAB_SIZE, tile_logits, -1e9)
+        tl.store(logits_ptr + pos[:, None] * VOCAB_PAD + vv[None, :], tile_logits)
 
 
-def fused_prefill(params, x):
+def fused_prefill(params, x, vocab_size=65):
     """Run full prefill in one fused kernel call.
 
     Args:
         params: weight dict from model.init_transformer
         x: (128,) int32 token IDs
+        vocab_size: actual vocabulary size
 
     Returns:
-        logits:  (128, 65) float32
+        logits:  (128, vocab_size) float32
         k_cache: (2, 128, 32) bf16
         v_cache: (2, 128, 32) bf16
     """
     assert x.shape == (128,)
+    vocab_pad = ((vocab_size + 127) // 128) * 128  # round up to VOCAB_TILE
 
     def bf(key):
         return params[key].astype(jnp.bfloat16)
+
+    pad_v = vocab_pad - params["output_proj"].shape[1]
+    output_proj_padded = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
 
     logits_pad, k_cache, v_cache = jt.triton_call(
         bf("token_emb"), bf("pos_emb"),
@@ -132,16 +141,18 @@ def fused_prefill(params, x):
         bf("layer0.ffn.up"), bf("layer0.ffn.up_bias"),
         bf("layer0.ffn.down"), bf("layer0.ffn.down_bias"),
         bf("ln_final.scale"), bf("ln_final.bias"),
-        jnp.pad(params["output_proj"], [(0, 0), (0, 63)]).astype(jnp.bfloat16),
+        output_proj_padded,
         x.astype(jnp.int32),
         kernel=_prefill_kernel,
         out_shape=[
-            jax.ShapeDtypeStruct((128, 128), jnp.float32),
+            jax.ShapeDtypeStruct((128, vocab_pad), jnp.float32),
             jax.ShapeDtypeStruct((2, 128, 32), jnp.bfloat16),
             jax.ShapeDtypeStruct((2, 128, 32), jnp.bfloat16),
         ],
         grid=(1,),
         num_warps=4,
         num_stages=1,
+        VOCAB_SIZE=vocab_size,
+        VOCAB_PAD=vocab_pad,
     )
-    return logits_pad[:, :65], k_cache, v_cache
+    return logits_pad[:, :vocab_size], k_cache, v_cache

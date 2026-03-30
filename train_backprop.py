@@ -1,6 +1,6 @@
 """Backprop+Adam baseline.
 
-Usage: uv run train_backprop.py [--seed SEED] [--lr LR]
+Usage: uv run train_backprop.py [--seed SEED] [--lr LR] [--tokenizer char|bpe] [--bpe-vocab 512]
 """
 
 import os
@@ -16,12 +16,12 @@ import optax
 from data import prepare_data
 from model import init_transformer, transformer_forward_batch, cross_entropy_loss, count_params
 
-D_MODEL = 64; N_HEADS = 2; N_LAYERS = 1; CONTEXT_LEN = 128; BATCH_SIZE = 128
-EPOCHS = 10; SEED = 42
+D_MODEL = 128; N_HEADS = 4; N_LAYERS = 2; CONTEXT_LEN = 128; BATCH_SIZE = 64
+EPOCHS = 20; SEED = 42
 
 
-def train(lr=1e-3, seed=SEED):
-    data = prepare_data(context_len=CONTEXT_LEN)
+def train(lr=1e-3, seed=SEED, tokenizer="char", bpe_vocab_size=512):
+    data = prepare_data(context_len=CONTEXT_LEN, tokenizer=tokenizer, bpe_vocab_size=bpe_vocab_size)
     vocab_size = data["vocab_size"]
 
     key = jax.random.key(seed)
@@ -55,7 +55,8 @@ def train(lr=1e-3, seed=SEED):
         logits = transformer_forward_batch(params, config, x)
         return cross_entropy_loss(logits, y)
 
-    print(f"=== Backprop+Adam LR={lr} seed={seed} ===")
+    print(f"=== Backprop+Adam LR={lr} seed={seed} tokenizer={tokenizer} vocab={vocab_size} ===")
+    print(f"Params: {count_params(params):,}")
 
     t_start = time.perf_counter()
     for epoch in range(EPOCHS):
@@ -83,9 +84,14 @@ def train(lr=1e-3, seed=SEED):
 
     # Save weights for inference
     import pickle
-    with open(os.path.join(os.path.dirname(__file__), "weights.pkl"), "wb") as f:
-        pickle.dump({"params": jax.tree.map(np.asarray, params), "config": config}, f)
-    print("Saved weights to weights.pkl")
+    save_path = os.path.join(os.path.dirname(__file__), "weights.pkl")
+    with open(save_path, "wb") as f:
+        pickle.dump({
+            "params": jax.tree.map(np.asarray, params),
+            "config": config,
+            "tokenizer": tokenizer,
+        }, f)
+    print(f"Saved weights to weights.pkl (tokenizer={tokenizer})")
 
     return float(vl), total, peak_mb
 
@@ -94,5 +100,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tokenizer", type=str, default="char", choices=["char", "bpe", "trained_bpe"])
+    parser.add_argument("--bpe-vocab", type=int, default=512)
     args = parser.parse_args()
-    train(lr=args.lr, seed=args.seed)
+    train(lr=args.lr, seed=args.seed, tokenizer=args.tokenizer, bpe_vocab_size=args.bpe_vocab)

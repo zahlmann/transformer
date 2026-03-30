@@ -1,53 +1,72 @@
 # Fused Inference
 
-Custom Triton kernels for transformer inference — the entire forward pass runs in a **single GPU kernel call** with all weights resident in registers. **4x faster** than JAX/XLA baseline.
+Custom Triton kernels for transformer inference — up to **17x faster** than JAX/XLA baseline. The entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**.
 
 ## Quick Start
 
 ```bash
-uv run train_backprop.py         # train model, save weights (4s)
-uv run inference_benchmark.py    # benchmark: Triton vs JAX (740 vs 185 tok/s)
+uv run train_backprop.py --tokenizer trained_bpe --bpe-vocab 1024   # train (6s)
+uv run inference_benchmark.py                                        # benchmark
 ```
 
 ## Results
 
 ```
-Prompt: 64 tokens, Generate: 64 tokens
+Small model (d=64, 1 layer, 189K params, BPE vocab=1024):
+  Triton:    3056 tok/s  (20.9 ms)
+  JAX:        181 tok/s  (353.8 ms)
+  Speedup:   16.9x
 
-Triton fused:   740 tok/s  (86.5 ms)
-JAX baseline:   185 tok/s  (362.6 ms)
-Speedup:        4.0x
+Large model (d=128, 2 layers, 674K params, BPE vocab=1024):
+  Triton:    2589 tok/s  (24.7 ms)
+  JAX:        187 tok/s  (342.4 ms)
+  Speedup:   13.9x
 ```
-
-Both produce identical text.
 
 ## How It Works
 
-Two fused Triton kernels replace the ~15 separate XLA kernels that JAX generates:
+### Prefill (process full prompt)
 
-**Prefill kernel** — processes the full prompt (128 tokens) in one kernel call. All weights stay in the GPU register file (132 KB model fits in 130 KB register budget). Outputs logits + KV cache.
+**Small model (d_model=64):** Single fused kernel — all weights stay in registers (132KB model fits in 130KB register budget). Zero HBM round-trips between operations.
 
-**Decode kernel** — generates one token at a time using the KV cache. Uses element-wise ops instead of tensor cores (M=1 is too small for tensor cores). Outputs logits + new K/V vectors for cache update.
+**Large model (d_model=128):** Multi-block approach with BLOCK_SEQ=32. Three Triton kernels per layer (projections, attention, FFN) enable scaling to any d_model while staying within register limits.
 
-The speedup comes from eliminating HBM round-trips between operations. In JAX, every intermediate result (embeddings, attention scores, FFN activations) gets written to HBM and read back. In the fused kernel, data flows through registers end-to-end.
+### Decode (generate tokens one at a time)
 
-See `inference_guide.md` for a detailed walkthrough (no GPU experience required).
+Fully fused kernel processes all layers in one launch. Key optimizations:
+- **In-kernel KV cache updates** — the kernel writes full updated caches directly, avoiding expensive `.at[].set()` scatter ops in Python (this alone gave 3.6x speedup)
+- **Precomputed bf16 weights** — dtype conversions done once before the decode loop
+- **Multi-layer fusion** — h stays in registers between layers (no HBM round-trip)
+
+### BPE Tokenization
+
+Trained ByteLevel BPE tokenizer on Shakespeare (0% UNK). Tiled output projection handles vocab=1024 in 8 tiles of 128 with zero overhead.
+
+### Key Insight
+
+For small models, **host-side overhead dominates GPU kernel time**. The GPU kernel takes 0.4ms per decode step, but Python/JAX dispatch, dtype conversions, and array scatters added 1.1ms. Eliminating all host overhead gave a 7.5x improvement.
 
 ## Architecture
 
-- Decoder-only transformer: d_model=64, 2 heads, 1 layer, d_ff=256
-- Character-level Shakespeare, vocab=65, context=128
-- 66,368 parameters
+```
+Decoder-only transformer on Shakespeare
+
+Small:  d_model=64,  n_heads=2, n_layers=1, vocab=1024, 189K params
+Large:  d_model=128, n_heads=4, n_layers=2, vocab=1024, 674K params
+```
 
 ## Files
 
 ```
-inference_guide.md                      ground-up explanation of GPU kernels + this project
+program.md                              agent program (read first for context)
+inference_guide.md                      ground-up explanation of GPU kernels
 model.py                                JAX transformer (inference baseline)
-train_backprop.py                       backprop+Adam training, saves weights
-kernels/fused_prefill.py                fused prefill kernel (full sequence)
-kernels/fused_decode.py                 fused decode kernel (one token + KV cache)
-inference_benchmark.py                  benchmark + text generation
-data.py                                 Shakespeare dataset
+train_backprop.py                       backprop+Adam training
+data.py                                 Shakespeare dataset + BPE tokenizer
+kernels/fused_prefill.py                fused prefill kernel (d_model<=64)
+kernels/fused_decode.py                 fused decode kernel (d_model<=64)
+kernels/block_prefill.py                multi-block prefill kernels (d_model>=128)
+kernels/block_decode.py                 per-layer decode (d_model>=128)
+kernels/fused_decode_2layer.py          fully fused 2-layer decode (fastest)
+inference_benchmark.py                  speed comparison benchmark
 ```
-
