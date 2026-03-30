@@ -372,25 +372,7 @@ What to build:
 - Measure quality vs MHA and speedup from reduced bandwidth
 - Target: 1.5-2x decode speedup from 4x less KV cache traffic
 
-### Option C: FP8 Inference on Ada Lovelace (hardware-specific optimization)
-
-The 4080 Super has native FP8 tensor cores (E4M3/E5M2). FP8 matmuls are 2x faster
-than bf16 and use half the register space for weight storage.
-
-What to build:
-- Quantize weights to FP8 E4M3 (better range for weights) offline
-- Use `tl.dot` with FP8 inputs + f32 accumulation in Triton
-- FP8 for: Q/K/V projections, O projection, FFN up/down, output projection
-- Keep activations in bf16/f32 (only quantize weights)
-- Measure quality loss and speedup
-- Target: up to 2x compute speedup for projection-heavy decode
-
-Key challenge: Triton's FP8 support may be limited. May need to use `tl.inline_asm`
-or custom CUDA for the FP8 tensor core path. Previous attempt at d=64 failed
-(register pressure from casts), but at d=512 compute dominates so the trade-off
-is different.
-
-### Option D: Batched Inference + Continuous Batching (throughput optimization)
+### Option C: Batched Inference + Continuous Batching (throughput optimization)
 
 Generate multiple sequences in parallel. With M>1, decode can use tensor cores
 (tl.dot instead of element-wise), dramatically increasing compute utilization.
