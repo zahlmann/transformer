@@ -71,12 +71,14 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
                 tok = jnp.argmax(logits)
                 tokens.append(int(tok))
         else:
-            from kernels.block_decode import block_decode, prepare_decode_weights_block
-            w = prepare_decode_weights_block(params, config, vocab_size)
+            from kernels.fused_decode_nlayer import (
+                fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
+            w = prepare_decode_weights_nlayer(params, config, vocab_size)
+            kv_packed = pack_kv_caches(k_caches, v_caches)
             for i in range(n_tokens - 1):
-                logits, k_caches, v_caches = block_decode(
+                logits, kv_packed = fused_decode_nlayer(
                     w, config, tok, len(prompt) + i,
-                    k_caches, v_caches, vocab_size)
+                    kv_packed, vocab_size)
                 tok = jnp.argmax(logits)
                 tokens.append(int(tok))
         return tokens
