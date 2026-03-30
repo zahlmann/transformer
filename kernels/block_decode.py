@@ -138,11 +138,21 @@ def _decode_output_kernel(
 # Python orchestrator
 # ──────────────────────────────────────────────────────────────────────
 
-def block_decode(params, config, token_id, pos, all_k_caches, all_v_caches, vocab_size):
+def prepare_decode_weights_block(params, config, vocab_size):
+    """Precompute bf16 weights + padded output proj once. Call before decode loop."""
+    vocab_pad = ((vocab_size + 127) // 128) * 128
+    pad_v = vocab_pad - vocab_size
+    w = {k: v.astype(jnp.bfloat16) for k, v in params.items()}
+    w["_output_proj_padded"] = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
+    w["_vocab_pad"] = vocab_pad
+    return w
+
+
+def block_decode(w, config, token_id, pos, all_k_caches, all_v_caches, vocab_size):
     """Multi-layer decode: one token through all layers.
 
     Args:
-        params: weight dict
+        w: precomputed bf16 weights from prepare_decode_weights_block()
         config: model config
         token_id: scalar int32
         pos: scalar int32
@@ -161,13 +171,11 @@ def block_decode(params, config, token_id, pos, all_k_caches, all_v_caches, voca
     n_layers = config["n_layers"]
     d_ff = 4 * d_model
     max_seq = config["context_len"]
-    vocab_pad = ((vocab_size + 127) // 128) * 128
-
-    def bf(key):
-        return params[key].astype(jnp.bfloat16)
+    vocab_pad = w["_vocab_pad"]
 
     # Embedding (JAX)
-    h = (params["token_emb"][token_id] + params["pos_emb"][pos]).astype(jnp.float32)
+    h = (w["token_emb"][token_id].astype(jnp.float32)
+         + w["pos_emb"][pos].astype(jnp.float32))
 
     new_k_caches = []
     new_v_caches = []
@@ -177,12 +185,12 @@ def block_decode(params, config, token_id, pos, all_k_caches, all_v_caches, voca
 
         h_out, k_new, v_new = jt.triton_call(
             h,
-            bf(f"{p}.ln1.scale"), bf(f"{p}.ln1.bias"),
-            bf(f"{p}.attn.q"), bf(f"{p}.attn.k"),
-            bf(f"{p}.attn.v"), bf(f"{p}.attn.o"),
-            bf(f"{p}.ln2.scale"), bf(f"{p}.ln2.bias"),
-            bf(f"{p}.ffn.up"), bf(f"{p}.ffn.up_bias"),
-            bf(f"{p}.ffn.down"), bf(f"{p}.ffn.down_bias"),
+            w[f"{p}.ln1.scale"], w[f"{p}.ln1.bias"],
+            w[f"{p}.attn.q"], w[f"{p}.attn.k"],
+            w[f"{p}.attn.v"], w[f"{p}.attn.o"],
+            w[f"{p}.ln2.scale"], w[f"{p}.ln2.bias"],
+            w[f"{p}.ffn.up"], w[f"{p}.ffn.up_bias"],
+            w[f"{p}.ffn.down"], w[f"{p}.ffn.down_bias"],
             jnp.int32(pos),
             all_k_caches[layer], all_v_caches[layer],
             kernel=_decode_layer_kernel,
@@ -201,13 +209,10 @@ def block_decode(params, config, token_id, pos, all_k_caches, all_v_caches, voca
         new_v_caches.append(all_v_caches[layer].at[:, pos, :].set(v_new))
 
     # Output projection
-    pad_v = vocab_pad - vocab_size
-    output_proj_padded = jnp.pad(params["output_proj"], [(0, 0), (0, pad_v)]).astype(jnp.bfloat16)
-
     (logits_pad,) = jt.triton_call(
         h,
-        bf("ln_final.scale"), bf("ln_final.bias"),
-        output_proj_padded,
+        w["ln_final.scale"], w["ln_final.bias"],
+        w["_output_proj_padded"],
         kernel=_decode_output_kernel,
         out_shape=[
             jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),

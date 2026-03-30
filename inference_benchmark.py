@@ -12,8 +12,8 @@ import jax.numpy as jnp
 from data import prepare_data, load_bpe_vocab
 from model import transformer_forward, count_params
 
-PROMPT_LEN = 64
-GEN_LEN = 64
+PROMPT_LEN = 128
+GEN_LEN = 128
 WARMUP = 5
 BENCH_ITERS = 20
 
@@ -71,10 +71,11 @@ def generate_triton(params, config, prompt, n_tokens, vocab_size):
                 tok = jnp.argmax(logits)
                 tokens.append(int(tok))
         else:
-            from kernels.block_decode import block_decode
+            from kernels.block_decode import block_decode, prepare_decode_weights_block
+            w = prepare_decode_weights_block(params, config, vocab_size)
             for i in range(n_tokens - 1):
                 logits, k_caches, v_caches = block_decode(
-                    params, config, tok, len(prompt) + i,
+                    w, config, tok, len(prompt) + i,
                     k_caches, v_caches, vocab_size)
                 tok = jnp.argmax(logits)
                 tokens.append(int(tok))
@@ -108,7 +109,10 @@ def main():
     if tokenizer == "trained_bpe":
         bpe_vocab = load_bpe_vocab()
         decode = bpe_vocab["decode_fn"]
-        data = prepare_data(tokenizer="trained_bpe", bpe_vocab_size=vocab_size)
+        # Detect dataset from tokenizer path
+        tok_path = bpe_vocab.get("tokenizer_path", "")
+        dataset = "tinystories" if "tinystories" in tok_path else "shakespeare"
+        data = prepare_data(tokenizer="trained_bpe", bpe_vocab_size=vocab_size, dataset=dataset)
     elif tokenizer == "bpe":
         bpe_vocab = load_bpe_vocab()
         compact_to_bytes = bpe_vocab["compact_to_bytes"]

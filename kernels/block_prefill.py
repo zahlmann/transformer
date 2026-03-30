@@ -2,20 +2,18 @@
 Multi-block prefill kernels for d_model >= 128.
 
 With d_model=128, h is (128,128) f32 = 64KB — can't fit in registers alongside
-attention intermediates. Solution: tile the sequence dimension into blocks of 32.
+attention intermediates. Solution: tile the sequence dimension into blocks.
 
-Three Triton kernels per layer (grid=num_blocks, each block handles 32 rows):
+BLOCK_SEQ is chosen based on d_model to fit in the 127KB register file:
+  d_model=128: BLOCK_SEQ=32 → h_block (32,128) = 16KB, peak ~52KB
+  d_model=256: BLOCK_SEQ=16 → h_block (16,256) = 16KB, peak ~116KB
+
+Three Triton kernels per layer (grid=num_blocks, each block handles BLOCK_SEQ rows):
   1. _proj_kernel:  LN1 + Q/K/V projections → writes Q,K,V to HBM
   2. _attn_kernel:  causal attention + O projection + residual → updates h
   3. _ffn_kernel:   LN2 + FFN + residual → updates h
 
 Plus _output_kernel for final LN + tiled output projection.
-
-Register budget per block (BLOCK_SEQ=32, D_MODEL=128):
-  h_block: (32,128) f32 = 16KB
-  Attention peak: Q(4KB) + K(16KB) + scores(16KB) + attn_accum(16KB) = 52KB
-  FFN peak: h(16KB) + h_norm(16KB) + ffn_out(16KB) + tiles = 64KB
-  All well under 127KB register file.
 """
 
 import triton
@@ -24,7 +22,6 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-BLOCK_SEQ  = tl.constexpr(32)
 BLOCK_K    = tl.constexpr(32)
 VOCAB_TILE = tl.constexpr(128)
 
@@ -39,6 +36,7 @@ def _proj_kernel(
     D_HEAD: tl.constexpr,
     N_HEADS: tl.constexpr,
     SEQ: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
 ):
     """LN1 + Q/K/V projections for a block of rows."""
     bid = tl.program_id(0)
@@ -84,6 +82,7 @@ def _attn_kernel(
     D_HEAD: tl.constexpr,
     N_HEADS: tl.constexpr,
     SEQ: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
 ):
     """Causal attention + O projection + residual for a block of rows."""
     bid = tl.program_id(0)
@@ -137,6 +136,7 @@ def _ffn_kernel(
     D_MODEL: tl.constexpr,
     D_FF: tl.constexpr,
     SEQ: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
 ):
     """LN2 + FFN + residual for a block of rows."""
     bid = tl.program_id(0)
@@ -177,6 +177,7 @@ def _output_kernel(
     SEQ: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
 ):
     """Final LN + tiled output projection for a block of rows."""
     bid = tl.program_id(0)
@@ -223,7 +224,8 @@ def block_prefill(params, config, x, vocab_size):
     n_heads = config["n_heads"]
     n_layers = config["n_layers"]
     d_ff = 4 * d_model
-    num_blocks = seq_len // 32
+    block_seq = 16 if d_model >= 256 else 32
+    num_blocks = seq_len // block_seq
     vocab_pad = ((vocab_size + 127) // 128) * 128
 
     # Precompute bf16 weights once (avoid repeated .astype in loop)
@@ -252,6 +254,7 @@ def block_prefill(params, config, x, vocab_size):
             grid=(num_blocks,),
             num_warps=4, num_stages=1,
             D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
+            BLOCK_SEQ=block_seq,
         )
         all_k_caches.append(k_cache)
         all_v_caches.append(v_cache)
@@ -267,6 +270,7 @@ def block_prefill(params, config, x, vocab_size):
             grid=(num_blocks,),
             num_warps=4, num_stages=1,
             D_MODEL=d_model, D_HEAD=d_head, N_HEADS=n_heads, SEQ=seq_len,
+            BLOCK_SEQ=block_seq,
         )
 
         # Kernel 3: LN + FFN + residual
@@ -282,6 +286,7 @@ def block_prefill(params, config, x, vocab_size):
             grid=(num_blocks,),
             num_warps=4, num_stages=1,
             D_MODEL=d_model, D_FF=d_ff, SEQ=seq_len,
+            BLOCK_SEQ=block_seq,
         )
 
     # Kernel 4: Final LN + output projection
@@ -300,6 +305,7 @@ def block_prefill(params, config, x, vocab_size):
         num_warps=4, num_stages=1,
         D_MODEL=d_model, SEQ=seq_len,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
+        BLOCK_SEQ=block_seq,
     )
 
     return logits_pad[:, :vocab_size], all_k_caches, all_v_caches

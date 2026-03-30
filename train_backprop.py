@@ -1,6 +1,9 @@
 """Backprop+Adam baseline.
 
-Usage: uv run train_backprop.py [--seed SEED] [--lr LR] [--tokenizer char|bpe] [--bpe-vocab 512]
+Usage: uv run train_backprop.py [--seed SEED] [--lr LR] [--tokenizer char|bpe|trained_bpe]
+                                [--bpe-vocab 512] [--dataset shakespeare|tinystories]
+                                [--d-model 256] [--n-heads 8] [--n-layers 4]
+                                [--context-len 256] [--epochs 20] [--batch-size 64]
 """
 
 import os
@@ -16,26 +19,37 @@ import optax
 from data import prepare_data
 from model import init_transformer, transformer_forward_batch, cross_entropy_loss, count_params
 
-D_MODEL = 128; N_HEADS = 4; N_LAYERS = 2; CONTEXT_LEN = 128; BATCH_SIZE = 64
-EPOCHS = 20; SEED = 42
 
-
-def train(lr=1e-3, seed=SEED, tokenizer="char", bpe_vocab_size=512):
-    data = prepare_data(context_len=CONTEXT_LEN, tokenizer=tokenizer, bpe_vocab_size=bpe_vocab_size)
+def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
+          dataset="shakespeare", d_model=128, n_heads=4, n_layers=2,
+          context_len=128, batch_size=64, epochs=20, warmup_steps=200,
+          weight_decay=0.1):
+    data = prepare_data(context_len=context_len, tokenizer=tokenizer,
+                        bpe_vocab_size=bpe_vocab_size, dataset=dataset)
     vocab_size = data["vocab_size"]
 
     key = jax.random.key(seed)
     key, init_key = jax.random.split(key)
-    params, config = init_transformer(init_key, vocab_size, d_model=D_MODEL,
-                                       n_heads=N_HEADS, n_layers=N_LAYERS, context_len=CONTEXT_LEN)
+    params, config = init_transformer(init_key, vocab_size, d_model=d_model,
+                                       n_heads=n_heads, n_layers=n_layers,
+                                       context_len=context_len)
 
     train_x = jnp.array(data["train_x"])
     train_y = jnp.array(data["train_y"])
-    val_x = jnp.array(data["val_x"][:BATCH_SIZE])
-    val_y = jnp.array(data["val_y"][:BATCH_SIZE])
-    n_batches = len(data["train_x"]) // BATCH_SIZE
+    val_x = jnp.array(data["val_x"][:batch_size])
+    val_y = jnp.array(data["val_y"][:batch_size])
+    n_batches = len(data["train_x"]) // batch_size
+    total_steps = n_batches * epochs
 
-    optimizer = optax.adam(lr)
+    # LR schedule: linear warmup + cosine decay
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(0.0, lr, warmup_steps),
+            optax.cosine_decay_schedule(lr, total_steps - warmup_steps, alpha=lr * 0.01),
+        ],
+        boundaries=[warmup_steps],
+    )
+    optimizer = optax.adamw(schedule, weight_decay=weight_decay)
     opt_state = optimizer.init(params)
 
     @jax.jit
@@ -55,23 +69,25 @@ def train(lr=1e-3, seed=SEED, tokenizer="char", bpe_vocab_size=512):
         logits = transformer_forward_batch(params, config, x)
         return cross_entropy_loss(logits, y)
 
-    print(f"=== Backprop+Adam LR={lr} seed={seed} tokenizer={tokenizer} vocab={vocab_size} ===")
-    print(f"Params: {count_params(params):,}")
+    print(f"=== Backprop+AdamW LR={lr} wd={weight_decay} warmup={warmup_steps} ===")
+    print(f"Model: d={d_model} h={n_heads} l={n_layers} ctx={context_len}")
+    print(f"Data: {dataset} tokenizer={tokenizer} vocab={vocab_size}")
+    print(f"Params: {count_params(params):,}  steps/epoch={n_batches}  total_steps={total_steps}")
 
     t_start = time.perf_counter()
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         key, sk = jax.random.split(key)
         perm = jax.random.permutation(sk, len(data["train_x"]))
         sx, sy = train_x[perm], train_y[perm]
         eloss = 0.0
         for bi in range(n_batches):
-            s = bi * BATCH_SIZE
+            s = bi * batch_size
             params, opt_state, loss = train_step(params, opt_state,
-                                                  sx[s:s+BATCH_SIZE], sy[s:s+BATCH_SIZE])
+                                                  sx[s:s+batch_size], sy[s:s+batch_size])
             eloss += float(loss)
         eloss /= n_batches
         vl = eval_loss(params, val_x, val_y)
-        print(f"  Epoch {epoch+1}/{EPOCHS}  train={eloss:.4f}  val={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}")
+        print(f"  Epoch {epoch+1}/{epochs}  train={eloss:.4f}  val={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}")
 
     vl = eval_loss(params, val_x, val_y)
     vl.block_until_ready()
@@ -98,9 +114,25 @@ def train(lr=1e-3, seed=SEED, tokenizer="char", bpe_vocab_size=512):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tokenizer", type=str, default="char", choices=["char", "bpe", "trained_bpe"])
-    parser.add_argument("--bpe-vocab", type=int, default=512)
+    parser.add_argument("--tokenizer", type=str, default="trained_bpe",
+                        choices=["char", "bpe", "trained_bpe"])
+    parser.add_argument("--bpe-vocab", type=int, default=4096)
+    parser.add_argument("--dataset", type=str, default="tinystories",
+                        choices=["shakespeare", "tinystories"])
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--n-layers", type=int, default=4)
+    parser.add_argument("--context-len", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
     args = parser.parse_args()
-    train(lr=args.lr, seed=args.seed, tokenizer=args.tokenizer, bpe_vocab_size=args.bpe_vocab)
+    train(lr=args.lr, seed=args.seed, tokenizer=args.tokenizer,
+          bpe_vocab_size=args.bpe_vocab, dataset=args.dataset,
+          d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+          context_len=args.context_len, batch_size=args.batch_size,
+          epochs=args.epochs, warmup_steps=args.warmup_steps,
+          weight_decay=args.weight_decay)
