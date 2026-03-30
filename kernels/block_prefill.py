@@ -301,7 +301,7 @@ def block_prefill(params, config, x, vocab_size):
     n_heads = config["n_heads"]
     n_layers = config["n_layers"]
     d_ff = 4 * d_model
-    block_seq = 16 if d_model >= 256 else 32
+    block_seq = 8 if d_model >= 512 else (16 if d_model >= 256 else 32)
     num_blocks = seq_len // block_seq
     vocab_pad = ((vocab_size + 127) // 128) * 128
 

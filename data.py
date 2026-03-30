@@ -182,14 +182,35 @@ def _prepare_trained_bpe_from_texts(train_text, val_text, context_len, vocab_siz
         tok.save(tokenizer_path)
         os.remove(corpus_path)
 
-    train_tokens = tok.encode(train_text).ids
-    val_tokens = tok.encode(val_text).ids
+    # Tokenize in chunks to avoid OOM on large texts (1.9GB TinyStories uses 46GB+ RAM
+    # if encoded at once due to tokenizer intermediate allocations)
+    CHUNK_CHARS = 50_000_000  # 50MB chunks
     actual_vocab = tok.get_vocab_size()
+
+    def encode_chunked(text):
+        if len(text) <= CHUNK_CHARS:
+            return tok.encode(text).ids
+        all_ids = []
+        for i in range(0, len(text), CHUNK_CHARS):
+            chunk = text[i:i + CHUNK_CHARS]
+            all_ids.extend(tok.encode(chunk).ids)
+            if i > 0 and i % (CHUNK_CHARS * 10) == 0:
+                print(f"  tokenized {i / 1e6:.0f}M / {len(text) / 1e6:.0f}M chars ({len(all_ids) / 1e6:.1f}M tokens)")
+        return all_ids
+
+    print(f"Tokenizing train ({len(train_text)/1e6:.0f}M chars)...")
+    train_tokens = encode_chunked(train_text)
+    del train_text  # free memory
+    print(f"Tokenizing val ({len(val_text)/1e6:.0f}M chars)...")
+    val_tokens = encode_chunked(val_text)
+    del val_text
     print(f"Trained BPE ({dataset}): {len(train_tokens)} train tokens, "
           f"{len(val_tokens)} val tokens, vocab={actual_vocab}")
 
     train_data = np.array(train_tokens, dtype=np.int32)
+    del train_tokens
     val_data = np.array(val_tokens, dtype=np.int32)
+    del val_tokens
 
     # Save vocab mapping for inference
     vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")

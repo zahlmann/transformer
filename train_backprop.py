@@ -34,11 +34,13 @@ def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
                                        n_heads=n_heads, n_layers=n_layers,
                                        context_len=context_len)
 
-    train_x = jnp.array(data["train_x"])
-    train_y = jnp.array(data["train_y"])
+    # Keep training data on CPU (numpy) — move batches to GPU on the fly.
+    # This avoids OOM when training on large datasets (e.g., full TinyStories).
+    train_x = np.array(data["train_x"])
+    train_y = np.array(data["train_y"])
     val_x = jnp.array(data["val_x"][:batch_size])
     val_y = jnp.array(data["val_y"][:batch_size])
-    n_batches = len(data["train_x"]) // batch_size
+    n_batches = len(train_x) // batch_size
     total_steps = n_batches * epochs
 
     # LR schedule: linear warmup + cosine decay
@@ -76,15 +78,23 @@ def train(lr=1e-3, seed=42, tokenizer="char", bpe_vocab_size=512,
 
     t_start = time.perf_counter()
     for epoch in range(epochs):
-        key, sk = jax.random.split(key)
-        perm = jax.random.permutation(sk, len(data["train_x"]))
+        rng = np.random.default_rng(seed + epoch)
+        perm = rng.permutation(len(train_x))
         sx, sy = train_x[perm], train_y[perm]
         eloss = 0.0
+        t_epoch = time.perf_counter()
         for bi in range(n_batches):
             s = bi * batch_size
-            params, opt_state, loss = train_step(params, opt_state,
-                                                  sx[s:s+batch_size], sy[s:s+batch_size])
+            bx = jnp.array(sx[s:s+batch_size])
+            by = jnp.array(sy[s:s+batch_size])
+            params, opt_state, loss = train_step(params, opt_state, bx, by)
             eloss += float(loss)
+            if bi > 0 and bi % 1000 == 0:
+                avg = eloss / bi
+                elapsed = time.perf_counter() - t_epoch
+                steps_per_sec = bi / elapsed
+                eta_min = (n_batches - bi) / steps_per_sec / 60
+                print(f"    step {bi}/{n_batches}  loss={avg:.4f}  {steps_per_sec:.1f} steps/s  eta={eta_min:.0f}min")
         eloss /= n_batches
         vl = eval_loss(params, val_x, val_y)
         print(f"  Epoch {epoch+1}/{epochs}  train={eloss:.4f}  val={float(vl):.4f}  ppl={float(jnp.exp(vl)):.2f}")
