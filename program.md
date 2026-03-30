@@ -25,12 +25,14 @@ Build the fastest possible inference for this transformer using custom Triton ke
 9. FlashAttention for context>256 (tiled KV + online softmax)
 10. AdamW + LR warmup + cosine decay training improvements
 11. Speculative decoding with parallel verification kernel
+12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
 
 ### Current Performance
 
-Small (d=64, 1L):   3056 tok/s, 16.9x over JAX
+Small (d=64, 1L):    3056 tok/s, 16.9x over JAX
 Medium (d=128, 2L):  2589 tok/s, 13.9x over JAX
-Large (d=256, 4L):   1396 tok/s, 15.1x over JAX  ← NEW (5.3M params, coherent text)
+Large (d=256, 4L):   1396 tok/s, 15.1x over JAX  (5.3M params)
+XL (d=512, 8L):       279 tok/s, JAX OOM          ← NEW (29.7M params, ppl=2.91)
 
 ---
 
@@ -47,13 +49,14 @@ Large (d=256, 4L):   1396 tok/s, 15.1x over JAX  ← NEW (5.3M params, coherent 
 
 ```
 Decoder-only transformer
-d_model: 64-256, n_heads: 2-8 (d_head=32), n_layers: 1-4, d_ff: 4*d_model
-context_len: 128-256
+d_model: 64-512, n_heads: 2-16 (d_head=32), n_layers: 1-8, d_ff: 4*d_model
+context_len: 128-512
 
-Small:  d=64,  h=2, l=1, vocab=65,   params=66,368    (Shakespeare, char)
-Medium: d=64,  h=2, l=1, vocab=1024, params=189,120   (Shakespeare, BPE)
-Large:  d=128, h=4, l=2, vocab=1024, params=674,304   (Shakespeare, BPE)
-XL:     d=256, h=8, l=4, vocab=4096, params=5,318,144 (TinyStories, BPE)
+Small:  d=64,  h=2,  l=1, vocab=65,   params=66,368     (Shakespeare, char)
+Medium: d=64,  h=2,  l=1, vocab=1024, params=189,120    (Shakespeare, BPE)
+Large:  d=128, h=4,  l=2, vocab=1024, params=674,304    (Shakespeare, BPE)
+XL:     d=256, h=8,  l=4, vocab=4096, params=5,318,144  (TinyStories, BPE)
+XXL:    d=512, h=16, l=8, vocab=4096, params=29,660,160 (TinyStories full, BPE)
 ```
 
 Weights: token_emb (65,64), pos_emb (128,64), Q/K/V/O (64,64 each), FFN up (64,256),
@@ -294,18 +297,48 @@ Parallel kernel speedup over sequential: 1.30x at K=4
 
 ---
 
+## COMPLETED: Scale Up (Phase A4)
+
+Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB).
+
+### What was done
+
+1. **Full TinyStories**: Downloaded all 2.1M stories (1.9GB). Chunked BPE tokenization
+   (50MB chunks) to avoid OOM — encoding 1.9GB at once used 46GB+ RAM. Retrained BPE
+   tokenizer on full dataset.
+
+2. **Training**: d=512, h=16, l=8, d_ff=2048, ctx=512, 29.7M params.
+   batch=16, lr=1e-4, 3 epochs (~4.4 hours). val_loss=1.068, ppl=2.91.
+   Data kept on CPU, batches streamed to GPU to avoid data OOM.
+
+3. **Kernel adaptations for d=512** (register pressure is the main challenge):
+   - **BLOCK_SEQ=8** for prefill (h_block = (8,512) = 16KB fits in registers)
+   - **tl.dot for projections**: element-wise (512,32) intermediates overflow registers
+     (128 regs/thread > 255 limit). tl.dot tiles internally, avoiding materialization.
+   - **Tiled KV decode**: (512,32) full cache load overflows shared memory.
+     Added online softmax with KV_TILE=64, same technique as FlashAttention.
+   - **Smaller output VTILE=32**: (512,128) weight load = 128KB > 130KB register file.
+     Reduced to (512,32) = 64KB.
+
+4. **Benchmark**: 279 tok/s Triton. JAX baseline OOMs (no KV cache, 16GB GPU).
+
+### Key engineering decisions
+
+- **tl.dot vs element-wise at d=512**: At d≤256, element-wise `tl.sum(h[:, None] * W, axis=0)`
+  works because (256,32) = 64 regs/thread fits alongside h (2 regs) in 255 budget. At d=512,
+  (512,32) = 128 regs alone, product = another 128 → 260 > 255. tl.dot avoids materializing
+  the full intermediate by tiling the reduction internally.
+- **Triton [0,:] indexing not supported**: Used `.sum(axis=0)` on (1,N) results from tl.dot.
+- **Chunked tokenization**: HuggingFace tokenizer uses ~25x text size in working memory.
+  1.9GB text → 46GB+ RAM → OOM killed. 50MB chunks cap peak at ~12GB.
+
+---
+
 ## YOUR NEXT TASK: Further Scaling or Optimization
 
 Possible directions for continued work:
 
-### Option A: Even Larger Model (d=512, 8 layers)
-
-- ~40M params, needs larger dataset (full TinyStories or OpenWebText)
-- BLOCK_SEQ=8 for d=512 prefill (h_block = (8,512) = 16KB, fits)
-- FlashAttention essential for context≥512
-- May need gradient accumulation for training
-
-### Option B: Batched Inference
+### Option A: Batched Inference
 
 - Generate multiple sequences in parallel
 - Uses tensor cores for decode (M>1 enables matmul)
@@ -443,3 +476,18 @@ target_weights.pkl                  — target model weights (d=256, 4L, 5.3M pa
     scores are (16,256)=16KB per head — fits alongside K(32KB)+V(32KB)+accumulators.
     At context=512+, the full scores matrix overflows. Tiled KV with online softmax
     (KV_TILE=64) keeps peak at ~20KB per tile regardless of context length.
+
+24. **At d=512, element-wise projections overflow registers.** Each (D_MODEL, D_HEAD) =
+    (512, 32) intermediate uses 128 registers per thread (out of 255 max). The product
+    `h[:, None] * W` needs another 128 → 260 > 255, causing spills to shared memory.
+    Fix: use `tl.dot` which tiles the reduction internally. With `tl.dot((1, 512) @ (512, 32))`,
+    Triton never materializes the full (512, 32) intermediate.
+
+25. **Output projection needs smaller VTILE at d=512.** Loading (D_MODEL, VOCAB_TILE) =
+    (512, 128) bf16 = 128KB ≈ entire register file. Reduced to VTILE=32 → (512, 32) = 32KB.
+    4x more loop iterations but avoids register spilling.
+
+26. **Tiled KV attention in decode is essential for MAX_SEQ=512.** Loading the full
+    (MAX_SEQ, D_HEAD) = (512, 32) cache at once overflows shared memory (139KB > 101KB).
+    Online softmax with KV_TILE=64 tiles the cache: each tile loads (64, 32) = 4KB.
+    Same algorithm as FlashAttention but for the M=1 single-token case.

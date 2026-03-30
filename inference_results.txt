@@ -1,5 +1,4 @@
-Model: d=256 h=8 l=4
+Model: d=512 h=16 l=8
 Tokenizer: trained_bpe, vocab_size: 4096
-Triton: 1396 tok/s (91.7ms)
-JAX:    92 tok/s (1384.5ms)
-Speedup: 15.10x
+Triton: 279 tok/s (458.6ms)
+JAX:    OOM (model too large for naive baseline)
