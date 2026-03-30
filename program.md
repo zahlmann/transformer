@@ -340,24 +340,7 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 
 Pick ONE of these directions. Each is a standalone phase with clear deliverables.
 
-### Option A: INT4 Weight Quantization (bandwidth optimization)
-
-The d=512 model is **bandwidth-bound** — loading 29.7M params × 2 bytes = 59MB per decode
-step from HBM. INT4 quantization halves weight storage, directly doubling effective bandwidth.
-
-What to build:
-- GPTQ-style or RTN (round-to-nearest) INT4 quantization with per-group scales (group_size=128)
-- In-kernel dequantization: load INT4 packed weights, unpack + scale to bf16 in registers
-- Quantize weights offline, store as (int32 packed + bf16 scales)
-- Measure quality loss (perplexity) and speedup
-- Target: 1.5-2x speedup over bf16 decode with <0.5 ppl degradation
-
-Key kernel work:
-- Pack 8 INT4 values into one int32, unpack with bit shifts in Triton
-- Fuse dequantization into the tl.dot projections
-- Group-wise scaling: load scale per 128 weights, multiply after unpack
-
-### Option B: Persistent Decode Kernel (eliminate all launch overhead)
+### Option A: Persistent Decode Kernel (eliminate all launch overhead)
 
 Currently each decode step = 1 kernel launch + Python dispatch (~0.4ms overhead).
 A persistent kernel stays resident on the GPU across ALL decode steps, reading
@@ -376,7 +359,7 @@ Key kernel work:
 - Implement spin-wait synchronization (device polls flag in global memory)
 - Handle the argmax on-device to avoid sync per step
 
-### Option C: Grouped-Query Attention (architectural optimization)
+### Option B: Grouped-Query Attention (architectural optimization)
 
 Current model uses multi-head attention (16 separate K/V heads). GQA shares K/V
 across groups of query heads (e.g., 4 KV heads for 16 Q heads = 4x less KV cache).
@@ -389,7 +372,7 @@ What to build:
 - Measure quality vs MHA and speedup from reduced bandwidth
 - Target: 1.5-2x decode speedup from 4x less KV cache traffic
 
-### Option D: FP8 Inference on Ada Lovelace (hardware-specific optimization)
+### Option C: FP8 Inference on Ada Lovelace (hardware-specific optimization)
 
 The 4080 Super has native FP8 tensor cores (E4M3/E5M2). FP8 matmuls are 2x faster
 than bf16 and use half the register space for weight storage.
@@ -407,7 +390,7 @@ or custom CUDA for the FP8 tensor core path. Previous attempt at d=64 failed
 (register pressure from casts), but at d=512 compute dominates so the trade-off
 is different.
 
-### Option E: Batched Inference + Continuous Batching (throughput optimization)
+### Option D: Batched Inference + Continuous Batching (throughput optimization)
 
 Generate multiple sequences in parallel. With M>1, decode can use tensor cores
 (tl.dot instead of element-wise), dramatically increasing compute utilization.

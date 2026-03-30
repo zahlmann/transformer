@@ -1,6 +1,6 @@
 # Fused Inference
 
-Custom Triton kernels for transformer inference — the entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**. At d=512/8L, the naive JAX baseline can't even fit in memory.
+Custom Triton kernels for transformer inference on a single **RTX 4080 Super (16GB VRAM)**. The entire decode step (embedding, attention, FFN, output projection) runs in a **single GPU kernel call**.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ Large model (d=256, 4 layers, 5.3M params, TinyStories):
 
 XL model (d=512, 8 layers, 29.7M params, TinyStories full):
   Triton:     279 tok/s
-  JAX:        OOM (no KV cache, 16GB GPU)
+  JAX:        OOM (naive baseline without KV cache exceeds 16GB)
 ```
 
 Text quality at 29.7M params (ppl=2.91) produces coherent multi-paragraph stories.
