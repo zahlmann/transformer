@@ -1,0 +1,11 @@
+# Baseline metrics — 2026-03-30 22:21
+# Compare against these after any kernel change
+
+model: d=512_h=16_l=8_ctx=512
+params: 29660160
+prefill_ms: 6.26
+decode_tok_s: 287.0
+decode_ms_per_tok: 3.481
+weight_buffer_mb: 59.3
+kv_cache_mb: 8.4
+bandwidth_util_pct: 2.0

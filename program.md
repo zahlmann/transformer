@@ -27,12 +27,26 @@ Build the fastest possible inference for this transformer using custom Triton ke
 11. Speculative decoding with parallel verification kernel
 12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
 
-### Current Performance
+### Current Performance (RTX 4080 Super)
 
-Small (d=64, 1L):    3056 tok/s, 16.9x over JAX
-Medium (d=128, 2L):  2589 tok/s, 13.9x over JAX
-Large (d=256, 4L):   1396 tok/s, 15.1x over JAX  (5.3M params)
-XL (d=512, 8L):       279 tok/s, JAX OOM          ← NEW (29.7M params, ppl=2.91)
+```
+XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
+  Decode:              287 tok/s  (3.48 ms/tok)
+  Prefill (128 tok):   6.3 ms    (20,460 tok/s)
+  Weight buffer:       59.3 MB   (bf16)
+  KV cache:            8.4 MB    (bf16, per sequence)
+  Bandwidth util:      2%        (of 836 GB/s theoretical)
+
+Previous model sizes:
+  d=64,  1L:    3056 tok/s
+  d=128, 2L:    2589 tok/s
+  d=256, 4L:    1396 tok/s
+  d=512, 8L:     287 tok/s  ← current focus
+```
+
+**Key finding: the GPU is 98% idle.** Theoretical minimum is 0.081 ms/tok at full
+bandwidth, we achieve 3.48 ms/tok. The bottleneck is kernel launch overhead and
+dispatch latency, not memory bandwidth or compute.
 
 ---
 
@@ -95,45 +109,34 @@ Same tiled output projection as prefill. JAX wrapper updates the cache via scatt
 
 ---
 
-## Results
+## Results (Optimization History)
 
 ```
-Char-level (vocab=65, register-only output):
-  Triton fused:   740 tok/s  (86.5 ms)
-  JAX baseline:   185 tok/s  (362.6 ms)
-  Speedup:        4.0x
+Phase A1: d=64, 1L, vocab=1024 (Shakespeare):
+  Initial:                          740 tok/s
+  + tiled output projection:        758 tok/s  (zero overhead from tiling)
 
-BPE (vocab=1024, tiled output — 8 tiles of 128):
-  Triton fused:   758 tok/s  (84.5 ms)
-  JAX baseline:   174 tok/s  (367.4 ms)
-  Speedup:        4.35x
+Phase A2: d=128, 2L, vocab=1024 (Shakespeare):
+  Multi-block (3 launches/step):    335 tok/s
+  + fused decode (1 launch/step):   454 tok/s  (+35%)
+  + precomputed bf16 weights:       713 tok/s  (+57%)
+  + in-kernel cache updates:       2504 tok/s  (+3.6x, biggest win)
 
-Phase A2: d_model=128, n_heads=4, n_layers=2, vocab=1024, 674K params:
-  Multi-block (3 launches/step):   335 tok/s,  1.89x
-  + fused decode (1 launch/step):  454 tok/s,  2.58x
-  + precomputed bf16 weights:      713 tok/s,  3.95x
-  + in-kernel cache updates:      2504 tok/s, 13.98x
-  JAX baseline:                    179 tok/s
+Phase A3: d=256, 4L, vocab=4096, 5.3M params (TinyStories):
+  Fused N-layer decode:            1396 tok/s
 
-Phase A3: d_model=256, n_heads=8, n_layers=4, vocab=4096, 5.3M params:
-  TinyStories data (14M tokens), val_loss=1.69, ppl=5.40
-  Fused N-layer decode (1 launch/step): 1396 tok/s, 15.10x
-  JAX baseline:                           92 tok/s
-  BLOCK_SEQ=16 (fits 256-dim in registers)
-  Packed weight buffer + packed KV caches in single kernel
+Phase A4: d=512, 8L, vocab=4096, 29.7M params (TinyStories full):
+  Fused N-layer decode:             287 tok/s  (3.48 ms/tok, 2% BW utilization)
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
-- Multi-block approach (BLOCK_SEQ=32) enables any d_model.
 - Python dispatch overhead per jt.triton_call is ~0.4ms. Fusing all decode
   into one kernel eliminated 128 launches (35% speedup).
 - .astype(bf16) per decode step created 1764 unnecessary allocations.
   Precomputing once gave another 57% speedup.
-- Text quality greatly improved with 2-layer model.
-- 15x speedup holds at 8x model size (5.3M vs 674K params).
-- Packed weight buffer + packed KV caches scale to any layer count.
-- TinyStories data produces coherent multi-paragraph stories (ppl=5.4).
-- FlashAttention (tiled KV + online softmax) implemented for context>256.
+- In-kernel KV cache updates were the biggest single win (3.6x).
+- At d=512, bandwidth utilization is only 2%. The GPU is 98% idle.
+  Theoretical min at 836 GB/s is 0.081 ms/tok vs achieved 3.48 ms/tok.
 ```
 
 ---
@@ -320,7 +323,7 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
    - **Smaller output VTILE=32**: (512,128) weight load = 128KB > 130KB register file.
      Reduced to (512,32) = 64KB.
 
-4. **Benchmark**: 279 tok/s Triton. JAX baseline OOMs (no KV cache, 16GB GPU).
+4. **Benchmark**: 287 tok/s, 3.48 ms/tok, 2% bandwidth utilization.
 
 ### Key engineering decisions
 
@@ -337,6 +340,27 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 ## YOUR NEXT TASK: Further Scaling or Optimization
 
 **GPU: RTX 4080 Super (Ada Lovelace, 16GB VRAM, 101KB shared memory, 52 TFLOPS FP16, 836 GB/s bandwidth)**
+
+### How to measure progress
+
+Run `uv run profile_kernels.py` after any kernel change. The hard metrics to beat:
+
+```
+CURRENT BASELINE (d=512, 8L, 29.7M params):
+  Decode throughput:     287 tok/s
+  Decode latency:        3.48 ms/tok
+  Bandwidth utilization: 2% of 836 GB/s
+  Prefill latency:       6.3 ms (128 tokens)
+  Theoretical min:       0.081 ms/tok (if bandwidth-saturated)
+```
+
+The 2% bandwidth utilization means the GPU is 98% idle — there is massive room
+for improvement. Any optimization that moves bandwidth utilization upward is real progress.
+
+For detailed GPU profiling, use Nsight Compute:
+```bash
+/usr/local/cuda/bin/ncu --set full uv run profile_kernels.py 2>&1 | head -100
+```
 
 Pick ONE of these directions. Each is a standalone phase with clear deliverables.
 
@@ -402,9 +426,19 @@ Key kernel work:
 ## Profiling Commands
 
 ```bash
-uv run train_backprop.py                                          # char-level (4s)
-uv run train_backprop.py --tokenizer trained_bpe --bpe-vocab 1024 # BPE (6s)
-uv run inference_benchmark.py                                     # inference speed
+uv run profile_kernels.py                   # primary benchmark (run after every change)
+uv run profile_kernels.py --detailed        # per-component breakdown
+uv run inference_benchmark.py               # quick throughput check
+
+# Nsight Compute for detailed GPU metrics
+/usr/local/cuda/bin/ncu --set full uv run profile_kernels.py
+
+# Nsight Systems for timeline view
+/usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
+
+# Training
+uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
+  --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 ```
 
 ---
@@ -424,7 +458,9 @@ kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
 kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
-inference_benchmark.py              — speed comparison benchmark
+profile_kernels.py                  — primary profiling tool (run after every change)
+inference_benchmark.py              — quick throughput benchmark
+baseline_metrics.txt                — current numbers to beat
 ```
 
 ---
