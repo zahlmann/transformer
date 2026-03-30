@@ -255,6 +255,7 @@ def _output_kernel(
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
+    VTILE: tl.constexpr,
 ):
     """Final LN + tiled output projection for a block of rows."""
     bid = tl.program_id(0)
@@ -269,8 +270,9 @@ def _output_kernel(
     hc = h - mean
     h_final = ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :]
 
-    for v_start in tl.range(0, VOCAB_PAD, VOCAB_TILE):
-        vv = v_start + tl.arange(0, VOCAB_TILE)
+    # VTILE is smaller for large D_MODEL to avoid (D_MODEL, VTILE) overflow
+    for v_start in tl.range(0, VOCAB_PAD, VTILE):
+        vv = v_start + tl.arange(0, VTILE)
         out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.bfloat16)
         tile_logits = tl.dot(h_final.to(tl.bfloat16), out_w).to(tl.float32)
         tile_logits = tl.where(vv[None, :] < VOCAB_SIZE, tile_logits, -1e9)
@@ -400,6 +402,7 @@ def block_prefill(params, config, x, vocab_size):
         D_MODEL=d_model, SEQ=seq_len,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         BLOCK_SEQ=block_seq,
+        VTILE=32 if d_model >= 512 else 128,
     )
 
     return logits_pad[:, :vocab_size], all_k_caches, all_v_caches

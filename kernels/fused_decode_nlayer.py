@@ -33,8 +33,11 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-BLOCK_K    = tl.constexpr(32)
-VOCAB_TILE = tl.constexpr(128)
+BLOCK_K      = tl.constexpr(32)
+VOCAB_TILE   = tl.constexpr(128)
+KV_TILE      = tl.constexpr(64)
+# Smaller output tile for large D_MODEL to avoid (D_MODEL, VOCAB_TILE) intermediate overflow
+OUTPUT_VTILE = tl.constexpr(32)
 
 
 @triton.jit
@@ -84,8 +87,6 @@ def _fused_decode_nlayer(
     LAYER_KV_SIZE: tl.constexpr = 2 * N_HEADS * MAX_SEQ * D_HEAD
 
     scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
-    seq = tl.arange(0, MAX_SEQ)
-    mask = seq <= pos
     dh = tl.arange(0, D_HEAD)
 
     for layer in tl.static_range(N_LAYERS):
@@ -116,57 +117,85 @@ def _fused_decode_nlayer(
         hc = h - mean
         h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
 
-        # ── Attention ──
+        # ── Attention (tiled KV with online softmax) ──
+        # Use tl.dot for projections: (1, D_MODEL) @ (D_MODEL, D_HEAD) avoids
+        # materializing (D_MODEL, D_HEAD) intermediate that overflows registers at d=512.
         attn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
+        h_norm_2d = h_norm[None, :].to(tl.bfloat16)  # (1, D_MODEL) bf16
 
         for head in tl.range(N_HEADS):
             hd = head * D_HEAD + dh
             cache_off = head * MAX_SEQ * D_HEAD
 
-            # Q/K/V projections (element-wise since M=1)
-            Q = tl.sum(h_norm[:, None] * tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
-            K_new = tl.sum(h_norm[:, None] * tl.load(packed_w_ptr + wk_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
-            V_new = tl.sum(h_norm[:, None] * tl.load(packed_w_ptr + wv_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.float32), axis=0)
+            # Q/K/V projections via tl.dot: (1, D_MODEL) @ (D_MODEL, D_HEAD) → (1, D_HEAD)
+            wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+            Q = tl.dot(h_norm_2d, wq).to(tl.float32).sum(axis=0)  # (D_HEAD,)
+            wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+            K_new = tl.dot(h_norm_2d, wk).to(tl.float32).sum(axis=0)
+            wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_MODEL + hd[None, :]).to(tl.bfloat16)
+            V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
 
-            # Load K cache, insert new K, write updated cache
-            K = tl.load(kv_in_ptr + kc_base + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
-            K = tl.where(seq[:, None] == pos, K_new[None, :], K)
-            tl.store(kv_out_ptr + kc_base + cache_off + seq[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16), mask=mask[:, None])
+            # Write new K/V to output cache
             tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
-
-            # Attention scores → softmax
-            scores = tl.sum(Q[None, :] * K, axis=1) * scale
-            scores = tl.where(mask, scores, -1e9)
-            exp_s = tl.exp(scores - tl.max(scores))
-            attn_w = exp_s / tl.sum(exp_s)
-
-            # Load V cache, insert new V, write updated cache
-            V = tl.load(kv_in_ptr + vc_base + cache_off + seq[:, None] * D_HEAD + dh[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
-            V = tl.where(seq[:, None] == pos, V_new[None, :], V)
-            tl.store(kv_out_ptr + vc_base + cache_off + seq[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16), mask=mask[:, None])
             tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
-            attn_out = tl.sum(attn_w[:, None] * V, axis=0)
+            # Online softmax over tiled KV cache
+            m_i = tl.full((1,), value=-1e9, dtype=tl.float32)
+            l_i = tl.zeros((1,), dtype=tl.float32)
+            o_i = tl.zeros((D_HEAD,), dtype=tl.float32)
 
-            # O projection
-            attn_accum += tl.sum(attn_out[:, None] * tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
+            for t in tl.range(0, MAX_SEQ, KV_TILE):
+                tile_pos = t + tl.arange(0, KV_TILE)
+                tile_mask = tile_pos <= pos
+
+                K_tile = tl.load(kv_in_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                                mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
+                tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                        K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+
+                V_tile = tl.load(kv_in_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                                mask=tile_mask[:, None], other=0.0).to(tl.float32)
+                V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
+                tl.store(kv_out_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                        V_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+
+                s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
+                s = tl.where(tile_mask, s, -1e9)
+
+                m_ij = tl.max(s)
+                m_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_new)
+                p = tl.exp(s - m_new)
+                l_i = l_i * alpha + tl.sum(p)
+                o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
+                m_i = m_new
+
+            attn_out = o_i / l_i  # (D_HEAD,)
+
+            # O projection via tl.dot: (1, D_HEAD) @ (D_HEAD, D_MODEL) → (1, D_MODEL)
+            wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+            attn_accum += tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
 
         h = h + attn_accum
 
-        # ── LN2 + FFN ──
+        # ── LN2 + FFN (also use tl.dot for projections) ──
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
         ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
         mean = tl.sum(h) / D_MODEL
         hc = h - mean
         h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+        h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
         ffn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
         for k in tl.range(0, D_FF, BLOCK_K):
             kk = k + tl.arange(0, BLOCK_K)
-            up = tl.sum(h_norm[:, None] * tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.float32), axis=0)
+            up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+            up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)  # (BLOCK_K,)
             up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
             act = up * tl.sigmoid(1.702 * up)
-            ffn_accum += tl.sum(act[:, None] * tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
+            down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+            ffn_accum += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
         h = h + ffn_accum + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
 
     # ════════════════════════════════════════════
@@ -179,10 +208,12 @@ def _fused_decode_nlayer(
     hc = h - mean
     h_final = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
 
-    for v_start in tl.range(0, VOCAB_PAD, VOCAB_TILE):
-        vv = v_start + tl.arange(0, VOCAB_TILE)
-        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.float32)
-        tile_logits = tl.sum(h_final[:, None] * out_w, axis=0)
+    # Output via tl.dot: (1, D_MODEL) @ (D_MODEL, OUTPUT_VTILE) → (1, OUTPUT_VTILE)
+    h_final_2d = h_final[None, :].to(tl.bfloat16)
+    for v_start in tl.range(0, VOCAB_PAD, OUTPUT_VTILE):
+        vv = v_start + tl.arange(0, OUTPUT_VTILE)
+        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :]).to(tl.bfloat16)
+        tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
         tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
         tl.store(logits_ptr + vv, tile_logits)
 

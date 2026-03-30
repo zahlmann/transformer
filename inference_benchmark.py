@@ -139,22 +139,32 @@ def main():
 
     # JAX baseline
     fwd = jax.jit(lambda x: transformer_forward(params, config, x))
-    jax_times, jax_tokens = bench(
-        lambda: generate_jax(fwd, prompt, GEN_LEN), WARMUP, BENCH_ITERS)
-    jax_ms = np.mean(jax_times) * 1000
-    jax_tps = GEN_LEN / np.mean(jax_times)
-    print(f"JAX:     {jax_tps:>6.0f} tok/s  ({jax_ms:.1f}ms)  text: {decode(jax_tokens)}")
+    try:
+        jax_times, jax_tokens = bench(
+            lambda: generate_jax(fwd, prompt, GEN_LEN), WARMUP, BENCH_ITERS)
+        jax_ms = np.mean(jax_times) * 1000
+        jax_tps = GEN_LEN / np.mean(jax_times)
+        print(f"JAX:     {jax_tps:>6.0f} tok/s  ({jax_ms:.1f}ms)  text: {decode(jax_tokens)}")
+        speedup = jax_ms / tri_ms
+    except Exception as e:
+        print(f"JAX:     FAILED ({e.__class__.__name__})")
+        jax_tps = 0
+        jax_ms = 0
+        speedup = 0
 
-    speedup = jax_ms / tri_ms
-    print(f"\nSpeedup: {speedup:.2f}x")
+    if speedup > 0:
+        print(f"\nSpeedup: {speedup:.2f}x")
 
     # Save
     with open(os.path.join(os.path.dirname(__file__), "inference_results.txt"), "w") as f:
         f.write(f"Model: d={config['d_model']} h={config['n_heads']} l={config['n_layers']}\n")
         f.write(f"Tokenizer: {tokenizer}, vocab_size: {vocab_size}\n")
         f.write(f"Triton: {tri_tps:.0f} tok/s ({tri_ms:.1f}ms)\n")
-        f.write(f"JAX:    {jax_tps:.0f} tok/s ({jax_ms:.1f}ms)\n")
-        f.write(f"Speedup: {speedup:.2f}x\n")
+        if jax_tps > 0:
+            f.write(f"JAX:    {jax_tps:.0f} tok/s ({jax_ms:.1f}ms)\n")
+            f.write(f"Speedup: {speedup:.2f}x\n")
+        else:
+            f.write(f"JAX:    OOM (model too large for naive baseline)\n")
 
 
 if __name__ == "__main__":
