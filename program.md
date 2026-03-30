@@ -357,61 +357,93 @@ CURRENT BASELINE (d=512, 8L, 29.7M params):
 The 2% bandwidth utilization means the GPU is 98% idle — there is massive room
 for improvement. Any optimization that moves bandwidth utilization upward is real progress.
 
-For detailed GPU profiling, use Nsight Compute:
+### Step 0: Profile to understand where time is spent
+
+Before optimizing, you MUST understand the bottleneck. Run Nsight Compute:
 ```bash
 /usr/local/cuda/bin/ncu --set full uv run profile_kernels.py 2>&1 | head -100
 ```
 
-Pick ONE of these directions. Each is a standalone phase with clear deliverables.
+Key questions to answer:
+- How much of the 3.48 ms/tok is kernel execution vs Python dispatch vs JAX overhead?
+- Within the kernel: how much time in attention vs FFN vs output projection?
+- What is the actual achieved memory bandwidth during kernel execution?
+- Is the kernel latency-bound (waiting for memory) or occupancy-bound (not enough warps)?
+- How many registers are spilling? What's the actual occupancy?
 
-### Option A: Persistent Decode Kernel (eliminate all launch overhead)
+Use `nsys profile` for a timeline view of kernel launches vs host activity:
+```bash
+/usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
+```
 
-Currently each decode step = 1 kernel launch + Python dispatch (~0.4ms overhead).
-A persistent kernel stays resident on the GPU across ALL decode steps, reading
-token IDs from a shared queue and writing results back — zero Python dispatch.
+Document all findings before proceeding to optimization. The profiling results
+determine which optimization below will have the most impact.
 
-What to build:
-- Persistent kernel that loops over decode steps inside the kernel
-- Host writes token_id and pos to pinned memory, kernel polls for new work
-- Kernel writes logits to output buffer, host reads and does argmax
-- Use `tl.atomic` or memory fences for host-device synchronization
-- Target: eliminate the ~0.4ms/step dispatch overhead (significant at d=512 where
-  GPU compute is only ~3ms)
+### Step 1: Eliminate host overhead (likely biggest win)
 
-Key kernel work:
-- Restructure fused_decode_nlayer to loop internally
-- Implement spin-wait synchronization (device polls flag in global memory)
-- Handle the argmax on-device to avoid sync per step
+The 3.48 ms/tok includes Python/JAX dispatch per step. Profile to measure how much.
+If dispatch is >1ms (likely), these optimizations apply:
 
-### Option B: Grouped-Query Attention (architectural optimization)
+**1a. CUDA graphs** — Capture the decode step as a CUDA graph. JAX supports this
+via `jax.jit` + XLA's CUDA graph mode. The graph replays the same kernel launch
+without Python involvement. This is the simplest approach.
 
-Current model uses multi-head attention (16 separate K/V heads). GQA shares K/V
-across groups of query heads (e.g., 4 KV heads for 16 Q heads = 4x less KV cache).
+```python
+# Conceptual approach — need to verify JAX/jax-triton CUDA graph support
+@jax.jit
+def decode_step(w, config, tok, pos, kv):
+    return fused_decode_nlayer(w, config, tok, pos, kv, vocab_size)
+```
 
-What to build:
-- Modify model.py to support n_kv_heads < n_heads (GQA)
-- Retrain d=512 model with n_kv_heads=4 (4 KV groups of 4 Q heads each)
-- Adapt decode kernel: 4x smaller KV cache reads per attention step
-- Adapt prefill kernel: Q heads within a group share the same K/V
-- Measure quality vs MHA and speedup from reduced bandwidth
-- Target: 1.5-2x decode speedup from 4x less KV cache traffic
+**1b. Persistent kernel** — If CUDA graphs don't work with jax-triton, build a
+persistent kernel that stays resident on the GPU across ALL decode steps:
+- Kernel loops internally, polls global memory for new token_id/pos
+- Host writes input, kernel reads it, computes, writes output
+- Host polls for output, does argmax, writes next input
+- Eliminates all kernel launch overhead
+- Uses `tl.atomic` or volatile memory for synchronization
 
-### Option C: Batched Inference + Continuous Batching (throughput optimization)
+**1c. Move argmax to device** — Currently each step does `int(jnp.argmax(logits))`
+which forces a GPU→CPU sync. Computing argmax inside the kernel and writing just
+the token ID to output avoids this sync entirely.
 
-Generate multiple sequences in parallel. With M>1, decode can use tensor cores
-(tl.dot instead of element-wise), dramatically increasing compute utilization.
+Target: reduce per-step overhead from ~0.4ms to ~0.01ms.
 
-What to build:
-- Batched decode kernel: process B tokens per step (one per sequence)
-- Separate KV caches per sequence, batch the attention
-- Continuous batching: sequences can start/finish independently
-- Measure throughput (total tok/s) vs batch size
-- Target: 4-8x throughput improvement at batch=8-16
+### Step 2: Improve kernel GPU utilization
 
-Key kernel work:
-- Reshape decode from M=1 element-wise to M=B matmul-based
-- This is the transition from "latency-optimized" to "throughput-optimized"
-- Uses tensor cores for the first time in decode
+Even if the kernel itself runs at full speed, it may have low SM utilization.
+
+**2a. Increase occupancy** — Current kernel uses num_warps=4. With d=512 and
+tl.dot projections, the register pressure may have changed. Try num_warps=8 to
+double occupancy. Profile both and compare SM utilization.
+
+**2b. Multi-SM decode** — Current decode launches grid=(1,) — one thread block on
+one SM. The 4080 Super has 80 SMs. 79 SMs are completely idle during decode.
+Possible approaches:
+- Split heads across SMs: grid=(N_HEADS,), each block handles one head's attention
+- Split layers across SMs: pipeline layers across blocks with barriers
+- Split the KV tiling across SMs: each block handles a tile of the cache
+
+This is the most impactful architectural change. Going from 1 SM to even 8 SMs
+would give up to 8x speedup if the work parallelizes well.
+
+**2c. Batched inference** — Process B sequences in parallel. With M>1:
+- Projections become real matmuls: tl.dot((B, D_MODEL), (D_MODEL, D_HEAD))
+- Tensor cores activate (need M >= 16 for full utilization)
+- Each SM has more work → better utilization
+- Trade-off: increases per-sequence latency slightly, but total tok/s goes up dramatically
+- Target: 4-8x throughput at batch=8-16
+
+### Step 3: Reduce memory traffic per step
+
+If after steps 1-2 the kernel becomes bandwidth-bound (good!), reduce bytes loaded:
+
+**3a. Grouped-Query Attention (GQA)** — Share K/V across groups of query heads.
+With 4 KV heads for 16 Q heads → 4x less KV cache traffic. Requires retraining.
+
+**3b. Optimize weight loading** — Current kernel loads all layer weights every step.
+If some weights can stay in L2 cache between steps (they fit: 59.3MB weight buffer,
+L2 is 64MB on 4080 Super), the effective bandwidth is much higher.
 
 ### What NOT to change
 
