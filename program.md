@@ -358,12 +358,16 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 Run `uv run profile_kernels.py` after any kernel change. The hard metrics to beat:
 
 ```
-CURRENT BASELINE (d=512, 8L, 29.7M params):
-  Decode throughput:     287 tok/s
-  Decode latency:        3.48 ms/tok
-  Bandwidth utilization: 2% of 836 GB/s
+CURRENT (d=512, 8L, 29.7M params, multi-SM grid=16):
+  Decode throughput:     1753 tok/s  (with int sync for token collection)
+  Decode no-sync:        ~2900 tok/s (in-kernel argmax, deferred collection)
+  Decode latency:        0.57 ms/tok (with sync), 0.35 ms/tok (no sync)
+  Bandwidth utilization: 14% of 836 GB/s
   Prefill latency:       6.3 ms (128 tokens)
-  Theoretical min:       0.081 ms/tok (if bandwidth-saturated)
+  Theoretical min:       0.075 ms/tok (63 MB unique data @ 836 GB/s)
+
+PREVIOUS BASELINE (single-SM, grid=1):
+  Decode throughput:     287 tok/s (3.48 ms/tok, 2% BW)
 ```
 
 The 2% bandwidth utilization means the GPU is 98% idle — there is massive room
@@ -402,43 +406,17 @@ PROFILING RESULTS (2026-03-30):
 - Step 2b (multi-SM decode) → HIGHEST IMPACT, 79 idle SMs
 - Step 1c (device argmax) → moderate impact, 17% speedup
 
-### Step 1: Eliminate host overhead (likely biggest win)
+### Step 1: Eliminate host overhead — COMPLETED (low impact)
 
-The 3.48 ms/tok includes Python/JAX dispatch per step. Profile to measure how much.
-If dispatch is >1ms (likely), these optimizations apply:
+Profiling showed host overhead is only 3% (0.11ms). Not the bottleneck at d=512.
+**1c. In-kernel argmax** — DONE. Avoids GPU→CPU sync in decode loop (1592→2900 tok/s).
 
-**1a. CUDA graphs** — Capture the decode step as a CUDA graph. JAX supports this
-via `jax.jit` + XLA's CUDA graph mode. The graph replays the same kernel launch
-without Python involvement. This is the simplest approach.
+### Step 2: Multi-SM decode — COMPLETED (biggest win)
 
-```python
-# Conceptual approach — need to verify JAX/jax-triton CUDA graph support
-@jax.jit
-def decode_step(w, config, tok, pos, kv):
-    return fused_decode_nlayer(w, config, tok, pos, kv, vocab_size)
-```
+**2a. num_warps sweep** — DONE. num_warps=4 and 8 are tied (2872 vs 2915 tok/s).
+Not warp-limited.
 
-**1b. Persistent kernel** — If CUDA graphs don't work with jax-triton, build a
-persistent kernel that stays resident on the GPU across ALL decode steps:
-- Kernel loops internally, polls global memory for new token_id/pos
-- Host writes input, kernel reads it, computes, writes output
-- Host polls for output, does argmax, writes next input
-- Eliminates all kernel launch overhead
-- Uses `tl.atomic` or volatile memory for synchronization
-
-**1c. Move argmax to device** — Currently each step does `int(jnp.argmax(logits))`
-which forces a GPU→CPU sync. Computing argmax inside the kernel and writing just
-the token ID to output avoids this sync entirely.
-
-Target: reduce per-step overhead from ~0.4ms to ~0.01ms.
-
-### Step 2: Improve kernel GPU utilization
-
-Even if the kernel itself runs at full speed, it may have low SM utilization.
-
-**2a. Increase occupancy** — Current kernel uses num_warps=4. With d=512 and
-tl.dot projections, the register pressure may have changed. Try num_warps=8 to
-double occupancy. Profile both and compare SM utilization.
+**2b. Multi-SM decode** — DONE. grid=(N_HEADS=16,) with atomic barriers.
 
 **2b. Multi-SM decode** — Current decode launches grid=(1,) — one thread block on
 one SM. The 4080 Super has 80 SMs. 79 SMs are completely idle during decode.
@@ -459,14 +437,33 @@ would give up to 8x speedup if the work parallelizes well.
 
 ### Step 3: Reduce memory traffic per step
 
-If after steps 1-2 the kernel becomes bandwidth-bound (good!), reduce bytes loaded:
+Achieved: 0.35 ms/tok (no sync), 14% BW utilization. Remaining gap: 4.7x vs theoretical.
 
-**3a. Grouped-Query Attention (GQA)** — Share K/V across groups of query heads.
-With 4 KV heads for 16 Q heads → 4x less KV cache traffic. Requires retraining.
+**Bottleneck analysis (2026-03-31):**
+- Unique data per step: 63 MB. Theoretical at 836 GB/s: 0.075 ms.
+- Achieved kernel time: 0.57 ms (block_until_ready), 0.35 ms (amortized/pipelined).
+- 17 barriers per step × 5-10µs each = 0.085-0.17 ms (15-30% of kernel time).
+- Weights (59.3 MB) barely fit in L2 (64 MB). With KV cache (8.4 MB), L2 overflows.
+- num_warps sweep: 2/4/8/16 all within 5% — not warp-limited.
+- Only 16 blocks on 80 SMs — low occupancy limits memory request parallelism.
 
-**3b. Optimize weight loading** — Current kernel loads all layer weights every step.
-If some weights can stay in L2 cache between steps (they fit: 59.3MB weight buffer,
-L2 is 64MB on 4080 Super), the effective bandwidth is much higher.
+**3a. Reduce barriers** — Merge FFN reduction with next layer's LN1. Use persistent
+accumulators. Target: 9 barriers instead of 17. Saves 0.04-0.08 ms.
+
+**3b. More blocks (higher grid)** — grid=(32,) or grid=(64,) to use more SMs and
+increase outstanding memory requests. Requires splitting heads across multiple blocks
+for KV attention (2 blocks per head, each handling half the KV tiles).
+
+**3c. INT8 weight quantization** — Halve weight buffer to ~30 MB. Fits comfortably
+in L2 with KV cache (38 MB). Effective bandwidth is L2 bandwidth (~2 TB/s), not
+DRAM. Theoretical: 38 MB / 2000 GB/s = 0.019 ms. Requires dequantization in kernel.
+
+**3d. GQA (Grouped-Query Attention)** — 4 KV heads for 16 Q heads → 4x less KV
+cache traffic. Requires retraining but reduces 8 MB KV cache to 2 MB.
+
+**3e. Persistent kernel across steps** — Kernel loops internally across all decode
+steps, polling for new tokens. Eliminates all per-step launch overhead and workspace
+allocation. Most ambitious approach.
 
 ### What NOT to change
 
