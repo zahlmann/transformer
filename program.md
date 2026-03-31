@@ -389,16 +389,23 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 
 ## COMPLETED: Batched Inference (Step 2c) — DONE
 
-**Results (MHA, d=512, 8L, 29.7M params):**
+**Results (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):**
 ```
-Single-sequence (B=1):  1890 tok/s  (0.529 ms/tok)
-Batched B=4:            3422 tok/s  (1.81x, 1.169 ms/step, 856 tok/s per seq)
-Batched B=8:            4347 tok/s  (2.30x, 1.841 ms/step, 543 tok/s per seq)
+Single-sequence (B=1):  1935 tok/s  (0.517 ms/tok)
+Batched B=4:            3821 tok/s  (1.97x, 1.047 ms/step, 955 tok/s per seq)
+Batched B=8:            4641 tok/s  (2.40x, 1.724 ms/step, 580 tok/s per seq)
+Batched B=16:           5050 tok/s  (2.61x, 3.169 ms/step, 316 tok/s per seq)
 ```
 
-**Why not 4x at B=4:** With MHA (8.4 MB KV per sequence), B=4 total data = 55 + 4×8.4 = 88.6 MB
-exceeds L2 cache (64 MB). KV cache thrashes L2, forcing HBM traffic. GQA (2.1 MB KV per seq)
-would fit B=4 in L2 (55 + 4×2.1 = 63.4 MB). Also, 3 barriers per layer (25 total) add ~75µs.
+**Previous (MHA, 29.7M params):**
+```
+B=1: 1890 tok/s, B=4: 3422 (1.81x), B=8: 4347 (2.30x)
+```
+
+**Why not 4x at B=4:** Per-sequence compute (attention over 512 KV positions, QKV projections,
+FFN) adds ~0.17ms per additional sequence regardless of weight sharing. The theoretical 4x assumed
+weights dominated kernel time (75%), but in practice the per-sequence attention loop is a
+significant fixed cost. GQA helped ~10% over MHA (L2-friendly KV caches: 2.1 vs 8.4 MB per seq).
 
 ### What was done
 
@@ -419,16 +426,16 @@ would fit B=4 in L2 (55 + 4×2.1 = 63.4 MB). Also, 3 barriers per layer (25 tota
    - Phase 3: h_new = h + attn_total + ffn_total + bias (writes to buf_out)
    - 3 barriers per layer: after phase 1, after phase 2, after phase 3
 
-### YOUR NEXT TASK: Train GQA model and benchmark batched + GQA
+### Possible next optimizations
 
-With GQA (4 KV heads), B=4 total data = 55 + 4×2.1 = 63.4 MB ≈ L2 cache.
-Expected improvement: 3-4x throughput (vs current 1.81x with MHA).
-
-Steps:
-1. Train GQA model: `uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 --n-kv-heads 4 --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16`
-2. Save as weights_gqa.pkl
-3. Benchmark batched decode with GQA weights
-4. Optionally try B=16 (55 + 16×2.1 = 88.6 MB, still tight)
+- **Weight-amortized FFN**: Current fused merge+LN2+FFN per batch element reloads FFN
+  weights B times. De-fusing and loading FFN weights once per k-tile (applying to B sequences)
+  could save ~10% at B=4. Requires h_norm buffer (safe with 3-barrier design).
+- **Larger batch sizes**: B=16 gives 2.61x but diminishing returns. Per-sequence attention
+  compute is the bottleneck. Reducing attention cost (e.g., shorter context, paged attention)
+  would help scaling.
+- **Tensor core batched projections**: With B>=16, projections become (B, D_MODEL) @ (D_MODEL, D_HEAD)
+  which can use tensor cores (need M>=16). Currently using element-wise dot for M=1.
 
 ### How to measure progress
 
