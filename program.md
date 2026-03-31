@@ -28,24 +28,26 @@ Build the fastest possible inference for this transformer using custom Triton ke
 12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
 13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
 14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
+15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
 
 ### Current Performance (RTX 4080 Super)
 
 ```
 XL model (d=512, h=16, l=8, ctx=512, 29.7M params, ppl=2.91):
-  Decode (multi-SM):   1851 tok/s (0.54 ms/tok)  ← 6.6x speedup via grid=(32,) kv_splits=2
+  Decode (multi-SM):   1937 tok/s (0.52 ms/tok)  ← 6.8x speedup via grid=(32,) + split barrier
+  Decode (no sync):    3108 tok/s (0.32 ms/tok)   (pure GPU, no int() per token)
   Decode (grid=16):    1734 tok/s (0.58 ms/tok)   (kv_splits=1, previous)
   Decode (single-SM):  287 tok/s  (3.49 ms/tok)   (original baseline)
   Prefill (128 tok):   6.1 ms    (21,168 tok/s)
   Weight buffer:       59.3 MB   (bf16)
   KV cache:            8.4 MB    (bf16, per sequence)
-  Bandwidth util:      15%       (of 836 GB/s theoretical, was 2%)
+  Bandwidth util:      16%       (of 836 GB/s theoretical, was 2%)
 
 Previous model sizes:
   d=64,  1L:    3056 tok/s
   d=128, 2L:    2589 tok/s
   d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  → 1734 tok/s → 1851 tok/s (KV splits)
+  d=512, 8L:     287 tok/s  → 1734 → 1851 → 1937 tok/s
 ```
 
 **Key findings:**
@@ -54,8 +56,11 @@ Previous model sizes:
   Splits KV cache tiles across 2 blocks per head (FlashDecoding-style).
   Merge uses online softmax correction (weighted average of normalized O-projections).
   kv_splits=4 was slightly slower (barrier contention with 64 blocks).
-- Bandwidth utilization: 15%. Without int() sync: ~2900 tok/s.
-- Theoretical minimum: 0.081 ms/tok — 6.7x headroom remaining.
+- Split barrier: separates arrival counter from done flag on different cache lines.
+  Reduces L2 contention during spin-waiting (1851→1937 tok/s, +5%).
+  Pure GPU throughput: 3108 tok/s (0.32 ms/tok).
+- GPU→CPU sync (int()) costs 34% of total time (0.19 ms per token).
+- Bandwidth utilization: 16%. Theoretical minimum: 0.081 ms/tok — 4.0x headroom (pure GPU).
 
 ---
 
@@ -149,6 +154,14 @@ Phase A6: KV-split parallelism (FlashDecoding):
   Improvement over grid=16:         +10% sustained throughput
   Technique: split KV cache tiles across 2 blocks per head, merge with
     online softmax correction (weighted average of normalized O-projections)
+
+Phase A7: Split barrier + profiling:
+  Split barrier:                   1937 tok/s  (0.52 ms/tok, 16% BW utilization)
+  Without GPU→CPU sync:            3108 tok/s  (0.32 ms/tok)
+  Improvement: +5% with sync, +6.5% pure GPU
+  Key insight: GPU→CPU int() sync costs 34% of total time (0.19 ms/tok)
+  Technique: separate arrival counter and done-flag on different cache lines.
+    Last-arriving block sets done flag; others poll done (not counter).
 
 Key findings:
 - Tiled output projection has ZERO overhead vs register-only.
@@ -371,13 +384,16 @@ Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB)
 Run `uv run profile_kernels.py` after any kernel change. The hard metrics to beat:
 
 ```
-CURRENT (d=512, 8L, 29.7M params, multi-SM grid=32, kv_splits=2):
-  Decode throughput:     1851 tok/s  (with int sync for token collection)
-  Decode no-sync:        ~2900 tok/s (in-kernel argmax, deferred collection)
-  Decode latency:        0.54 ms/tok (with sync)
-  Bandwidth utilization: 15% of 836 GB/s
+CURRENT (d=512, 8L, 29.7M params, multi-SM grid=32, kv_splits=2, split barrier):
+  Decode throughput:     1937 tok/s  (with int sync for token collection)
+  Decode no-sync:        3108 tok/s  (in-kernel argmax, deferred collection)
+  Decode latency:        0.52 ms/tok (with sync), 0.32 ms/tok (no sync)
+  Bandwidth utilization: 16% of 836 GB/s
   Prefill latency:       6.1 ms (128 tokens)
   Theoretical min:       0.081 ms/tok (67.7 MB unique data @ 836 GB/s)
+
+PREVIOUS (grid=32, kv_splits=2, old barrier):
+  Decode throughput:     1851 tok/s (0.54 ms/tok, 15% BW)
 
 PREVIOUS (multi-SM, grid=16, kv_splits=1):
   Decode throughput:     1734 tok/s (0.58 ms/tok, 14% BW)
@@ -463,8 +479,11 @@ Achieved: 0.54 ms/tok (with sync), 15% BW utilization. Remaining gap: 6.7x vs th
 - num_warps sweep: 2/4/8/16 all within 5% — not warp-limited.
 - Only 16 blocks on 80 SMs — low occupancy limits memory request parallelism.
 
-**3a. Reduce barriers** — Merge FFN reduction with next layer's LN1. Use persistent
-accumulators. Target: 9 barriers instead of 17. Saves 0.04-0.08 ms.
+**3a. Reduce barrier cost** — PARTIALLY DONE. Split barrier implementation reduces
+L2 contention by separating arrival counter from done flag on different cache lines.
+Saves ~21µs/step (0.32→0.30 ms equivalent, +6.5% pure GPU throughput).
+Further reduction to 9 barriers (from 17) requires parallel residual model architecture
+(attention ‖ FFN instead of sequential), which needs retraining.
 
 **3b. More blocks (higher grid)** — DONE. grid=(32,) with kv_splits=2.
 Each head's KV attention is split across 2 blocks (FlashDecoding-style).
@@ -685,3 +704,26 @@ baseline_metrics.txt                — current numbers to beat
     worst-case spin time. Also, each block has less FFN work (D_FF/64=32 elements,
     only 1 iteration), reducing per-block compute efficiency. The FFN reduction also
     reads from more blocks (64×D_MODEL vs 32×D_MODEL from L2).
+
+33. **Split barrier: separate counter and done-flag on different cache lines.**
+    The standard all-spin barrier has all N blocks polling the same counter address
+    with atomic_add(0, acquire) while other blocks are still arriving with atomic_add(1,
+    release). This causes L2 cache line thrashing (arrivals invalidate the line that
+    pollers are reading). Fix: arrivals go to counter[], last-arriving block sets a
+    done-flag[] on a different cache line, all blocks poll done[]. The counter line
+    sees only 32 writes (no reads during arrival), the done line sees only reads until
+    the single write. 6.5% kernel speedup (2918→3108 tok/s pure GPU).
+
+34. **Triton if/else on atomic return values is unreliable.** When branching on the
+    return value of `tl.atomic_add`, using `if/else` caused subtle correctness bugs:
+    tokens diverged after 10 steps. Replacing `if (...): ... else: ...` with
+    `if (...): ...\n while ...:` (no else, all blocks execute the while) fixed it.
+    The issue is likely that Triton's compiler generates incorrect predicated code
+    when the else branch contains a while loop with atomics.
+
+35. **GPU→CPU sync costs 34% of total decode time.** `int(next_token)` forces a
+    GPU→CPU transfer per token (0.19 ms). The in-kernel argmax avoids the argmax
+    compute cost, but int() still triggers sync. The pipelined approach (tokens stay
+    on device, JAX dispatches next call while current runs) achieves 3108 tok/s vs
+    1937 tok/s with sync. For real applications, collect tokens on device and batch-
+    transfer to CPU periodically.

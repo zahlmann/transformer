@@ -65,7 +65,8 @@ def _multi_sm_decode(
     VOCAB_PAD: tl.constexpr,
     FF_PER_BLOCK: tl.constexpr,
     ATTN_ML_OFF: tl.constexpr,    # offset to attention m/l section
-    BARRIER_OFF: tl.constexpr,    # offset to barrier section
+    BARRIER_OFF: tl.constexpr,    # offset to barrier counters
+    DONE_OFF: tl.constexpr,       # offset to done flags (separate cache line from counters)
     ARGMAX_OFF: tl.constexpr,     # offset to argmax section
 ):
     pid = tl.program_id(0)  # 0..TOTAL_BLOCKS-1
@@ -80,6 +81,7 @@ def _multi_sm_decode(
     partial_ptr = workspace_ptr
     attn_ml_ptr = workspace_ptr + ATTN_ML_OFF
     barrier_ptr = workspace_ptr + BARRIER_OFF
+    done_ptr = workspace_ptr + DONE_OFF
     argmax_ptr = workspace_ptr + ARGMAX_OFF
 
     # ── Embedding (all blocks compute redundantly — 2KB from L2) ──
@@ -183,10 +185,14 @@ def _multi_sm_decode(
         tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
         tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
-        # Barrier (f32 atomics — exact for small integers)
+        # Split barrier: arrivals on counter, spinning on separate done flag
+        # Reduces L2 contention (counter writes don't interfere with done-flag polls)
         b0 = layer * 2
-        tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+        old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
+        if old_cnt >= TOTAL_BLOCKS - 1:
+            _ = tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu')
+            tl.atomic_add(done_ptr + b0, 1.0, sem='release', scope='gpu')
+        while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
             pass
 
         # ── PHASE 2: Merge KV splits + reduce attention + LN2 + FFN ──
@@ -231,8 +237,11 @@ def _multi_sm_decode(
         tl.store(partial_ptr + pid * D_MODEL + d, ffn_partial)
 
         b1 = layer * 2 + 1
-        tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+        old_cnt = tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
+        if old_cnt >= TOTAL_BLOCKS - 1:
+            _ = tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu')
+            tl.atomic_add(done_ptr + b1, 1.0, sem='release', scope='gpu')
+        while tl.atomic_add(done_ptr + b1, 0.0, sem='acquire', scope='gpu') < 1.0:
             pass
 
         # ── PHASE 3: Reduce FFN + residual ──
@@ -272,8 +281,11 @@ def _multi_sm_decode(
 
     # Final barrier: all blocks done with output projection
     N_BARRIERS: tl.constexpr = 2 * N_LAYERS
-    tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
-    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+    old_cnt = tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
+    if old_cnt >= TOTAL_BLOCKS - 1:
+        _ = tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu')
+        tl.atomic_add(done_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
+    while tl.atomic_add(done_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < 1.0:
         pass
 
     # Block 0: find global argmax
@@ -313,11 +325,13 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
     total_blocks = n_heads * kv_splits
     ff_per_block = d_ff // total_blocks
 
-    # Workspace layout: partials | attn_ml | barriers | argmax
+    # Workspace layout: partials | attn_ml | barriers | done_flags | argmax
+    # Barriers and done flags on separate cache lines (32 entries apart = 128 bytes)
+    n_barriers = 2 * n_layers + 1
     attn_ml_off = total_blocks * d_model
     barrier_off = attn_ml_off + total_blocks * 2
-    # +1 barrier for output projection sync
-    argmax_off = barrier_off + 2 * n_layers + 1
+    done_off = barrier_off + 32  # pad to 128 bytes (separate cache line)
+    argmax_off = done_off + 32   # pad done flags too
     workspace_size = argmax_off + 2 * total_blocks  # per-block (val, idx)
 
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
@@ -337,7 +351,7 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
             jax.ShapeDtypeStruct((1,), jnp.int32),
         ],
         grid=(total_blocks,),
-        num_warps=4, num_stages=1,
+        num_warps=4, num_stages=2,
         D_MODEL=d_model, D_HEAD=d_head, D_FF=d_ff,
         N_HEADS=n_heads, N_LAYERS=n_layers, MAX_SEQ=max_seq,
         KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
@@ -345,6 +359,7 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
         FF_PER_BLOCK=ff_per_block,
         ATTN_ML_OFF=attn_ml_off,
         BARRIER_OFF=barrier_off,
+        DONE_OFF=done_off,
         ARGMAX_OFF=argmax_off,
     )
 
