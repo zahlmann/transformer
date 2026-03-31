@@ -5,10 +5,11 @@ import jax.numpy as jnp
 
 
 def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=None):
+                     n_kv_heads=None, parallel_residual=False):
     """Initialize a small decoder-only transformer. Returns a flat dict of params.
 
     n_kv_heads: number of KV heads for GQA. If None, defaults to n_heads (standard MHA).
+    parallel_residual: if True, compute attention and FFN in parallel (GPT-NeoX style).
     """
     assert d_model % n_heads == 0
     d_head = d_model // n_heads
@@ -25,6 +26,7 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
         "n_layers": n_layers,
         "d_head": d_head,
         "context_len": context_len,
+        "parallel_residual": parallel_residual,
     }
 
     # token embedding: (vocab_size, d_model)
@@ -119,6 +121,8 @@ def transformer_forward(params, config, x):
     # embeddings
     h = params["token_emb"][x] + params["pos_emb"][:seq_len]
 
+    parallel = config.get("parallel_residual", False)
+
     for layer in range(config["n_layers"]):
         prefix = f"layer{layer}"
 
@@ -133,13 +137,21 @@ def transformer_forward(params, config, x):
             config["n_heads"],
             config.get("n_kv_heads", config["n_heads"]),
         )
-        h = h + attn_out
 
-        # pre-norm FFN
-        h_norm = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-        h_ff = jax.nn.gelu(h_norm @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-        h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
-        h = h + h_ff
+        if parallel:
+            # Parallel residual: attention and FFN both computed from h
+            # h_out = h + Attn(LN1(h)) + FFN(LN2(h))
+            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h = h + attn_out + h_ff
+        else:
+            # Standard sequential residual
+            h = h + attn_out
+            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h = h + h_ff
 
     # final layer norm + output projection
     h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
@@ -176,13 +188,20 @@ def prefill_with_kv(params, config, x):
             h_norm, params[f"{prefix}.attn.q"], params[f"{prefix}.attn.k"],
             params[f"{prefix}.attn.v"], params[f"{prefix}.attn.o"],
             config["n_heads"], n_kv_heads)
-        h = h + attn_out
 
-        # FFN
-        h_norm = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-        h_ff = jax.nn.gelu(h_norm @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-        h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
-        h = h + h_ff
+        # FFN (parallel or sequential residual)
+        parallel = config.get("parallel_residual", False)
+        if parallel:
+            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h = h + attn_out + h_ff
+        else:
+            h = h + attn_out
+            h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h = h + h_ff
 
     h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
     logits = h @ params["output_proj"]

@@ -66,7 +66,9 @@ def _multi_sm_decode(
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
     FF_PER_BLOCK: tl.constexpr,
+    PARALLEL_RESIDUAL: tl.constexpr,  # True: parallel attn||ffn (1 barrier/layer)
     ATTN_ML_OFF: tl.constexpr,    # offset to attention m/l section
+    FFN_PARTIAL_OFF: tl.constexpr, # offset to FFN partials (for parallel residual)
     BARRIER_OFF: tl.constexpr,    # offset to barrier counters
     DONE_OFF: tl.constexpr,       # offset to done flags (separate cache line from counters)
     ARGMAX_OFF: tl.constexpr,     # offset to argmax section
@@ -80,7 +82,8 @@ def _multi_sm_decode(
     pos = tl.load(pos_ptr)
 
     # Aliases for workspace sections
-    partial_ptr = workspace_ptr
+    partial_ptr = workspace_ptr                       # attention partials (always)
+    ffn_partial_ptr = workspace_ptr + FFN_PARTIAL_OFF # FFN partials (parallel residual only)
     attn_ml_ptr = workspace_ptr + ATTN_ML_OFF
     barrier_ptr = workspace_ptr + BARRIER_OFF
     done_ptr = workspace_ptr + DONE_OFF
@@ -194,70 +197,125 @@ def _multi_sm_decode(
         tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
         tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
-        # Split barrier: arrivals on counter, spinning on separate done flag
-        # Reduces L2 contention (counter writes don't interfere with done-flag polls)
-        b0 = layer * 2
-        old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + b0, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
-            pass
+        if PARALLEL_RESIDUAL:
+            # ── PARALLEL RESIDUAL: compute FFN from same h (before attention modifies it) ──
+            ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
+            ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
+            mean = tl.sum(h) / D_MODEL
+            hc = h - mean
+            h_norm2 = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+            h_norm2_2d = h_norm2[None, :].to(tl.bfloat16)
 
-        # ── PHASE 2: Merge KV splits + reduce attention + LN2 + FFN ──
-        attn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
-        for head in tl.range(N_HEADS):
-            # Find global max m across KV splits for this head
-            m_max_val = tl.full((), -1e9, dtype=tl.float32)
-            for s in tl.static_range(KV_SPLITS):
-                m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
-                m_max_val = tl.maximum(m_max_val, m_s)
-            # Weighted merge of normalized O-projections
-            l_total = tl.full((), 0.0, dtype=tl.float32)
-            o_merged = tl.zeros((D_MODEL,), dtype=tl.float32)
-            for s in tl.static_range(KV_SPLITS):
-                m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
-                l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
-                o_s = tl.load(partial_ptr + (head * KV_SPLITS + s) * D_MODEL + d)
-                w = l_s * tl.exp(m_s - m_max_val)
-                l_total = l_total + w
-                o_merged = o_merged + o_s * w
-            attn_total = attn_total + o_merged / l_total
-        h = h + attn_total
+            ff_start = pid * FF_PER_BLOCK
+            ffn_partial = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
+                kk = ff_start + k + tl.arange(0, BLOCK_K)
+                up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+                up = tl.dot(h_norm2_2d, up_w).to(tl.float32).sum(axis=0)
+                up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
+                act = up * tl.sigmoid(1.702 * up)
+                down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+                ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
-        ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = h - mean
-        h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
-        h_norm_2d = h_norm[None, :].to(tl.bfloat16)
+            tl.store(ffn_partial_ptr + pid * D_MODEL + d, ffn_partial)
 
-        ff_start = pid * FF_PER_BLOCK
-        ffn_partial = tl.zeros((D_MODEL,), dtype=tl.float32)
-        for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
-            kk = ff_start + k + tl.arange(0, BLOCK_K)
-            up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
-            up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-            up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
-            act = up * tl.sigmoid(1.702 * up)
-            down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
-            ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
+            # SINGLE barrier (both attn and FFN partials written)
+            b = layer
+            old_cnt = tl.atomic_add(barrier_ptr + b, 1.0, sem='release', scope='gpu')
+            if old_cnt >= TOTAL_BLOCKS - 1:
+                _ = tl.atomic_add(barrier_ptr + b, 0.0, sem='acquire', scope='gpu')
+                tl.atomic_add(done_ptr + b, 1.0, sem='release', scope='gpu')
+            while tl.atomic_add(done_ptr + b, 0.0, sem='acquire', scope='gpu') < 1.0:
+                pass
 
-        tl.store(partial_ptr + pid * D_MODEL + d, ffn_partial)
+            # Reduce both attention and FFN, combine
+            attn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for head in tl.range(N_HEADS):
+                m_max_val = tl.full((), -1e9, dtype=tl.float32)
+                for s in tl.static_range(KV_SPLITS):
+                    m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                    m_max_val = tl.maximum(m_max_val, m_s)
+                l_total = tl.full((), 0.0, dtype=tl.float32)
+                o_merged = tl.zeros((D_MODEL,), dtype=tl.float32)
+                for s in tl.static_range(KV_SPLITS):
+                    m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                    l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
+                    o_s = tl.load(partial_ptr + (head * KV_SPLITS + s) * D_MODEL + d)
+                    w = l_s * tl.exp(m_s - m_max_val)
+                    l_total = l_total + w
+                    o_merged = o_merged + o_s * w
+                attn_total = attn_total + o_merged / l_total
 
-        b1 = layer * 2 + 1
-        old_cnt = tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + b1, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + b1, 0.0, sem='acquire', scope='gpu') < 1.0:
-            pass
+            ffn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for i in tl.range(TOTAL_BLOCKS):
+                ffn_total += tl.load(ffn_partial_ptr + i * D_MODEL + d)
 
-        # ── PHASE 3: Reduce FFN + residual ──
-        ffn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
-        for i in tl.range(TOTAL_BLOCKS):
-            ffn_total += tl.load(partial_ptr + i * D_MODEL + d)
-        h = h + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
+            h = h + attn_total + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
+        else:
+            # ── SEQUENTIAL RESIDUAL (standard transformer) ──
+            # Barrier 1: attention partials
+            b0 = layer * 2
+            old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
+            if old_cnt >= TOTAL_BLOCKS - 1:
+                _ = tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu')
+                tl.atomic_add(done_ptr + b0, 1.0, sem='release', scope='gpu')
+            while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
+                pass
+
+            # Merge KV splits + reduce attention
+            attn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for head in tl.range(N_HEADS):
+                m_max_val = tl.full((), -1e9, dtype=tl.float32)
+                for s in tl.static_range(KV_SPLITS):
+                    m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                    m_max_val = tl.maximum(m_max_val, m_s)
+                l_total = tl.full((), 0.0, dtype=tl.float32)
+                o_merged = tl.zeros((D_MODEL,), dtype=tl.float32)
+                for s in tl.static_range(KV_SPLITS):
+                    m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+                    l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
+                    o_s = tl.load(partial_ptr + (head * KV_SPLITS + s) * D_MODEL + d)
+                    w = l_s * tl.exp(m_s - m_max_val)
+                    l_total = l_total + w
+                    o_merged = o_merged + o_s * w
+                attn_total = attn_total + o_merged / l_total
+            h = h + attn_total
+
+            # LN2 + FFN
+            ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
+            ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
+            mean = tl.sum(h) / D_MODEL
+            hc = h - mean
+            h_norm2 = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
+            h_norm2_2d = h_norm2[None, :].to(tl.bfloat16)
+
+            ff_start = pid * FF_PER_BLOCK
+            ffn_partial = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
+                kk = ff_start + k + tl.arange(0, BLOCK_K)
+                up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+                up = tl.dot(h_norm2_2d, up_w).to(tl.float32).sum(axis=0)
+                up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
+                act = up * tl.sigmoid(1.702 * up)
+                down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+                ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
+
+            tl.store(partial_ptr + pid * D_MODEL + d, ffn_partial)
+
+            # Barrier 2: FFN partials
+            b1 = layer * 2 + 1
+            old_cnt = tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
+            if old_cnt >= TOTAL_BLOCKS - 1:
+                _ = tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu')
+                tl.atomic_add(done_ptr + b1, 1.0, sem='release', scope='gpu')
+            while tl.atomic_add(done_ptr + b1, 0.0, sem='acquire', scope='gpu') < 1.0:
+                pass
+
+            # Reduce FFN + residual
+            ffn_total = tl.zeros((D_MODEL,), dtype=tl.float32)
+            for i in tl.range(TOTAL_BLOCKS):
+                ffn_total += tl.load(partial_ptr + i * D_MODEL + d)
+            h = h + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
 
     # ── OUTPUT ──
     ln_s = tl.load(lnf_s_ptr + d).to(tl.float32)
@@ -289,7 +347,7 @@ def _multi_sm_decode(
     tl.store(argmax_ptr + pid * 2 + 1, best_idx)
 
     # Final barrier: all blocks done with output projection
-    N_BARRIERS: tl.constexpr = 2 * N_LAYERS
+    N_BARRIERS: tl.constexpr = N_LAYERS if PARALLEL_RESIDUAL else 2 * N_LAYERS
     old_cnt = tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
     if old_cnt >= TOTAL_BLOCKS - 1:
         _ = tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu')
@@ -335,11 +393,18 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
     total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head
     total_blocks = n_heads * kv_splits
     ff_per_block = d_ff // total_blocks
+    parallel_residual = config.get("parallel_residual", False)
 
-    # Workspace layout: partials | attn_ml | barriers | done_flags | argmax
-    # Barriers and done flags on separate cache lines (32 entries apart = 128 bytes)
-    n_barriers = 2 * n_layers + 1
-    attn_ml_off = total_blocks * d_model
+    # Workspace layout: attn_partials | [ffn_partials] | attn_ml | barriers | done | argmax
+    ffn_partial_off = total_blocks * d_model  # FFN partials start after attn partials
+    if parallel_residual:
+        # Need separate FFN partial buffer (attn + FFN written before single barrier)
+        attn_ml_off = ffn_partial_off + total_blocks * d_model
+        n_barriers = n_layers + 1  # 1 per layer + 1 output
+    else:
+        # Reuse partial buffer (attn and FFN use it sequentially)
+        attn_ml_off = ffn_partial_off  # FFN partials overlap attn partials
+        n_barriers = 2 * n_layers + 1  # 2 per layer + 1 output
     barrier_off = attn_ml_off + total_blocks * 2
     done_off = barrier_off + 32  # pad to 128 bytes (separate cache line)
     argmax_off = done_off + 32   # pad done flags too
@@ -369,7 +434,9 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
         KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         FF_PER_BLOCK=ff_per_block,
+        PARALLEL_RESIDUAL=parallel_residual,
         ATTN_ML_OFF=attn_ml_off,
+        FFN_PARTIAL_OFF=ffn_partial_off,
         BARRIER_OFF=barrier_off,
         DONE_OFF=done_off,
         ARGMAX_OFF=argmax_off,
