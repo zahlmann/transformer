@@ -33,6 +33,7 @@ from kernels.fused_decode_nlayer import (
     fused_decode_nlayer, prepare_decode_weights_nlayer, pack_kv_caches)
 from kernels.multi_sm_decode import multi_sm_decode_nlayer
 from kernels.batched_decode import batched_decode_nlayer
+from kernels.persistent_decode import persistent_decode_nlayer
 
 
 def load_params():
@@ -315,6 +316,79 @@ def main():
         except Exception as e:
             print(f"ERROR: {e}")
         print()
+
+    # Pipelined decode (no per-token int() sync — tokens stay on GPU)
+    print(f"--- Decode: Pipelined ({GEN_LEN} tokens, grid={total_blocks}, no per-token sync) ---")
+    try:
+        # Warmup
+        kv_tmp = kv_packed
+        t = tok
+        for i in range(5):
+            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
+        _ = int(t)  # single sync
+
+        pipe_times = []
+        pipe_tokens_list = []
+        for _ in range(args.n_runs):
+            kv_tmp = kv_packed
+            t = tok
+            tok_devs = []
+            t0 = time.perf_counter()
+            for i in range(GEN_LEN):
+                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
+                tok_devs.append(t)
+            pipe_toks = [int(td) for td in tok_devs]  # batch sync at end
+            pipe_times.append(time.perf_counter() - t0)
+            pipe_tokens_list = pipe_toks
+        pipe_ms = np.median(pipe_times) * 1000
+        pipe_tok_s = GEN_LEN / pipe_ms * 1000
+        pipe_ms_tok = pipe_ms / GEN_LEN
+        print(f"Total:            {pipe_ms:.1f} ms")
+        print(f"Per token:        {pipe_ms_tok:.3f} ms/tok")
+        print(f"Throughput:       {pipe_tok_s:.0f} tok/s")
+        print(f"Speedup vs sync:  {pipe_tok_s / tok_per_s:.2f}x")
+        print(f"Text:             {decode_fn(pipe_tokens_list)[:100]}...")
+        match_pipe = pipe_tokens_list == tokens
+        print(f"Matches sync:     {'YES' if match_pipe else 'NO'}")
+    except Exception as e:
+        import traceback
+        print(f"ERROR: {e}")
+        traceback.print_exc()
+        pipe_tok_s = 0
+    print()
+
+    # Persistent decode (single kernel launch for all steps)
+    print(f"--- Decode: Persistent ({GEN_LEN} tokens, grid={total_blocks}, single launch) ---")
+    try:
+        _tok_out, _, _ = persistent_decode_nlayer(
+            w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=5)
+        _ = _tok_out.block_until_ready()
+
+        persist_times = []
+        persist_tokens = []
+        for _ in range(args.n_runs):
+            t0 = time.perf_counter()
+            tok_out, _, _ = persistent_decode_nlayer(
+                w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=GEN_LEN)
+            tok_list = tok_out.tolist()
+            persist_times.append(time.perf_counter() - t0)
+            persist_tokens = tok_list
+        persist_ms = np.median(persist_times) * 1000
+        persist_tok_s = GEN_LEN / persist_ms * 1000
+        persist_ms_tok = persist_ms / GEN_LEN
+        print(f"Total:            {persist_ms:.1f} ms")
+        print(f"Per token:        {persist_ms_tok:.3f} ms/tok")
+        print(f"Throughput:       {persist_tok_s:.0f} tok/s")
+        print(f"Speedup vs sync:  {persist_tok_s / tok_per_s:.2f}x")
+        print(f"Text:             {decode_fn(persist_tokens)[:100]}...")
+        match_persist = persist_tokens == tokens
+        print(f"Matches sync:     {'YES' if match_persist else 'NO'}")
+    except Exception as e:
+        import traceback
+        print(f"ERROR: {e}")
+        traceback.print_exc()
+        persist_tok_s = 0
+    print()
 
     # End-to-end
     total_ms = prefill_ms + decode_ms
