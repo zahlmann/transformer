@@ -1,9 +1,12 @@
 .venv/
 __pycache__/
 data/
-results.tsv
 *.pyc
 *.log
+*.pkl
 .python-version
 kernels/cuda/*.so
-*.pkl
+
+# intermediate results and experiment outputs
+results.tsv
+*_results.txt

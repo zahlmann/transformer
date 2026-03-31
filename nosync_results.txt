@@ -1,4 +1,0 @@
-with_sync_tok_s: 1945
-no_sync_tok_s: 3108
-block_tok_s: 3108
-sync_overhead_us: 192

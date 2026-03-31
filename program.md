@@ -624,7 +624,7 @@ uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
 
 ```
 program.md                          — this file (read first)
-repo_explained_from_zero.md                  — ground-up explanation of GPU kernels + this project
+repo_explained_from_zero.md         — ground-up explanation of GPU kernels + this project
 README.md                           — project overview
 model.py                            — JAX transformer model (inference baseline)
 train_backprop.py                   — AdamW training with LR schedule
@@ -633,12 +633,11 @@ kernels/fused_prefill.py            — fused Triton prefill kernel (d_model≤6
 kernels/fused_decode.py             — fused Triton decode kernel (d_model≤64)
 kernels/block_prefill.py            — multi-block prefill + FlashAttention (d_model≥128)
 kernels/block_decode.py             — per-layer decode + orchestrator (d_model≥128)
-kernels/fused_decode_2layer.py      — fully fused 2-layer decode
 kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weights/caches)
-kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS,) with atomic barriers
+kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS×KV_SPLITS,) with atomic barriers
 kernels/batched_decode.py           — batched multi-SM decode: B sequences per launch
+kernels/persistent_decode.py        — persistent decode: single launch for all steps
 profile_kernels.py                  — primary profiling tool (run after every change)
-profile_host_overhead.py            — detailed host vs GPU timing breakdown
 inference_benchmark.py              — quick throughput benchmark
 baseline_metrics.txt                — current numbers to beat
 ```

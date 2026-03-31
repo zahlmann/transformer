@@ -1,7 +1,0 @@
-# Host overhead profiling — 2026-03-30 23:53
-total_per_step_ms: 3.598
-gpu_kernel_ms: 3.351
-argmax_sync_ms: 0.134
-host_overhead_ms: 0.113
-no_sync_per_step_ms: 3.031
-with_sync_per_step_ms: 3.469

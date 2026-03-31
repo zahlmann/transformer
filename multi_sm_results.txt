@@ -1,6 +1,0 @@
-# Multi-SM decode test — 2026-03-31 01:04
-single_sm_ms: 232.0
-multi_sm_sync_ms: 37.5
-multi_sm_no_sync_ms: 23.3
-speedup_sync: 6.19
-speedup_no_sync: 9.95

@@ -1,11 +1,14 @@
-# From Python to GPU Registers: Building a 4x Faster Transformer
+# Custom GPU Kernels for Transformer Inference
 
-A step-by-step guide to writing custom GPU kernels for transformer inference.
+How to write Triton kernels that fuse an entire transformer decode step into a single
+GPU launch — from register-level data flow to multi-SM parallelism with atomic barriers.
 No GPU experience required — just Python and a rough idea of what neural nets do.
 
 ---
 
 ## Table of Contents
+
+**Part I: The Fundamentals (d=64, 1 layer, 66K params)**
 
 1. [The Problem](#1-the-problem)
 2. [How GPUs Actually Work](#2-how-gpus-actually-work)
@@ -19,7 +22,15 @@ No GPU experience required — just Python and a rough idea of what neural nets 
 10. [The Decode Kernel, Line by Line](#10-the-decode-kernel-line-by-line)
 11. [The Generation Loop](#11-the-generation-loop)
 12. [Results and Why It's Faster](#12-results-and-why-its-faster)
-13. [Key Lessons](#13-key-lessons)
+
+**Part II: Scaling Up (d=512, 8 layers, 30M params)**
+
+13. [Scaling the Model](#13-scaling-the-model)
+14. [Multi-SM Decode: Using the Whole GPU](#14-multi-sm-decode-using-the-whole-gpu)
+15. [Batched Decode: Multiple Sequences at Once](#15-batched-decode-multiple-sequences-at-once)
+16. [Persistent Decode: Eliminating Host Sync](#16-persistent-decode-eliminating-host-sync)
+17. [What Didn't Work](#17-what-didnt-work)
+18. [Key Lessons](#18-key-lessons)
 
 ---
 
@@ -764,7 +775,7 @@ and picks the next token. The KV cache grows by one entry per step.
 
 ## 12. Results and Why It's Faster
 
-### The numbers
+### The numbers (d=64, 1 layer)
 
 ```
 Prompt: 64 tokens, Generate: 64 tokens
@@ -802,59 +813,383 @@ baseline, so it processes the full growing sequence each time.)
 
 The speedup is purely from keeping data close to the compute units.
 
+This was the starting point. Everything that follows is about scaling this approach to a
+real model and dealing with the problems that emerge at larger scale.
+
 ---
 
-## 13. Key Lessons
+## 13. Scaling the Model
 
-**1. Memory bandwidth is the bottleneck, not compute.**
-Modern GPUs can do trillions of operations per second but can only read ~2 TB/s from HBM.
-For a tiny model like ours, the math finishes instantly — the GPU spends most of its time
-waiting for data.
+The fused-kernel approach works brilliantly at d=64 because the entire model fits in
+registers. But what happens when we scale up?
 
-**2. Kernel fusion is the highest-leverage optimization.**
-Eliminating HBM round-trips between operations gives you the biggest speedup. Everything
-else (quantization, better attention algorithms) is secondary for small models.
+### The scaling journey
 
-**3. bf16 + f32 accumulation is the sweet spot.**
-Cast inputs to bf16 for tensor cores, accumulate in f32 for precision. FP8 was tried and
-was slower (register pressure from casts outweighed any gains).
+```
+d=64,  1L,   66K params:    740 tok/s  (4.0x vs JAX)
+d=128, 2L,  674K params:   2504 tok/s  (14.0x — in-kernel KV cache updates)
+d=256, 4L, 5.3M params:   1396 tok/s  (15.1x — fused N-layer decode)
+d=512, 8L,  30M params:    287 tok/s  (single SM, 2% bandwidth utilization)
+                          4777 tok/s  (persistent kernel, final)
+```
 
-**4. Dynamic loops prevent register spilling.**
-`tl.range(0, 256, 32)` tells Triton to emit a real loop. `tl.static_range` would unroll
-all 8 iterations, requiring registers for all tiles simultaneously, causing 340 bytes of
-spill to slow local memory.
+Each scale-up introduced new problems. Here's what happened and how we solved them.
 
-**5. num_warps=4 is optimal for this model.**
-4 warps = 128 threads = 255 registers per thread = enough for the (128, 128) attention
-matrix (the largest tensor). More warps would mean fewer registers per thread and spilling.
+### d=128: The model no longer fits in one block
 
-**6. Decode can't use tensor cores.**
-With only 1 token, the M dimension is 1. Tensor cores need at least 16×16 tiles. So the
-decode kernel uses element-wise operations, which are faster for M=1.
+At d=128, the hidden state `h` is (128, 128) = 64 KB — it can't coexist with the attention
+scores matrix (also 128 × 128 = 64 KB) in the 130 KB register file. Solution: **multi-block
+prefill**. Tile the sequence dimension into BLOCK_SEQ=32 row blocks. Each of 4 thread blocks
+handles 32 positions. h_block is (32, 128) = 16 KB. Scores are (32, 128) = 16 KB. Fits.
 
-**7. The model must fit in registers for this approach.**
-Our model is 132 KB in bf16. The register file is 130 KB. For larger models, you'd need
-to tile across multiple thread blocks and use shared memory or HBM for intermediate
-results between tiles — which is what FlashAttention and similar algorithms do.
+The cost is that blocks can't communicate within a single kernel. So projections (which write
+K/V to HBM) must be a separate kernel launch from attention (which reads K/V from HBM).
+Three kernels per layer instead of one.
+
+The decode kernel stays fused — with M=1, all tensors are 1D and tiny.
+
+The three biggest optimizations at this scale:
+
+1. **In-kernel KV cache updates (3.6x win).** Instead of outputting K_new/V_new and having
+   JAX do `.at[pos].set()` (which copies the entire cache per step), the kernel writes the
+   updated cache directly to an output buffer. This eliminated the biggest bottleneck.
+
+2. **Precomputed bf16 weights (57% win).** `.astype(bf16)` inside the decode loop created
+   a new JAX array per call — 28 weights × 63 steps = 1764 allocations. Converting once
+   before the loop: free.
+
+3. **Fused multi-layer decode (35% win).** Instead of one kernel call per layer, a single
+   kernel processes all layers with h staying in registers between them.
+
+### d=256: Fused N-layer decode with packed buffers
+
+At 4 layers, passing individual weight pointers becomes unwieldy (50+ arguments). Solution:
+**packed weight buffer** — concatenate all per-layer weights into one bf16 buffer. The kernel
+computes offsets from the layer index. Same for KV caches: all layers packed into one flat
+buffer.
+
+FlashAttention becomes necessary at context > 256. The full scores matrix would be (16, 512)
+= 32 KB per head, too large alongside K and V. Tiled KV with online softmax (KV_TILE=64)
+keeps peak memory at ~20 KB per tile regardless of context length.
+
+### d=512: Register pressure and the single-SM bottleneck
+
+At d=512, two critical problems emerge:
+
+**Register overflow.** Element-wise projections `tl.sum(h[:, None] * W, axis=0)` create a
+(512, 32) intermediate = 128 registers per thread. The product with h needs another 128.
+Total: 260 > 255 limit. Fix: `tl.dot` tiles the reduction internally, never materializing
+the full intermediate.
+
+**Single-SM bottleneck.** The fused kernel runs on grid=(1,) — one thread block on one SM.
+The RTX 4080 Super has 80 SMs. At d=512 with 8 layers, the kernel takes 3.48 ms per token.
+Profiling showed: kernel=93% of time, host=3%. The GPU is 98% idle — not because it's
+waiting for data, but because 79 of 80 SMs have no work.
+
+This is the fundamental challenge that the next three sections address.
+
+---
+
+## 14. Multi-SM Decode: Using the Whole GPU
+
+### The problem
+
+At d=512, a single thread block runs the entire decode step. It processes 16 attention heads
+sequentially, then the full FFN, then layer norm, for each of 8 layers. 79 out of 80 SMs
+sit idle. Bandwidth utilization: 2%.
+
+### The solution: one block per attention head
+
+Launch grid=(N_HEADS,) = grid=(16,). Each of the 16 blocks handles one attention head's
+Q/K/V projections, attention, and O-projection. Then all 16 blocks split the FFN work
+(each handles D_FF/16 = 128 columns of the up-projection).
+
+```
+Block 0:  head 0 attention + FFN columns 0-127
+Block 1:  head 1 attention + FFN columns 128-255
+...
+Block 15: head 15 attention + FFN columns 1920-2047
+```
+
+### Cross-block synchronization with atomic barriers
+
+The problem: blocks can't communicate within a kernel. After attention, all blocks must
+wait for all partial results before anyone can compute the next layer's input.
+
+Solution: **atomic barriers** using GPU-scope atomics in L2 cache.
+
+```python
+# Barrier implementation (simplified):
+# Each block arrives by atomically incrementing a counter
+old = tl.atomic_add(barrier_ptr, 1, sem='release', scope='gpu')
+if old == N_BLOCKS - 1:
+    # Last block to arrive: set done flag
+    tl.atomic_xchg(done_ptr, 1, sem='release', scope='gpu')
+# All blocks wait for done flag
+while tl.atomic_add(done_ptr, 0, sem='acquire', scope='gpu') == 0:
+    pass  # spin-wait
+```
+
+Two barriers per layer: one after attention (before FFN), one after FFN (before next layer).
+With 8 layers + 1 final: 17 barriers total.
+
+**Key insight: redundant computation is cheaper than synchronization.** All 16 blocks
+independently compute LayerNorm and reduce the 16 partial FFN results. This is redundant
+(each block reads 32 KB from L2) but costs only ~1 µs. The alternative — one block computes
+and broadcasts — would need an additional barrier (~5 µs) plus a serial bottleneck.
+
+### KV-split parallelism (FlashDecoding)
+
+With 16 blocks on 80 SMs, utilization is only 20%. **KV-split parallelism** doubles the
+grid to 32 by having 2 blocks per attention head, each handling half the KV cache tiles.
+
+Each block computes a partial online softmax (partial O-projection + running max + running
+sum). After the barrier, all blocks merge the partials using the log-sum-exp trick:
+
+$$h_{head} = \frac{\sum_s o_s \cdot l_s \cdot e^{m_s - m_{max}}}{\sum_s l_s \cdot e^{m_s - m_{max}}}$$
+
+where $o_s$ is the normalized partial output, $l_s$ is the partial sum of exponentials, and
+$m_s$ is the partial maximum. This is mathematically exact — no approximation.
+
+### Split barrier optimization
+
+The standard barrier has all blocks polling the same counter address while others are still
+arriving. This causes **L2 cache line thrashing** — arrivals invalidate the line that pollers
+are reading.
+
+Fix: separate the arrival counter and done-flag on different cache lines. Arrivals write to
+`counter[]`, the last-arriving block sets `done[]`, all blocks poll `done[]`. Result: +5%
+kernel speedup.
+
+### Results
+
+```
+Single-SM (grid=1):        287 tok/s  (3.48 ms/tok, 2% BW utilization)
+Multi-SM (grid=16):       1734 tok/s  (0.58 ms/tok, 14% BW, 6.0x)
++ KV splits (grid=32):   1851 tok/s  (0.54 ms/tok, 15% BW, +7%)
++ Split barrier:          1937 tok/s  (0.52 ms/tok, 16% BW, +5%)
+Without GPU→CPU sync:     3108 tok/s  (0.32 ms/tok — pure GPU speed)
+```
+
+The 6.0x speedup from multi-SM is the single largest improvement at d=512.
+GPU→CPU sync (`int()` per token) costs 34% of total time — addressed in section 16.
+
+---
+
+## 15. Batched Decode: Multiple Sequences at Once
+
+### The idea
+
+In production, you're often generating for multiple users simultaneously. Instead of
+running B separate decode calls, run one kernel that processes B sequences in parallel.
+Weight loads are shared across the batch — loaded once, used B times.
+
+### Implementation
+
+Same grid as single-sequence, but each block processes B sequences. The kernel loads each
+weight tile once, then loops over B sequences applying it. KV caches are independent per
+sequence.
+
+### Race conditions (the hard part)
+
+Two critical race conditions emerged:
+
+**1. h_buf read-write race.** All blocks read h, compute `h_new = h + residual`, and write
+back. A fast block can overwrite h before a slow block reads the original, causing
+`h + 2 × residual` instead of `h + residual`. Fix: **double-buffered h_buf** — even layers
+read buf_a/write buf_b, odd layers read buf_b/write buf_a.
+
+**2. Partial buffer merge/FFN race.** After the phase 1 barrier, all blocks read attention
+o_proj from the partial buffer while also writing FFN results to the same buffer. A fast
+block can overwrite o_proj before a slow block reads it. Fix: **separate ffn_buf** for FFN
+accumulation.
+
+### Weight-amortized FFN
+
+The initial batched kernel loaded FFN weights B times per tile (once per batch element in
+a fused merge+LN+FFN loop). De-fusing into separate passes — merge+LN for all B first,
+then FFN with outer k-loop / inner b-loop — loads weights once per tile regardless of B.
+
+Result: B=4 +14%, B=8 +22%, B=16 +19%.
+
+### Results
+
+```
+Single-sequence:        1935 tok/s
+Batched B=4 (sync):     4205 tok/s  (2.17x)
+Batched B=4 (pipe):     6691 tok/s  (3.46x)
+Batched B=8 (pipe):     7339 tok/s  (3.79x)
+Batched B=16 (sync):    6064 tok/s  (3.13x)
+```
+
+Why not 4x at B=4? Per-sequence compute (attention over 512 KV positions) adds ~0.17 ms
+per additional sequence regardless of weight sharing. The theoretical 4x assumed weights
+dominated kernel time, but attention is a significant fixed cost per sequence.
+
+---
+
+## 16. Persistent Decode: Eliminating Host Sync
+
+### The GPU→CPU sync bottleneck
+
+After multi-SM optimization, the kernel itself runs in 0.32 ms per token. But `int(next_token)`
+forces a GPU→CPU transfer each step, adding 0.15-0.20 ms. **Sync accounts for 30-60% of
+wall time.**
+
+### Persistent kernel: one launch for all tokens
+
+Instead of one kernel call per token, launch a single kernel that runs all N decode steps
+internally. Block 0 computes argmax in-kernel and writes the next token to a workspace buffer.
+A step-sync barrier ensures all blocks see it before the next step's embedding lookup.
+
+```
+Normal decode (N kernel launches):
+  Host: launch → sync → read token → launch → sync → read token → ...
+
+Persistent decode (1 kernel launch):
+  Host: launch ──────────────────────────────────→ read all N tokens
+  GPU:  [step 0 → step 1 → step 2 → ... → step N]
+         └── all tokens stay on GPU, no host sync ──┘
+```
+
+Fresh barrier slots per step (`step * BARRIERS_PER_STEP + barrier_idx`) avoid reusing
+counters. The initial KV copy (input → output buffer) is done cooperatively by all blocks
+before the step loop, protected by a barrier.
+
+### Pipelined batched decode
+
+For batched inference, a lighter-weight alternative: tokens stay on GPU as JAX arrays, and
+JAX overlaps dispatch of the next step with execution of the current one. Not as fast as
+a true persistent kernel, but much simpler.
+
+### Results
+
+```
+Single-seq sync'd:      1869 tok/s  (0.535 ms/tok)
+Single-seq pipelined:   2624 tok/s  (0.381 ms/tok)
+Persistent kernel:      4777 tok/s  (0.209 ms/tok)  ← 2.56x vs sync'd
+Batched B=4 sync'd:     4205 tok/s
+Batched B=4 pipelined:  6691 tok/s                   ← 1.59x vs sync'd
+```
+
+---
+
+## 17. What Didn't Work
+
+Not everything we tried improved performance. Documenting failures is as important as
+documenting successes — they reveal what the actual bottlenecks are.
+
+**GQA (Grouped Query Attention).** 4 KV heads instead of 16 Q heads. KV cache shrinks from
+8.4 MB to 2.1 MB per sequence. But decode speed was unchanged — the kernel is
+barrier-limited, not memory-limited. The data already fits in L2 at high bandwidth. GQA
+helps batched inference (where KV cache scales with batch size) but not single-sequence.
+
+**Parallel residual (attn || FFN).** Compute attention and FFN in parallel, reducing
+barriers from 17 to 9. Result: +1.3% speedup. Why? Barrier cost is dominated by straggler
+*variance* (proportional to total work per step), not fixed overhead. Halving barriers
+saves ~8 µs of fixed overhead, but the ~80 µs of straggler time stays constant.
+
+**num_warps sweep.** 2, 4, 8 warps all within 5%. The kernel is not warp-limited.
+
+**Speculative decoding.** With fused kernels, both draft (~2500 tok/s) and target (~1400
+tok/s) are fast. The speed ratio is only ~2x, not the ~10x needed. Acceptance rate was
+36-51% with a 1-layer draft — you need 80%+ to break even at this ratio.
+
+---
+
+## 18. Key Lessons
+
+### Fundamentals
+
+**1. Memory bandwidth is the bottleneck, not compute.** Modern GPUs do trillions of ops/s
+but read ~2 TB/s from HBM. For small models, math finishes instantly — the GPU waits for data.
+
+**2. Kernel fusion is the highest-leverage optimization.** Eliminating HBM round-trips
+gives the biggest speedup. In-kernel KV cache updates alone gave 3.6x.
+
+**3. bf16 + f32 accumulation is the sweet spot.** Cast to bf16 for tensor cores, accumulate
+in f32. FP8 was slower (register pressure from casts outweighed gains).
+
+**4. Dynamic loops prevent register spilling.** `tl.range` emits a real loop; `tl.static_range`
+unrolls, requiring registers for all tiles simultaneously.
+
+### Scaling
+
+**5. BLOCK_SEQ scales inversely with d_model.** Register file is fixed. d=128: BLOCK_SEQ=32.
+d=256: BLOCK_SEQ=16. d=512: BLOCK_SEQ=8. The h_block stays at ~16 KB.
+
+**6. Use tl.dot for projections at d >= 512.** Element-wise `h[:, None] * W` materializes the
+full (d, d_head) intermediate. tl.dot tiles internally, avoiding register overflow.
+
+**7. The bottleneck shifts with model size.** At d=64, host dispatch dominates (Python overhead).
+At d=512, the GPU kernel dominates (93% of step time). Optimizations that help at one scale
+may be irrelevant at another. Always profile first.
+
+### Multi-SM and parallelism
+
+**8. Multi-SM with atomic barriers unlocks the full GPU.** Going from grid=(1,) to grid=(32,)
+gave 6.8x speedup at d=512. The technique: one block per attention head, all blocks split
+the FFN, atomic barriers for cross-block sync.
+
+**9. Redundant computation beats synchronization.** All blocks independently compute LayerNorm
+(~1 µs from L2) rather than one block computing and broadcasting (needs a ~5 µs barrier).
+
+**10. GPU→CPU sync is the #1 bottleneck at 30M params.** `int()` per token costs 30-60% of
+wall time. Persistent kernels and pipelining eliminate this entirely.
+
+### Batched inference
+
+**11. Weight amortization requires careful loop structure.** Outer k-loop / inner b-loop loads
+weights once per tile. The naive fused approach loads them B times.
+
+**12. Shared buffers need double-buffering or phase separation.** Any buffer that is both read
+and written by all blocks within a barrier-delimited phase needs either double-buffering or a
+separate buffer for the write phase.
+
+### What doesn't help
+
+**13. Reducing barrier count gives minimal speedup.** Straggler variance (proportional to total
+work) dominates fixed barrier overhead. Halving barriers from 17 to 9 gave only 1.3%.
+
+**14. GQA doesn't help when barrier-limited.** If data already fits in L2, reducing it further
+doesn't matter. GQA helps when KV cache is the memory bottleneck (batched, long-context).
 
 ---
 
 ## Running It Yourself
 
 ```bash
-# Train the model (saves weights.pkl)
-uv run train_backprop.py
+# train the model (d=512, 8 layers, ~4 hours on TinyStories)
+uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
+  --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 
-# Run the benchmark
+# profile kernels (primary benchmark)
+uv run profile_kernels.py
+
+# quick inference demo
 uv run inference_benchmark.py
 ```
 
 ### File overview
 
 ```
-model.py                         — transformer in pure JAX (the baseline)
-train_backprop.py                — trains the model, saves weights
-kernels/fused_prefill.py         — prefill kernel (full sequence, one kernel call)
-kernels/fused_decode.py          — decode kernel (one token, one kernel call)
-inference_benchmark.py           — benchmarks Triton vs JAX and generates text
+Core:
+  model.py                        — JAX transformer model
+  data.py                         — Shakespeare + TinyStories + BPE tokenizer
+  train_backprop.py               — AdamW training with LR schedule
+
+Kernels:
+  kernels/fused_prefill.py        — fused prefill (d_model <= 64, one kernel call)
+  kernels/fused_decode.py         — fused decode (d_model <= 64, one kernel call)
+  kernels/block_prefill.py        — multi-block prefill + FlashAttention (d_model >= 128)
+  kernels/block_decode.py         — per-layer decode orchestrator (d_model >= 128)
+  kernels/fused_decode_nlayer.py  — fused N-layer decode (packed weights/caches)
+  kernels/multi_sm_decode.py      — multi-SM decode with atomic barriers + KV-split
+  kernels/batched_decode.py       — batched multi-SM decode (B sequences)
+  kernels/persistent_decode.py    — persistent decode (single launch, all steps)
+
+Benchmarking:
+  profile_kernels.py              — primary profiling tool
+  inference_benchmark.py          — quick throughput + text generation demo
+  baseline_metrics.txt            — current performance numbers
 ```
