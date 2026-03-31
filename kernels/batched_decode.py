@@ -266,7 +266,7 @@ def _batched_decode(
             tl.store(partial_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, o_proj)
 
         # ── Split barrier (counter + done flag on separate cache lines) ──
-        b0 = layer * 3
+        b0 = layer * 2
         old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
         if old_cnt >= TOTAL_BLOCKS - 1:
             _ = tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu')
@@ -275,11 +275,11 @@ def _batched_decode(
             pass
 
         # ══════════════════════════════════════════════════
-        # PHASE 2: Merge attention + LN2 + FFN (fused per batch element)
+        # PHASE 2a: Merge attention + LN2 for all B → store h_norm to buffer
         # ══════════════════════════════════════════════════
         # h_buf is READ-ONLY here (no write until phase 3).
         # attn_total stored to attn_buf (all blocks write same value — benign race).
-        # h_norm stays in registers (fused LN2+FFN per batch element).
+        # h_norm stored to h_norm_buf for FFN weight amortization.
 
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
         ln_b = tl.load(packed_w_ptr + ln2_b_off + d).to(tl.float32)
@@ -309,28 +309,41 @@ def _batched_decode(
             # Store attn_total for phase 3 (all blocks write same value)
             tl.store(attn_buf_ptr + b * D_MODEL + d, attn_total)
 
-            # LN2 on (h + attn_total) — h_norm stays in registers
+            # LN2 on (h + attn_total) → store h_norm for weight-amortized FFN
             h_attn = h + attn_total
             mean = tl.sum(h_attn) / D_MODEL
             hc = h_attn - mean
             h_norm = ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b
-            h_norm_2d = h_norm[None, :].to(tl.bfloat16)
+            tl.store(h_norm_ptr + b * D_MODEL + d, h_norm)
 
-            # FFN — h_norm_2d in registers, weights reloaded per batch element
-            ffn_partial = tl.zeros((D_MODEL,), dtype=tl.float32)
-            for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
-                kk = ff_start + k + tl.arange(0, BLOCK_K)
-                up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+        # ══════════════════════════════════════════════════
+        # PHASE 2b: FFN with weight amortization — outer k-loop, inner b-loop
+        # ══════════════════════════════════════════════════
+        # Load FFN weights once per k-tile, apply to all B sequences.
+        # Saves (B-1) * weight_size L2 traffic per tile.
+
+        for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
+            kk = ff_start + k + tl.arange(0, BLOCK_K)
+            up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
+            up_bias = tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
+            down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
+
+            for b in tl.range(0, BATCH_SIZE):
+                h_norm = tl.load(h_norm_ptr + b * D_MODEL + d)
+                h_norm_2d = h_norm[None, :].to(tl.bfloat16)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-                up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
+                up += up_bias
                 act = up * tl.sigmoid(1.702 * up)
-                down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
-                ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
+                partial = tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
-            tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, ffn_partial)
+                if k == 0:
+                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, partial)
+                else:
+                    existing = tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d)
+                    tl.store(ffn_buf_ptr + (b * TOTAL_BLOCKS + pid) * D_MODEL + d, existing + partial)
 
         # ── Barrier ──
-        b1 = layer * 3 + 1
+        b1 = layer * 2 + 1
         old_cnt = tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
         if old_cnt >= TOTAL_BLOCKS - 1:
             _ = tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu')
@@ -351,15 +364,9 @@ def _batched_decode(
             h = h + attn_total + ffn_total + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
             tl.store(h_buf_ptr + h_out_off + b * D_MODEL + d, h)
 
-        # Barrier after phase 3: ensures all blocks finish writing h_buf
-        # before any block reads h_buf in the next layer's phase 1.
-        b2 = layer * 3 + 2
-        old_cnt = tl.atomic_add(barrier_ptr + b2, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + b2, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + b2, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + b2, 0.0, sem='acquire', scope='gpu') < 1.0:
-            pass
+        # No barrier needed after phase 3: all blocks write identical h values
+        # (redundant reduce), so each block can safely read its own writes in the
+        # next layer's phase 1 without waiting for other blocks.
 
     # ══════════════════════════════════════════════════
     # OUTPUT: Final LN + tiled output projection + argmax
@@ -396,7 +403,7 @@ def _batched_decode(
         tl.store(argmax_ptr + (b * TOTAL_BLOCKS + pid) * 2 + 1, best_idx)
 
     # ── Final barrier ──
-    N_BARRIERS: tl.constexpr = 3 * N_LAYERS
+    N_BARRIERS: tl.constexpr = 2 * N_LAYERS
     old_cnt = tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
     if old_cnt >= TOTAL_BLOCKS - 1:
         _ = tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu')
