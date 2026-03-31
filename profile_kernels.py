@@ -34,6 +34,7 @@ from kernels.fused_decode_nlayer import (
 from kernels.multi_sm_decode import multi_sm_decode_nlayer
 from kernels.batched_decode import batched_decode_nlayer
 from kernels.persistent_decode import persistent_decode_nlayer
+from kernels.persistent_batched_decode import persistent_batched_decode_nlayer
 
 
 def load_params():
@@ -362,6 +363,35 @@ def main():
             print(f"Throughput:       {pipe_batch_tok_s:.0f} tok/s total ({pipe_batch_tok_s/B:.0f} per seq)")
         except Exception as e:
             print(f"ERROR: {e}")
+        print()
+
+    # Persistent batched decode (single kernel launch for all steps × B sequences)
+    for B in [4, 8]:
+        print(f"--- Persistent Batched B={B} ({GEN_LEN} tokens/seq, single launch) ---")
+        try:
+            first_tokens = jnp.full((B,), tok, dtype=jnp.int32)
+            kv_batch_persist = jnp.tile(kv_packed, B)
+            # Warmup
+            _tout, _, _ = persistent_batched_decode_nlayer(
+                w, config, first_tokens, PROMPT_LEN, kv_batch_persist, vocab_size, B, n_steps=5)
+            _ = _tout.block_until_ready()
+
+            persist_batch_times = []
+            for _ in range(args.n_runs):
+                t0 = time.perf_counter()
+                tout, _, _ = persistent_batched_decode_nlayer(
+                    w, config, first_tokens, PROMPT_LEN, kv_batch_persist, vocab_size, B, n_steps=GEN_LEN)
+                _ = tout.tolist()
+                persist_batch_times.append(time.perf_counter() - t0)
+            pb_ms = np.median(persist_batch_times) * 1000
+            pb_tok_s = B * GEN_LEN / pb_ms * 1000
+            print(f"Total:            {pb_ms:.1f} ms ({GEN_LEN} steps)")
+            print(f"Per step:         {pb_ms/GEN_LEN:.3f} ms")
+            print(f"Throughput:       {pb_tok_s:.0f} tok/s total ({pb_tok_s/B:.0f} per seq)")
+        except Exception as e:
+            import traceback
+            print(f"ERROR: {e}")
+            traceback.print_exc()
         print()
 
     # Pipelined decode (no per-token int() sync — tokens stay on GPU)
