@@ -273,9 +273,15 @@ def unpack_kv_caches(packed, n_layers, n_heads, max_seq, d_head):
     return k_caches, v_caches
 
 
-def prepare_decode_weights_nlayer(params, config, vocab_size):
+def prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=2):
     """Precompute packed weights, bf16 embeddings, padded output proj."""
-    vocab_pad = ((vocab_size + 127) // 128) * 128
+    # vocab_pad must be divisible by OUTPUT_VTILE * TOTAL_BLOCKS for tiled output projection.
+    # TOTAL_BLOCKS = n_heads * kv_splits, OUTPUT_VTILE = 32.
+    n_heads = config["n_heads"]
+    output_vtile = 32
+    total_blocks = n_heads * kv_splits
+    align = output_vtile * total_blocks  # e.g., 32*32=1024 for d=512, 32*48=1536 for d=768
+    vocab_pad = ((vocab_size + align - 1) // align) * align
     pad_v = vocab_pad - vocab_size
     return {
         "token_emb": params["token_emb"].astype(jnp.bfloat16),
