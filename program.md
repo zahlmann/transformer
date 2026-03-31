@@ -454,6 +454,35 @@ CURRENT (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
 **Key insight:** GPU→CPU sync (int() per token) was the #1 bottleneck at 30M params,
 costing 30-60% of wall time. Persistent kernel and pipelining eliminate it.
 
+## COMPLETED: Kernel Optimization Round 2 (2026-04-01)
+
+**Optimizations applied:**
+1. Persistent batched kernel: single launch for B sequences × N steps
+2. In-place KV for persistent kernels: pos-only store replaces full tile copy
+
+```
+UPDATED (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
+  Single-seq (sync):       1834 tok/s  (0.545 ms/tok, 12% BW util)
+  Pipelined:               2733 tok/s  (0.366 ms/tok)
+  Persistent kernel:       5129 tok/s  (0.195 ms/tok, single launch) ← +7.1% via in-place KV
+  Batched B=4 (sync):      4110 tok/s  (0.973 ms/step, 2.24x)
+  Batched B=4 (pipe):      6672 tok/s  (0.600 ms/step)
+  Persistent B=4:          7351 tok/s  (0.544 ms/step, NEW)
+  Persistent B=8:          7862 tok/s  (1.018 ms/step, NEW)
+  Batched B=16 (sync):     6013 tok/s  (2.661 ms/step, 3.28x)
+```
+
+**Findings:**
+- Persistent batched gives +10% over pipelined batched by eliminating per-step
+  workspace allocation and JAX dispatch overhead.
+- In-place KV: removing full tile stores saves ~4MB traffic per step. However,
+  Triton compiler reorders the K_new store relative to tile loads when no store
+  dependency exists in the tile loop, causing divergence at step 34. Fix: store
+  only at pos (128 bytes) forces correct compiler ordering. +7.1% for single-seq.
+- Shared memory optimization (A1) was skipped: all hot buffers in decode kernels
+  are already in registers. Cross-block buffers can't use shared memory (SM-local).
+  Only per-block buffers (h_norm, qkv_tmp in batched) were candidates at ~1% of traffic.
+
 ---
 
 ## YOUR NEXT TASK: Kernel Optimization + Model Scaling Validation
@@ -637,6 +666,7 @@ kernels/fused_decode_nlayer.py      — fully fused N-layer decode (packed weigh
 kernels/multi_sm_decode.py          — multi-SM decode: grid=(N_HEADS×KV_SPLITS,) with atomic barriers
 kernels/batched_decode.py           — batched multi-SM decode: B sequences per launch
 kernels/persistent_decode.py        — persistent decode: single launch for all steps
+kernels/persistent_batched_decode.py — persistent batched: single launch for B seq × N steps
 profile_kernels.py                  — primary profiling tool (run after every change)
 inference_benchmark.py              — quick throughput benchmark
 baseline_metrics.txt                — current numbers to beat
@@ -879,3 +909,22 @@ baseline_metrics.txt                — current numbers to beat
     For batched B=4: sync'd 4205 tok/s → pipelined 6691 tok/s (+59%). The lesson:
     benchmark both sync'd and pipelined, and report the number that matches your
     deployment scenario (streaming vs batch generation).
+
+44. **Persistent batched kernel: apply persistent technique to batched inference.**
+    Same design as persistent single-seq but with B sequences: double-buffered h_buf
+    across layers, fresh barrier slots per step, in-kernel argmax per batch element,
+    block 0 writes B next_tokens. Eliminates per-step workspace allocation AND JAX
+    dispatch. Result: B=4 7351 tok/s (+10% vs pipelined 6672), B=8 7862 tok/s (+10%
+    vs pipelined 7351). The gain is smaller than single-seq persistent (2.5x) because
+    the batched kernel is already compute-heavy (B×attention + B×FFN per step), so
+    the per-step host overhead is a smaller fraction of total time.
+
+45. **In-place KV: pos-only store fixes Triton compiler reordering.** Removing tile
+    stores from the persistent kernel saves ~4MB traffic per step (full tile copies
+    were writing back data already in kv_out). But this causes divergence at step 34:
+    without a store in the tile loop, the Triton compiler reorders the K_new store
+    (before the loop) relative to tile loads (inside the loop), reading stale data.
+    The tl.where masks it for the current step, but kv_out never gets K_new for
+    subsequent steps. Fix: store ONLY at pos in the tile loop (`mask=pos_mask`, 128
+    bytes instead of 4MB). This forces the compiler to maintain the dependency chain
+    without significant traffic. +7.1% for single-seq persistent (4797→5129 tok/s).
