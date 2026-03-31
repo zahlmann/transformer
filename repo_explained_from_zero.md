@@ -1160,7 +1160,7 @@ doesn't matter. GQA helps when KV cache is the memory bottleneck (batched, long-
 
 ```bash
 # train the model (d=512, 8 layers, ~4 hours on TinyStories)
-uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
+uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
   --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 
 # profile kernels (primary benchmark)
@@ -1176,7 +1176,7 @@ uv run inference_benchmark.py
 Core:
   model.py                        — JAX transformer model
   data.py                         — Shakespeare + TinyStories + BPE tokenizer
-  train_backprop.py               — AdamW training with LR schedule
+  train.py               — AdamW training with LR schedule
 
 Kernels:
   kernels/fused_prefill.py        — fused prefill (d_model <= 64, one kernel call)

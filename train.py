@@ -1,6 +1,6 @@
 """Backprop+Adam baseline.
 
-Usage: uv run train_backprop.py [--seed SEED] [--lr LR] [--tokenizer char|bpe|trained_bpe]
+Usage: uv run train.py [--seed SEED] [--lr LR] [--tokenizer char|bpe|trained_bpe]
                                 [--bpe-vocab 512] [--dataset shakespeare|tinystories]
                                 [--d-model 256] [--n-heads 8] [--n-layers 4]
                                 [--context-len 256] [--epochs 20] [--batch-size 64]

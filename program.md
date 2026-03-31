@@ -562,7 +562,7 @@ matters more. GQA becomes essential.
 **B3. Train and benchmark at each scale**
 
 For each config:
-1. Train with `uv run train_backprop.py --d-model D --n-heads H --n-layers L --context-len C`
+1. Train with `uv run train.py --d-model D --n-heads H --n-layers L --context-len C`
 2. Run `uv run profile_kernels.py` to get throughput numbers
 3. Compare persistent/pipelined/sync'd throughput
 4. Identify new bottlenecks if optimizations don't transfer
@@ -614,7 +614,7 @@ uv run inference_benchmark.py               # quick throughput check
 /usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
 
 # Training
-uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
+uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
   --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 ```
 
@@ -627,7 +627,7 @@ program.md                          — this file (read first)
 repo_explained_from_zero.md         — ground-up explanation of GPU kernels + this project
 README.md                           — project overview
 model.py                            — JAX transformer model (inference baseline)
-train_backprop.py                   — AdamW training with LR schedule
+train.py                   — AdamW training with LR schedule
 data.py                             — Shakespeare + TinyStories (char, GPT-2 BPE, trained BPE)
 kernels/fused_prefill.py            — fused Triton prefill kernel (d_model≤64)
 kernels/fused_decode.py             — fused Triton decode kernel (d_model≤64)

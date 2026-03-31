@@ -46,7 +46,7 @@ Phase A7: persistent  — single launch, no host sync     4777 tok/s (2.56x vs s
 
 ```bash
 # train the model (d=512, 8L, 29.7M params, ~4 hours)
-uv run train_backprop.py --d-model 512 --n-heads 16 --n-layers 8 \
+uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
   --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
 
 # profile kernels (primary benchmark — run after any kernel change)
@@ -112,7 +112,7 @@ XL:     d=512, h=16, l=8, vocab=4096, 29.7M params  (TinyStories)
 Core:
   model.py                        JAX transformer model
   data.py                         Shakespeare + TinyStories + BPE tokenizer
-  train_backprop.py               AdamW training with LR schedule
+  train.py               AdamW training with LR schedule
 
 Kernels:
   kernels/fused_prefill.py        fused prefill (d_model <= 64)
