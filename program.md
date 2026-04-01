@@ -34,6 +34,10 @@ Build the fastest possible inference for this transformer using custom Triton ke
 18. In-place KV for persistent kernels: pos-only store (+7.1% single-seq)
 19. Scaled to d=768, 12 layers, 24 heads, GQA 6 KV heads (81.1M params, ppl=2.60)
 20. Non-power-of-2 D_MODEL support via D_BLOCK padding with masking
+21. Bandwidth optimization: L2 eviction hints, merged barriers (1448→1472 pipelined)
+22. Streaming text generation API (generate.py, 966 tok/s streaming at d=768)
+23. Variable-length batched inference (serve.py, per-sequence position tracking)
+24. Triton prefill kernel for GQA + D_BLOCK padding (12.9ms vs JAX 30.4ms, 2.4x)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -567,34 +571,29 @@ UPDATED (d=768, 12L, GQA 6 KV heads, 81.1M params):
 
 ---
 
-## YOUR NEXT TASK: Production Hardening
+## COMPLETED: Production Hardening (2026-04-02)
 
-The kernel architecture is mature across 3 model scales. Focus now shifts to making
-the kernels usable for real inference workloads.
+**B1. Streaming text generation** — DONE
+- `generate.py` with `stream_tokens()` generator and `generate_tokens()` batch API
+- CLI: `uv run generate.py --prompt "Once upon a time" --max-tokens 256`
+- Streaming decode: 966 tok/s at d=768 (per-token host sync)
+- Non-streaming (pipelined): ~1472 tok/s (batch sync at end)
+- Warmup step in `_prefill()` triggers JIT compilation before timing
 
-**B1. Streaming text generation**
+**B2. Variable-length batched inference** — DONE
+- `serve.py` with `BatchedServer` class for managing variable-length sequences
+- The batched kernel already supported per-sequence positions via `positions_ptr`
+- API: add_sequence() → generate() → get_tokens(), with per-slot position tracking
+- Sequences can be at different generation stages; unused slots = None
 
-Currently persistent kernels collect all tokens and return them at the end. For
-interactive use, tokens should stream out as they're generated. Best approach:
-- Hybrid: pipelined decode (one kernel per step) with host reading each token
-  as it's produced — this is already how pipelined decode works! Just need a
-  clean Python API that yields tokens as a generator.
-- The persistent kernel is inherently non-streaming (single launch). Keep it
-  for benchmarking but use pipelined for interactive inference.
+**B3. Triton prefill kernel for GQA** — DONE
+- Added N_KV_HEADS, D_KV, GQA_GROUP to all 4 prefill kernels (_proj, _attn, _flash_attn, _ffn)
+- Added D_BLOCK padding (non-power-of-2 D_MODEL support) to all prefill kernels
+- Q projections: N_HEADS, K/V projections: N_KV_HEADS, attention maps Q→KV head via GQA_GROUP
+- d=768 Triton prefill: 12.9ms vs JAX 30.4ms (2.4x speedup)
+- Entire inference pipeline now uses custom Triton kernels (no JAX fallback)
 
-**B2. Variable-length batched inference**
-
-The batched kernel assumes all B sequences are at the same position. Real serving has
-sequences at different lengths. Add per-sequence position tracking and masking in the
-batched/persistent-batched kernels. Each sequence needs its own `pos` value, and the
-attention mask must use per-sequence `pos_b` instead of a shared `pos`.
-
-**B3. Triton prefill kernel for GQA**
-
-The prefill currently uses JAX (not Triton) for GQA models. Extend block_prefill.py to
-support n_kv_heads < n_heads, so the entire inference pipeline uses custom kernels.
-
-### Part C: Frontier Kernel Techniques (after B1-B3)
+## YOUR NEXT TASK: Frontier Kernel Techniques
 
 **C1. Tensor core batched projections (B >= 16)**
 
@@ -984,6 +983,12 @@ baseline_metrics.txt                — current numbers to beat
     Double-buffered: 128KB > 101KB shared memory limit. Warp specialization would need
     CUDA, not Triton. The 1024-wide D_BLOCK (padding for d=768) is the fundamental
     constraint — it makes every 2D tile large.
+
+55. **GQA prefill: separate Q/K/V loops give 2.4x over JAX.** The Triton prefill
+    kernel loops Q projections over N_HEADS (24) and K/V over N_KV_HEADS (6). Each
+    KV head is computed once and shared by 4 Q heads in attention via head//GQA_GROUP.
+    Adding D_BLOCK padding (1024 for d=768) required d_mask on all loads/stores,
+    identical to the decode kernel approach. Prefill 12.9ms vs JAX 30.4ms at d=768.
 
 54. **At d=768, HBM bandwidth is the terminal bottleneck.** 162MB weights don't fit in
     64MB L2, so every decode step re-fetches all weights from HBM. At d=512 (55MB
