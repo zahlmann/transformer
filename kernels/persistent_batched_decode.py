@@ -212,35 +212,38 @@ def _persistent_batched_decode(
                                   0.0)
                 tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
-            # 1b. Q projection
+            # 1b-d. Batched Q/K/V projections — single tl.dot per weight matrix
+            b_range = tl.arange(0, BATCH_SIZE)
+            h_batch = tl.load(h_norm_ptr + b_range[:, None] * D_BLOCK + d[None, :],
+                              mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
+
+            # Q projection
             wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :],
                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            for b in tl.range(0, BATCH_SIZE):
-                h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
-                Q = tl.dot(h_norm[None, :].to(tl.bfloat16), wq).to(tl.float32).sum(axis=0)
-                tl.store(qkv_tmp_ptr + b * D_HEAD + dh, Q)
+            Q_batch = tl.dot(h_batch, wq).to(tl.float32)
+            tl.store(qkv_tmp_ptr + b_range[:, None] * D_HEAD + dh[None, :], Q_batch)
 
-            # 1c. K projection
+            # K projection + store to KV cache
             wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :],
                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+            K_batch = tl.dot(h_batch, wk).to(tl.float32)
+            tl.store(qkv_tmp_ptr + (BATCH_SIZE + b_range[:, None]) * D_HEAD + dh[None, :], K_batch)
             for b in tl.range(0, BATCH_SIZE):
-                h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
-                K_new = tl.dot(h_norm[None, :].to(tl.bfloat16), wk).to(tl.float32).sum(axis=0)
                 kv_b = b * TOTAL_KV_SIZE
+                K_new = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
                 tl.store(kv_out_ptr + kv_b + kc_base + cache_off + pos * D_HEAD + dh,
                          K_new.to(tl.bfloat16))
-                tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, K_new)
 
-            # 1d. V projection
+            # V projection + store to KV cache
             wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :],
                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+            V_batch = tl.dot(h_batch, wv).to(tl.float32)
+            tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b_range[:, None]) * D_HEAD + dh[None, :], V_batch)
             for b in tl.range(0, BATCH_SIZE):
-                h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
-                V_new = tl.dot(h_norm[None, :].to(tl.bfloat16), wv).to(tl.float32).sum(axis=0)
                 kv_b = b * TOTAL_KV_SIZE
+                V_new = tl.load(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh)
                 tl.store(kv_out_ptr + kv_b + vc_base + cache_off + pos * D_HEAD + dh,
                          V_new.to(tl.bfloat16))
-                tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh, V_new)
 
             # 1e. Attention — per-sequence
             for b in tl.range(0, BATCH_SIZE):
