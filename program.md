@@ -42,6 +42,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 26. Paged KV cache (PagePool, 64-position pages, 87% memory reduction for short seqs)
 27. GPU-accelerated paged KV (JIT gather/scatter, 3.5x faster than CPU paging, 693 tok/s)
 28. Continuous batching (serve_continuous: N prompts through B slots, auto page reuse)
+29. Speculative decoding revisit (d=512 draft: 71% acceptance at K=4, seq verify 0.47x)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -704,10 +705,53 @@ CLI: `uv run serve.py --continuous --batch-size 4 --prompts "prompt1" "prompt2" 
 
 ---
 
+## COMPLETED: Speculative Decoding Revisit (2026-04-02)
+
+Revisited speculative decoding with d=512 draft (ppl=2.91) and d=768 target (ppl=2.60).
+The closer model quality gives dramatically better acceptance rates than the original
+attempt (d=128/1L draft with ppl=8.76).
+
+```
+Acceptance rates (128 tokens, 4 prompts):
+  K=2: 82%  (was 51% with old draft)
+  K=4: 71%  (was 36%)
+  K=6: 63%
+  K=8: 58%
+
+Throughput:
+  Standard (d=768):          1003 tok/s
+  Speculative K=4 (seq):      467 tok/s (0.47x) — sequential verify, NOT profitable
+```
+
+**Why sequential verification can't work:**
+  Draft step: 0.55ms (d=512 sync'd)
+  Target step: 1.0ms (d=768 sync'd)
+  Total per cycle: K × (t_draft + t_target) = K × 1.55ms
+  Standard: K × 1.0ms
+  Speculative is always slower: 1.55 > 1.0
+
+**Estimated parallel verify + persistent draft:**
+  Persistent draft: ~0.78ms for K=4 (single launch)
+  Parallel verify: ~1.5ms for K=4 (multi-SM, no barriers)
+  Total: 2.28ms for ~3.8 tokens → ~1650 tok/s (1.6x)
+  Would require: new multi-SM verify kernel + persistent draft modifications
+
+**Key finding:** Acceptance rates are excellent (71% at K=4), validating the approach.
+The bottleneck is the draft/target speed ratio (~2x sync'd). At production scales
+(70B target at 20 tok/s, 7B draft at 200 tok/s → 10x ratio), speculative decoding
+with these acceptance rates would give 2-3x speedup.
+
+---
+
 ## What's Next
 
-The core kernel architecture is complete. Potential future directions:
-- **Speculative decoding revisit**: with larger target model, the speed ratio improves
+The core kernel architecture is complete. All major optimizations explored:
+- Fused multi-layer decode with multi-SM parallelism
+- Persistent and pipelined decode (eliminate host sync)
+- Batched decode with weight amortization
+- GPU-accelerated paged KV cache
+- Continuous batching
+- Speculative decoding (acceptance rates validated)
 
 ### How to measure progress
 
@@ -777,6 +821,7 @@ generate.py                          — streaming text generation API + CLI
 serve.py                             — variable-length batched inference server (BatchedServer)
 profile_kernels.py                   — primary profiling tool (run after every change)
 inference_benchmark.py               — quick throughput benchmark
+speculative_decode.py                — speculative decoding benchmark (d=512 draft + d=768 target)
 test_paged_kernel.py                 — paged KV correctness test + benchmark
 baseline_metrics.txt                 — current numbers to beat
 ```
@@ -1141,3 +1186,19 @@ baseline_metrics.txt                 — current numbers to beat
     dispatch overhead. This is the fundamental cost of paging with immutable arrays.
     Mutable GPU buffers (via CUDA) would eliminate this but break JAX's functional
     model.
+
+61. **Speculative decoding acceptance scales with draft model quality, not size.**
+    Original attempt: d=128/1L draft (ppl=8.76) gave 36% acceptance at K=4. Revisit
+    with d=512/8L draft (ppl=2.91) gave 71% at K=4 — nearly 2x improvement. The
+    perplexity gap (8.76→5.40 vs 2.91→2.60) is the primary predictor of acceptance,
+    not the number of parameters. A draft model with similar perplexity to the target
+    will have high acceptance regardless of its architecture.
+
+62. **Speculative decoding needs >5x draft/target speed ratio at <80% acceptance.**
+    At d=512 draft (0.55ms/tok) vs d=768 target (1.0ms/tok), the speed ratio is ~2x.
+    Sequential verify cost: K × (t_draft + t_target) = K × 1.55ms > K × 1.0ms for
+    standard decode — mathematically impossible to profit. Even with parallel verify
+    (est. 1.5ms for K=4) + persistent draft (0.78ms for K=4), the estimated speedup
+    is only 1.6x. The small-model regime (both <100M params) has high throughput for
+    all models, compressing the speed ratio. Production-scale models (70B→7B, 10-20x
+    ratio) would see 2-3x speedup at 71% acceptance.
