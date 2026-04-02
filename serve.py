@@ -1,17 +1,8 @@
-"""Variable-length batched inference server.
-
-Manages a batch of sequences at different generation stages using the
-batched multi-SM decode kernel (which already supports per-sequence positions).
+"""Variable-length batched inference server with optional paged KV + continuous batching.
 
 Usage:
-    server = BatchedServer(params, config, batch_size=4)
-    server.add_sequence(prompt_ids_1)
-    server.add_sequence(prompt_ids_2)
-
-    for step_results in server.generate(max_tokens=128):
-        for seq_id, token_id, is_done in step_results:
-            if token_id is not None:
-                print(decode_fn([token_id]), end='')
+    uv run serve.py --prompts "Once upon a time" "The cat sat"
+    uv run serve.py --paged --continuous --batch-size 2 --prompts "A" "B" "C" "D"
 """
 
 import os
@@ -28,266 +19,136 @@ from model import prefill_with_kv
 
 
 class BatchedServer:
-    """Manages variable-length batched inference.
+    """Batched decode with contiguous KV cache (one buffer per sequence)."""
 
-    Sequences can be at different positions. Each step advances all active
-    sequences by one token. Sequences stop when they hit the EOS token or
-    max context length.
-
-    Uses the non-persistent batched decode kernel which supports per-sequence
-    positions via positions_ptr.
-    """
-
-    def __init__(self, params, config, batch_size=4, eos_token=None):
-        """Initialize the server.
-
-        Args:
-            params: model parameters (JAX arrays)
-            config: model config dict
-            batch_size: maximum batch size
-            eos_token: token ID that signals end of generation (None = no stopping)
-        """
+    def __init__(self, params, config, batch_size):
         self.params = params
         self.config = config
         self.batch_size = batch_size
-        self.eos_token = eos_token
         self.vocab_size = config["vocab_size"]
         self.ctx_len = config["context_len"]
-        self.d_head = config["d_head"]
-        self.n_kv_heads = config.get("n_kv_heads", config["n_heads"])
+        self.n_kv_heads = config["n_kv_heads"]
         self.n_layers = config["n_layers"]
+        self.d_head = config["d_head"]
         self.kv_per_seq = self.n_layers * 2 * self.n_kv_heads * self.ctx_len * self.d_head
-
         self.w = prepare_decode_weights_nlayer(params, config, self.vocab_size)
-
-        # Per-sequence state
-        self.slots = [None] * batch_size  # None = empty slot
-        self._warmup_done = False
+        self.slots = [None] * batch_size
+        self._warmed_up = False
 
     def _warmup(self):
-        """Run one decode step to trigger JIT compilation."""
-        if self._warmup_done:
+        if self._warmed_up:
             return
-        dummy_tok = jnp.zeros((1,), dtype=jnp.int32)
-        dummy_pos = jnp.zeros((1,), dtype=jnp.int32)
         dummy_kv = jnp.zeros((self.kv_per_seq,), dtype=jnp.bfloat16)
-        # Single-sequence warmup via multi_sm_decode
-        _t, _, _ = multi_sm_decode_nlayer(
-            self.w, self.config, dummy_tok[0], 0, dummy_kv, self.vocab_size)
-        _ = int(_t)
-        self._warmup_done = True
+        tok, _, _ = multi_sm_decode_nlayer(self.w, self.config, 0, 0, dummy_kv, self.vocab_size)
+        _ = int(tok)
+        self._warmed_up = True
 
-    def add_sequence(self, prompt_ids):
-        """Add a sequence to the batch.
-
-        Runs prefill immediately and stores KV cache.
-
-        Args:
-            prompt_ids: list or array of prompt token IDs
-
-        Returns:
-            int: slot index, or -1 if batch is full
-        """
-        # Find empty slot
-        slot = -1
-        for i, s in enumerate(self.slots):
-            if s is None:
-                slot = i
-                break
-        if slot == -1:
-            return -1
-
+    def _prefill(self, prompt_ids):
+        """Run prefill, return (first_token, kv_packed)."""
         prompt_ids = jnp.array(prompt_ids, dtype=jnp.int32)
         prompt_len = len(prompt_ids)
-
-        if prompt_len >= self.ctx_len:
-            prompt_ids = prompt_ids[:self.ctx_len - 1]
-            prompt_len = len(prompt_ids)
-
-        # Prefill
+        assert prompt_len < self.ctx_len
         x = jnp.pad(prompt_ids, (0, self.ctx_len - prompt_len)).astype(jnp.int32)
         logits, k_caches, v_caches = prefill_with_kv(self.params, self.config, x)
         _ = logits.block_until_ready()
-
-        kv_packed = pack_kv_caches(k_caches, v_caches)
         first_token = int(jnp.argmax(logits[prompt_len - 1]))
+        return first_token, prompt_len, pack_kv_caches(k_caches, v_caches), k_caches, v_caches
 
+    def add_sequence(self, prompt_ids):
+        """Add a sequence. Returns slot index, or -1 if full."""
+        slot = next((i for i, s in enumerate(self.slots) if s is None), -1)
+        if slot == -1:
+            return -1
+        first_token, prompt_len, kv, _, _ = self._prefill(prompt_ids)
         self.slots[slot] = {
-            "token": first_token,
-            "position": prompt_len,  # next position to use
-            "kv": kv_packed,
-            "done": False,
-            "tokens": [first_token],
+            "token": first_token, "position": prompt_len,
+            "kv": kv, "done": False, "tokens": [first_token],
         }
-
         self._warmup()
         return slot
 
     def _active_indices(self):
-        """Return indices of active (non-done, non-empty) slots."""
-        return [i for i, s in enumerate(self.slots)
-                if s is not None and not s["done"]]
+        return [i for i, s in enumerate(self.slots) if s is not None and not s["done"]]
 
     def step(self):
-        """Run one decode step for all active sequences.
-
-        Returns:
-            list of (slot_index, token_id, is_done) for each active sequence
-        """
+        """One decode step for all active sequences. Returns [(slot, tok, done)]."""
         active = self._active_indices()
         if not active:
             return []
 
-        n_active = len(active)
-
-        # Build batched inputs
         token_ids = jnp.array([self.slots[i]["token"] for i in active], dtype=jnp.int32)
         positions = jnp.array([self.slots[i]["position"] for i in active], dtype=jnp.int32)
         kv_batch = jnp.concatenate([self.slots[i]["kv"] for i in active])
 
-        # Run batched decode
         next_tokens, _, kv_out = batched_decode_nlayer(
             self.w, self.config, token_ids, positions,
-            kv_batch, self.vocab_size, n_active)
-
-        # Sync results
+            kv_batch, self.vocab_size, len(active))
         next_toks = next_tokens.tolist()
 
         results = []
         for j, slot_idx in enumerate(active):
             tok = next_toks[j]
             slot = self.slots[slot_idx]
-
-            # Update slot state
             slot["token"] = tok
             slot["position"] += 1
             slot["kv"] = kv_out[j * self.kv_per_seq:(j + 1) * self.kv_per_seq]
             slot["tokens"].append(tok)
-
-            # Check stopping conditions
-            is_done = False
-            if self.eos_token is not None and tok == self.eos_token:
-                is_done = True
-            if slot["position"] >= self.ctx_len:
-                is_done = True
-            slot["done"] = is_done
-
-            results.append((slot_idx, tok, is_done))
-
+            slot["done"] = slot["position"] >= self.ctx_len
+            results.append((slot_idx, tok, slot["done"]))
         return results
 
-    def generate(self, max_tokens=128):
-        """Generate tokens for all active sequences, yielding after each step.
-
-        Yields:
-            list of (slot_index, token_id, is_done) after each decode step
-        """
+    def generate(self, max_tokens):
         for _ in range(max_tokens):
             results = self.step()
-            if not results:
+            if not results or all(done for _, _, done in results):
                 break
             yield results
-            if all(r[2] for r in results):
-                break
 
     def get_tokens(self, slot_idx):
-        """Get all generated tokens for a slot."""
-        if self.slots[slot_idx] is None:
-            return []
-        return self.slots[slot_idx]["tokens"]
+        return self.slots[slot_idx]["tokens"] if self.slots[slot_idx] else []
 
     def remove_sequence(self, slot_idx):
-        """Remove a sequence and free its slot."""
         self.slots[slot_idx] = None
 
 
 class PagedBatchedServer(BatchedServer):
-    """Batched inference server with paged KV cache memory management.
+    """Batched decode with paged KV cache (GPU gather/scatter)."""
 
-    Instead of pre-allocating max_seq per sequence, allocates pages of 64
-    positions on demand. Memory is freed when sequences complete, allowing
-    the pool to be reused by new sequences.
-
-    Uses GPU-accelerated paging: JIT-compiled gather/scatter on the GPU pool
-    replaces the slow CPU numpy loops. The decode kernel is unchanged — it
-    receives contiguous KV buffers assembled from pages via GPU gather.
-    """
-
-    def __init__(self, params, config, batch_size=4, eos_token=None,
-                 pool_pages=None, use_gpu=True):
-        super().__init__(params, config, batch_size, eos_token)
+    def __init__(self, params, config, batch_size):
+        super().__init__(params, config, batch_size)
         from kernels.paged_kv import PagePool
-
-        if pool_pages is None:
-            max_pages_per_seq = (self.ctx_len + 63) // 64
-            pool_pages = batch_size * max_pages_per_seq + 16  # small margin
-        self.page_pool = PagePool(config, pool_pages)
-        self.use_gpu = use_gpu
+        max_pages_per_seq = (self.ctx_len + 63) // 64
+        self.page_pool = PagePool(config, batch_size * max_pages_per_seq + 16)
 
     def add_sequence(self, prompt_ids):
-        """Add a sequence with paged KV cache."""
-        slot = -1
-        for i, s in enumerate(self.slots):
-            if s is None:
-                slot = i
-                break
+        slot = next((i for i, s in enumerate(self.slots) if s is None), -1)
         if slot == -1:
             return -1
-
-        prompt_ids = jnp.array(prompt_ids, dtype=jnp.int32)
-        prompt_len = len(prompt_ids)
-        if prompt_len >= self.ctx_len:
-            prompt_ids = prompt_ids[:self.ctx_len - 1]
-            prompt_len = len(prompt_ids)
-
-        x = jnp.pad(prompt_ids, (0, self.ctx_len - prompt_len)).astype(jnp.int32)
-        logits, k_caches, v_caches = prefill_with_kv(self.params, self.config, x)
-        _ = logits.block_until_ready()
-
-        first_token = int(jnp.argmax(logits[prompt_len - 1]))
-
-        # Store KV into page pool
+        first_token, prompt_len, _, k_caches, v_caches = self._prefill(prompt_ids)
         self.page_pool.store_prefill_kv(slot, k_caches, v_caches, prompt_len)
-        if self.use_gpu:
-            self.page_pool.sync_to_gpu()
-
+        self.page_pool.sync_to_gpu()
         self.slots[slot] = {
-            "token": first_token,
-            "position": prompt_len,
-            "done": False,
-            "tokens": [first_token],
+            "token": first_token, "position": prompt_len,
+            "done": False, "tokens": [first_token],
         }
-
         self._warmup()
         return slot
 
     def step(self):
-        """Run one decode step using paged KV cache."""
         active = self._active_indices()
         if not active:
             return []
 
-        n_active = len(active)
-
-        # Ensure pages allocated for current positions
         for i in active:
-            self.page_pool.ensure_page_for_pos(i, self.slots[i]["position"])
+            self.page_pool.ensure_page(i, self.slots[i]["position"])
 
-        # Convert paged KV to contiguous for kernel
         token_ids = jnp.array([self.slots[i]["token"] for i in active], dtype=jnp.int32)
         positions = jnp.array([self.slots[i]["position"] for i in active], dtype=jnp.int32)
+        kv_batch = jnp.concatenate([self.page_pool.to_contiguous_gpu(i) for i in active])
 
-        if self.use_gpu:
-            kv_parts = [self.page_pool.to_contiguous_gpu(i) for i in active]
-        else:
-            kv_parts = [self.page_pool.to_contiguous(i) for i in active]
-        kv_batch = jnp.concatenate(kv_parts)
-
-        # Run batched decode
         next_tokens, _, kv_out = batched_decode_nlayer(
             self.w, self.config, token_ids, positions,
-            kv_batch, self.vocab_size, n_active)
-
+            kv_batch, self.vocab_size, len(active))
         next_toks = next_tokens.tolist()
 
         results = []
@@ -295,81 +156,45 @@ class PagedBatchedServer(BatchedServer):
             tok = next_toks[j]
             slot = self.slots[slot_idx]
             pos = slot["position"]
-
-            # Update page pool with new KV at the current position
             kv_seq = kv_out[j * self.kv_per_seq:(j + 1) * self.kv_per_seq]
-            if self.use_gpu:
-                self.page_pool.update_page_gpu(slot_idx, kv_seq, pos)
-            else:
-                self.page_pool.update_from_contiguous(slot_idx, kv_seq, pos)
-
+            self.page_pool.update_page_gpu(slot_idx, kv_seq, pos)
             slot["token"] = tok
             slot["position"] += 1
             slot["tokens"].append(tok)
-
-            is_done = False
-            if self.eos_token is not None and tok == self.eos_token:
-                is_done = True
-            if slot["position"] >= self.ctx_len:
-                is_done = True
-            slot["done"] = is_done
-
-            results.append((slot_idx, tok, is_done))
-
+            slot["done"] = slot["position"] >= self.ctx_len
+            results.append((slot_idx, tok, slot["done"]))
         return results
 
     def remove_sequence(self, slot_idx):
-        """Remove sequence and free its pages."""
-        self.page_pool.free_seq_pages(slot_idx)
+        self.page_pool.free_seq(slot_idx)
         self.slots[slot_idx] = None
 
-    def serve_continuous(self, prompts, max_tokens_per_seq=128, callback=None):
-        """Process a queue of prompts with continuous batching.
+    def serve_continuous(self, prompts, max_tokens_per_seq):
+        """Process N prompts through B slots. Refills slots as sequences finish.
 
-        When a sequence finishes (EOS or max tokens), its slot and pages are
-        freed and immediately filled with the next pending prompt. The batch
-        stays full as long as there are pending prompts.
-
-        Args:
-            prompts: list of token ID lists (pre-tokenized prompts)
-            max_tokens_per_seq: max tokens to generate per sequence
-            callback: optional fn(slot_idx, token_id, is_done, prompt_idx)
-
-        Returns:
-            dict mapping prompt index to list of generated tokens
+        Returns (completed, total_tokens) where completed maps prompt_idx → tokens.
         """
-        queue = list(enumerate(prompts))  # (prompt_idx, token_ids)
-        completed = {}  # prompt_idx -> tokens
-        slot_to_prompt = {}  # slot_idx -> (prompt_idx, tokens_generated)
+        queue = list(enumerate(prompts))
+        completed = {}
+        slot_to_prompt = {}  # slot_idx -> (prompt_idx, n_generated)
 
-        # Fill initial batch
+        # fill initial batch
         while queue:
-            free_slot = None
-            for i, s in enumerate(self.slots):
-                if s is None:
-                    free_slot = i
-                    break
-            if free_slot is None:
+            slot = next((i for i, s in enumerate(self.slots) if s is None), -1)
+            if slot == -1:
                 break
             prompt_idx, prompt_ids = queue.pop(0)
-            slot = self.add_sequence(prompt_ids)
-            if slot >= 0:
-                slot_to_prompt[slot] = (prompt_idx, 0)
+            assert self.add_sequence(prompt_ids) == slot
+            slot_to_prompt[slot] = (prompt_idx, 0)
 
         total_tokens = 0
         while self._active_indices():
-            results = self.step()
-
-            for slot_idx, tok, is_done in results:
+            for slot_idx, tok, is_done in self.step():
                 prompt_idx, n_gen = slot_to_prompt[slot_idx]
                 n_gen += 1
-                slot_to_prompt[slot_idx] = (prompt_idx, n_gen)
                 total_tokens += 1
+                slot_to_prompt[slot_idx] = (prompt_idx, n_gen)
 
-                if callback:
-                    callback(slot_idx, tok, is_done, prompt_idx)
-
-                # Check per-sequence token limit
                 if n_gen >= max_tokens_per_seq:
                     is_done = True
                     self.slots[slot_idx]["done"] = True
@@ -378,135 +203,98 @@ class PagedBatchedServer(BatchedServer):
                     completed[prompt_idx] = self.get_tokens(slot_idx)
                     self.remove_sequence(slot_idx)
                     del slot_to_prompt[slot_idx]
-
-                    # Fill freed slot with next prompt
                     if queue:
                         next_idx, next_ids = queue.pop(0)
                         new_slot = self.add_sequence(next_ids)
-                        if new_slot >= 0:
-                            slot_to_prompt[new_slot] = (next_idx, 0)
+                        assert new_slot >= 0
+                        slot_to_prompt[new_slot] = (next_idx, 0)
 
         return completed, total_tokens
 
     @property
     def memory_stats(self):
+        pp = self.page_pool
         return {
-            "pages_used": self.page_pool.pages_used,
-            "pages_total": self.page_pool.max_pages,
-            "memory_used_mb": self.page_pool.memory_used_mb,
-            "memory_pool_mb": self.page_pool.memory_allocated_mb,
+            "pages_used": pp.pages_used, "pages_total": pp.max_pages,
+            "memory_used_mb": pp.memory_used_mb, "memory_pool_mb": pp.memory_allocated_mb,
         }
 
 
 def main():
-    import argparse
-    import pickle
-    import sys
-    import time
-
+    import argparse, pickle, sys, time
     from data import load_bpe_vocab
 
-    parser = argparse.ArgumentParser(description="Variable-length batched inference")
+    parser = argparse.ArgumentParser(description="Batched inference server")
     parser.add_argument("--prompts", nargs="+",
                         default=["Once upon a time", "The cat sat on the",
-                                 "In a galaxy far", "She opened the door"],
-                        help="Prompts to generate from")
+                                 "In a galaxy far", "She opened the door"])
     parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=None,
-                        help="Batch size (default: number of prompts)")
-    parser.add_argument("--weights", type=str, default="weights.pkl")
-    parser.add_argument("--paged", action="store_true",
-                        help="Use paged KV cache (page-level memory management)")
-    parser.add_argument("--continuous", action="store_true",
-                        help="Use continuous batching (requires --paged)")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--weights", default="weights.pkl")
+    parser.add_argument("--paged", action="store_true")
+    parser.add_argument("--continuous", action="store_true")
     args = parser.parse_args()
 
-    # Load model
     with open(os.path.join(os.path.dirname(__file__), args.weights), "rb") as f:
         saved = pickle.load(f)
     params = {k: jnp.array(v) for k, v in saved["params"].items()}
     config = saved["config"]
+    assert "n_kv_heads" in config, "config must have n_kv_heads"
 
-    # Load tokenizer
     bpe_vocab = load_bpe_vocab()
     decode_fn = bpe_vocab["decode_fn"]
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(bpe_vocab["tokenizer_path"])
     encode_fn = lambda text: tok.encode(text).ids
 
-    if args.continuous and not args.paged:
+    if args.continuous:
         args.paged = True
-        print("--continuous implies --paged", file=sys.stderr)
 
     batch_size = args.batch_size or len(args.prompts)
     print(f"Model: d={config['d_model']} h={config['n_heads']} l={config['n_layers']}",
           file=sys.stderr)
-    print(f"Batch size: {batch_size}, Prompts: {len(args.prompts)}", file=sys.stderr)
-    print(file=sys.stderr)
 
     if args.paged:
-        server = PagedBatchedServer(params, config, batch_size=batch_size)
-        print(f"Using paged KV cache ({server.page_pool.max_pages} pages)", file=sys.stderr)
+        server = PagedBatchedServer(params, config, batch_size)
+        print(f"Paged KV ({server.page_pool.max_pages} pages)", file=sys.stderr)
     else:
-        server = BatchedServer(params, config, batch_size=batch_size)
+        server = BatchedServer(params, config, batch_size)
 
-    # Tokenize all prompts
     all_prompt_ids = [encode_fn(p) for p in args.prompts]
 
     if args.continuous:
-        # Continuous batching: process all prompts through batch_size slots
-        print(f"Continuous batching: {len(args.prompts)} prompts through "
-              f"{batch_size} slots", file=sys.stderr)
-
         t0 = time.perf_counter()
         completed, total_tokens = server.serve_continuous(
-            all_prompt_ids, max_tokens_per_seq=args.max_tokens)
+            all_prompt_ids, args.max_tokens)
         elapsed = time.perf_counter() - t0
-        tok_per_s = total_tokens / elapsed
 
-        for prompt_idx in sorted(completed.keys()):
-            tokens = completed[prompt_idx]
-            text = decode_fn(tokens)
-            prompt = args.prompts[prompt_idx]
-            print(f"\n--- Prompt {prompt_idx} ({len(tokens)} tokens) ---")
-            print(f"{prompt}{text}")
-
-        print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
-              f" ({len(args.prompts)} prompts, batch_size={batch_size})]",
-              file=sys.stderr)
-
+        for idx in sorted(completed):
+            text = decode_fn(completed[idx])
+            print(f"\n--- Prompt {idx} ({len(completed[idx])} tokens) ---")
+            print(f"{args.prompts[idx]}{text}")
+        print(f"\n[{total_tokens} tok in {elapsed*1000:.0f}ms = "
+              f"{total_tokens/elapsed:.0f} tok/s]", file=sys.stderr)
     else:
-        # Static batching: one prompt per slot
-        for i, prompt_ids in enumerate(all_prompt_ids[:batch_size]):
-            slot = server.add_sequence(prompt_ids)
-            print(f"[Slot {slot}] prompt ({len(prompt_ids)} tokens): "
-                  f"{args.prompts[i]}", file=sys.stderr)
-
-        print(file=sys.stderr)
+        for i, ids in enumerate(all_prompt_ids[:batch_size]):
+            server.add_sequence(ids)
 
         t0 = time.perf_counter()
         total_tokens = 0
-        for step_results in server.generate(max_tokens=args.max_tokens):
+        for step_results in server.generate(args.max_tokens):
             total_tokens += len(step_results)
-
         elapsed = time.perf_counter() - t0
-        tok_per_s = total_tokens / elapsed
 
         for i in range(min(batch_size, len(args.prompts))):
-            tokens = server.get_tokens(i)
-            text = decode_fn(tokens)
-            prompt = args.prompts[i]
-            print(f"\n--- Slot {i} ({len(tokens)} tokens) ---")
-            print(f"{prompt}{text}")
-
-        print(f"\n[{total_tokens} tokens in {elapsed*1000:.0f}ms = {tok_per_s:.0f} tok/s"
-              f" ({tok_per_s/batch_size:.0f} per seq)]", file=sys.stderr)
+            text = decode_fn(server.get_tokens(i))
+            print(f"\n--- Slot {i} ({len(server.get_tokens(i))} tokens) ---")
+            print(f"{args.prompts[i]}{text}")
+        print(f"\n[{total_tokens} tok in {elapsed*1000:.0f}ms = "
+              f"{total_tokens/elapsed:.0f} tok/s]", file=sys.stderr)
 
     if args.paged:
-        stats = server.memory_stats
-        print(f"[Paged KV: {stats['pages_used']}/{stats['pages_total']} pages,"
-              f" {stats['memory_used_mb']:.1f}/{stats['memory_pool_mb']:.1f} MB]",
-              file=sys.stderr)
+        s = server.memory_stats
+        print(f"[Pages: {s['pages_used']}/{s['pages_total']}, "
+              f"{s['memory_used_mb']:.1f}/{s['memory_pool_mb']:.1f} MB]", file=sys.stderr)
 
 
 if __name__ == "__main__":

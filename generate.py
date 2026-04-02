@@ -47,25 +47,9 @@ def _prefill(params, config, prompt_ids, vocab_size):
     return w, first_token, prompt_len, kv_packed
 
 
-def stream_tokens(params, config, prompt_ids, max_tokens=128, vocab_size=None):
-    """Yield token IDs one at a time as they're generated.
-
-    Uses pipelined multi-SM decode (one kernel call per token).
-    Each token is synced to host immediately for streaming output.
-
-    Args:
-        params: model parameters
-        config: model config dict
-        prompt_ids: jnp.array of prompt token IDs
-        max_tokens: maximum tokens to generate
-        vocab_size: vocabulary size (inferred from config if None)
-
-    Yields:
-        int: token IDs, one at a time
-    """
-    if vocab_size is None:
-        vocab_size = config["vocab_size"]
-
+def stream_tokens(params, config, prompt_ids, max_tokens=128):
+    """Yield token IDs one at a time (per-token host sync for streaming)."""
+    vocab_size = config["vocab_size"]
     w, tok, start_pos, kv_packed = _prefill(params, config, prompt_ids, vocab_size)
 
     # First token (from prefill argmax)
@@ -79,25 +63,9 @@ def stream_tokens(params, config, prompt_ids, max_tokens=128, vocab_size=None):
         yield int(tok)
 
 
-def generate_tokens(params, config, prompt_ids, n_tokens=128, vocab_size=None):
-    """Generate all tokens at once (pipelined, minimal per-token sync).
-
-    Faster than stream_tokens because tokens stay on device between steps.
-    All tokens synced to host at the end.
-
-    Args:
-        params: model parameters
-        config: model config dict
-        prompt_ids: jnp.array of prompt token IDs
-        n_tokens: number of tokens to generate
-        vocab_size: vocabulary size (inferred from config if None)
-
-    Returns:
-        list[int]: generated token IDs
-    """
-    if vocab_size is None:
-        vocab_size = config["vocab_size"]
-
+def generate_tokens(params, config, prompt_ids, n_tokens=128):
+    """Generate all tokens at once (pipelined, tokens stay on device)."""
+    vocab_size = config["vocab_size"]
     w, tok, start_pos, kv_packed = _prefill(params, config, prompt_ids, vocab_size)
 
     # Collect device-side token tensors (no per-step sync)
@@ -170,7 +138,7 @@ def main():
 
     if args.no_stream:
         t0 = time.perf_counter()
-        tokens = generate_tokens(params, config, prompt_ids, max_gen, vocab_size)
+        tokens = generate_tokens(params, config, prompt_ids, max_gen)
         elapsed = time.perf_counter() - t0
         text = decode_fn(tokens)
         sys.stdout.write(text)
@@ -184,7 +152,7 @@ def main():
         all_tokens = []
         t_first = None
         printed_chars = 0
-        for token_id in stream_tokens(params, config, prompt_ids, max_gen, vocab_size):
+        for token_id in stream_tokens(params, config, prompt_ids, max_gen):
             if t_first is None:
                 t_first = time.perf_counter()
             all_tokens.append(token_id)
