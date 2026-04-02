@@ -52,6 +52,9 @@ def prepare_data(context_len=128, val_fraction=0.1, tokenizer="char",
                    "trained_bpe" for BPE trained on corpus (0% UNK).
         bpe_vocab_size: vocabulary size (only used if tokenizer="bpe" or "trained_bpe").
     """
+    if dataset == "combined":
+        return _prepare_combined(context_len)
+
     if dataset == "tinystories":
         train_text, val_text = load_tinystories()
     else:
@@ -247,6 +250,60 @@ def _prepare_trained_bpe_from_texts(train_text, val_text, context_len, vocab_siz
         "val_x": val_x,
         "val_y": val_y,
         "vocab_size": actual_vocab,
+        "decode_fn": decode_tokens,
+        "tokenizer": "trained_bpe",
+    }
+
+
+def _prepare_combined(context_len):
+    """Load the pre-tokenized multi-source dataset (from prepare_data.py)."""
+    from tokenizers import Tokenizer
+
+    token_dir = os.path.join(DATA_DIR, "tokens")
+    combined_path = os.path.join(token_dir, "combined.npz")
+    meta_path = os.path.join(token_dir, "metadata.json")
+
+    if not os.path.exists(combined_path):
+        raise FileNotFoundError(
+            f"Combined dataset not found at {combined_path}. "
+            "Run: uv run prepare_data.py"
+        )
+
+    import json
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    print(f"Loading combined dataset ({meta['total_train_tokens']/1e9:.2f}B train tokens)...")
+    data = np.load(combined_path)
+    train_data = data["train"]
+    val_data = data["val"]
+
+    vocab_size = meta["vocab_size"]
+    tok = Tokenizer.from_file(meta["tokenizer_path"])
+
+    train_x, train_y = _make_sequences(train_data, context_len)
+    val_x, val_y = _make_sequences(val_data, context_len)
+
+    print(f"Combined: {len(train_x):,} train seqs, {len(val_x):,} val seqs, vocab={vocab_size}")
+
+    def decode_tokens(ids):
+        return tok.decode(list(int(i) for i in ids))
+
+    # Save vocab mapping for inference
+    vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")
+    with open(vocab_path, "wb") as f:
+        pickle.dump({
+            "tokenizer_path": meta["tokenizer_path"],
+            "bpe_vocab_size": vocab_size,
+            "tokenizer_type": "trained_bpe",
+        }, f)
+
+    return {
+        "train_x": train_x,
+        "train_y": train_y,
+        "val_x": val_x,
+        "val_y": val_y,
+        "vocab_size": vocab_size,
         "decode_fn": decode_tokens,
         "tokenizer": "trained_bpe",
     }

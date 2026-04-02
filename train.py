@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--dataset", default="tinystories", choices=["shakespeare", "tinystories"])
+    parser.add_argument("--dataset", default="tinystories", choices=["shakespeare", "tinystories", "combined"])
     parser.add_argument("--tokenizer", default="trained_bpe", choices=["char", "bpe", "trained_bpe"])
     parser.add_argument("--bpe-vocab", type=int, default=4096)
     args = parser.parse_args()

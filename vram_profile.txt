@@ -1,0 +1,12 @@
+Config                                       Params       VRAM   Util
+d=768 h=24 kv=6 l=12 bs=16                   123.9M     5224MB    33%
+d=768 h=24 kv=6 l=12 bs=32                   123.9M     7522MB    47%
+d=1024 h=16 kv=4 l=16 bs=16                  242.3M     7954MB    50%
+d=1024 h=16 kv=4 l=16 bs=32                  242.3M    10496MB    66%
+d=1024 h=16 kv=4 l=20 bs=16                  286.3M    10496MB    66%
+d=1024 h=16 kv=4 l=24 bs=16                  330.4M    10496MB    66%
+d=1024 h=32 kv=8 l=16 bs=16                  242.3M    10496MB    66%
+d=1280 h=20 kv=4 l=16 bs=16                  355.3M    10780MB    67%
+d=1280 h=20 kv=4 l=20 bs=16                  423.5M    12311MB    77%
+d=1536 h=24 kv=6 l=16 bs=16                     OOM        OOM    OOM
+d=1536 h=24 kv=6 l=16 bs=8                      OOM        OOM    OOM
