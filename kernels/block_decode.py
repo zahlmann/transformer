@@ -24,7 +24,7 @@ def _decode_layer_kernel(
     ln1_scale_ptr, ln1_bias_ptr,
     wq_ptr, wk_ptr, wv_ptr, wo_ptr,
     ln2_scale_ptr, ln2_bias_ptr,
-    ffn_up_ptr, ffn_up_bias_ptr, ffn_down_ptr, ffn_down_bias_ptr,
+    ffn_up_ptr, ffn_down_ptr,
     # Decode input
     pos_ptr,
     k_cache_ptr, v_cache_ptr,
@@ -98,10 +98,9 @@ def _decode_layer_kernel(
     for k in tl.range(0, D_FF, BLOCK_K):
         kk = k + tl.arange(0, BLOCK_K)
         up = tl.sum(h_norm2[:, None] * tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :]).to(tl.float32), axis=0)
-        up += tl.load(ffn_up_bias_ptr + kk).to(tl.float32)
         act = up * tl.sigmoid(1.702 * up)
         ffn_accum += tl.sum(act[:, None] * tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
-    h = h + ffn_accum + tl.load(ffn_down_bias_ptr + d).to(tl.float32)
+    h = h + ffn_accum
 
     tl.store(h_out_ptr + d, h)
 
@@ -189,8 +188,7 @@ def block_decode(w, config, token_id, pos, all_k_caches, all_v_caches, vocab_siz
             w[f"{p}.attn.q"], w[f"{p}.attn.k"],
             w[f"{p}.attn.v"], w[f"{p}.attn.o"],
             w[f"{p}.ln2.scale"], w[f"{p}.ln2.bias"],
-            w[f"{p}.ffn.up"], w[f"{p}.ffn.up_bias"],
-            w[f"{p}.ffn.down"], w[f"{p}.ffn.down_bias"],
+            w[f"{p}.ffn.up"], w[f"{p}.ffn.down"],
             jnp.int32(pos),
             all_k_caches[layer], all_v_caches[layer],
             kernel=_decode_layer_kernel,

@@ -127,7 +127,7 @@ def _batched_decode(
         D_MODEL + D_MODEL +
         D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
         D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF + D_FF * D_MODEL + D_MODEL
+        D_MODEL * D_FF + D_FF * D_MODEL
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
@@ -164,9 +164,7 @@ def _batched_decode(
         ln2_s_off = off;    off += D_MODEL
         ln2_b_off = off;    off += D_MODEL
         up_off = off;       off += D_MODEL * D_FF
-        up_b_off = off;     off += D_FF
-        down_off = off;     off += D_FF * D_MODEL
-        down_b_off = off
+        down_off = off
 
         # ══════════════════════════════════════════════════
         # PHASE 1: LN1 + Q/K/V projections + Attention + O projection
@@ -347,7 +345,6 @@ def _batched_decode(
             kk = ff_start + k + tl.arange(0, BLOCK_K)
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
                            mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            up_bias = tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
                              mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
 
@@ -355,7 +352,6 @@ def _batched_decode(
                 h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
                 h_norm_2d = h_norm[None, :].to(tl.bfloat16)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-                up += up_bias
                 act = up * tl.sigmoid(1.702 * up)
                 partial = tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
@@ -377,7 +373,7 @@ def _batched_decode(
             pass
 
         # ══════════════════════════════════════════════════
-        # PHASE 3: h = h_original + attn_total + ffn_total + bias
+        # PHASE 3: h = h_original + attn_total + ffn_total
         # Double-buffer: read from h_in, write to h_out (no read-write race).
         # ══════════════════════════════════════════════════
         for b in tl.range(0, BATCH_SIZE):
@@ -387,8 +383,7 @@ def _batched_decode(
             for i in tl.range(TOTAL_BLOCKS):
                 ffn_total += tl.load(ffn_buf_ptr + (b * TOTAL_BLOCKS + i) * D_BLOCK + d,
                                      mask=d_mask, other=0.0)
-            h = h + attn_total + ffn_total + tl.load(packed_w_ptr + down_b_off + d,
-                                                      mask=d_mask, other=0.0).to(tl.float32)
+            h = h + attn_total + ffn_total
             tl.store(h_buf_ptr + h_out_off + b * D_BLOCK + d, h, mask=d_mask)
 
         # No barrier needed after phase 3: all blocks write identical h values

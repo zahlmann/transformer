@@ -207,8 +207,7 @@ def _flash_attn_kernel(
 def _ffn_kernel(
     h_ptr,
     ln_scale_ptr, ln_bias_ptr,
-    ffn_up_ptr, ffn_up_bias_ptr,
-    ffn_down_ptr, ffn_down_bias_ptr,
+    ffn_up_ptr, ffn_down_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
     D_BLOCK: tl.constexpr,
@@ -239,13 +238,12 @@ def _ffn_kernel(
         kk = k + tl.arange(0, BLOCK_K)
         up = tl.dot(h_norm.to(tl.bfloat16),
                     tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)).to(tl.float32)
-        up += tl.load(ffn_up_bias_ptr + kk).to(tl.float32)[None, :]
         act = up * tl.sigmoid(1.702 * up)
         ffn_out += tl.dot(act.to(tl.bfloat16),
                           tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)).to(tl.float32)
 
     # Residual
-    h = h + ffn_out + tl.load(ffn_down_bias_ptr + d, mask=d_mask, other=0.0).to(tl.float32)[None, :]
+    h = h + ffn_out
     tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
 
 
@@ -394,8 +392,7 @@ def block_prefill(params, config, x, vocab_size):
         (h,) = jt.triton_call(
             h,
             w[f"{p}.ln2.scale"], w[f"{p}.ln2.bias"],
-            w[f"{p}.ffn.up"], w[f"{p}.ffn.up_bias"],
-            w[f"{p}.ffn.down"], w[f"{p}.ffn.down_bias"],
+            w[f"{p}.ffn.up"], w[f"{p}.ffn.down"],
             kernel=_ffn_kernel,
             out_shape=[
                 jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),

@@ -9,7 +9,7 @@ regardless of d_model or n_layers. The kernel processes layers sequentially,
 loading each layer's weights from the packed buffer.
 
 Weight packing layout (all bf16):
-  Per layer (12 tensors):
+  Per layer (10 tensors):
     ln1_scale:  D_MODEL
     ln1_bias:   D_MODEL
     wq:         D_MODEL * D_MODEL
@@ -19,9 +19,7 @@ Weight packing layout (all bf16):
     ln2_scale:  D_MODEL
     ln2_bias:   D_MODEL
     ffn_up:     D_MODEL * D_FF
-    ffn_up_b:   D_FF
     ffn_down:   D_FF * D_MODEL
-    ffn_down_b: D_MODEL
 
 KV cache packing: all layers concatenated.
   Per layer: k_cache (N_HEADS * MAX_SEQ * D_HEAD) + v_cache (same)
@@ -79,8 +77,8 @@ def _fused_decode_nlayer(
         D_MODEL + D_MODEL +                      # ln1 scale, bias
         4 * D_MODEL * D_MODEL +                   # wq, wk, wv, wo
         D_MODEL + D_MODEL +                       # ln2 scale, bias
-        D_MODEL * D_FF + D_FF +                   # ffn_up, ffn_up_bias
-        D_FF * D_MODEL + D_MODEL                  # ffn_down, ffn_down_bias
+        D_MODEL * D_FF +                          # ffn_up
+        D_FF * D_MODEL                            # ffn_down
     )
 
     # Per-layer KV cache size in elements (bf16)
@@ -106,9 +104,7 @@ def _fused_decode_nlayer(
         ln2_s_off = off;          off += D_MODEL
         ln2_b_off = off;          off += D_MODEL
         up_off = off;             off += D_MODEL * D_FF
-        up_b_off = off;           off += D_FF
-        down_off = off;           off += D_FF * D_MODEL
-        down_b_off = off
+        down_off = off
 
         # ── LN1 ──
         ln_s = tl.load(packed_w_ptr + ln1_s_off + d).to(tl.float32)
@@ -192,11 +188,10 @@ def _fused_decode_nlayer(
             kk = k + tl.arange(0, BLOCK_K)
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)
             up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)  # (BLOCK_K,)
-            up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
             act = up * tl.sigmoid(1.702 * up)
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)
             ffn_accum += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
-        h = h + ffn_accum + tl.load(packed_w_ptr + down_b_off + d).to(tl.float32)
+        h = h + ffn_accum
 
     # ════════════════════════════════════════════
     # OUTPUT
@@ -239,9 +234,7 @@ def pack_weights(params, config):
             params[f"{p}.ln2.scale"].reshape(-1),
             params[f"{p}.ln2.bias"].reshape(-1),
             params[f"{p}.ffn.up"].reshape(-1),
-            params[f"{p}.ffn.up_bias"].reshape(-1),
             params[f"{p}.ffn.down"].reshape(-1),
-            params[f"{p}.ffn.down_bias"].reshape(-1),
         ])
 
     return jnp.concatenate(layer_tensors).astype(jnp.bfloat16)

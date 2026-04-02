@@ -208,8 +208,8 @@ def compute_memory_stats(config, vocab_size):
         d * d_kv +          # V (GQA: smaller)
         d * d +             # O
         d + d +             # ln2 scale, bias
-        d * d_ff + d_ff +   # ffn up + bias
-        d_ff * d + d        # ffn down + bias
+        d * d_ff +          # ffn up
+        d_ff * d            # ffn down
     )
     total_weights = (
         config["vocab_size"] * d +   # token_emb

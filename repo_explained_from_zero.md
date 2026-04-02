@@ -202,9 +202,9 @@ makes it "autoregressive" — each position only sees the past.
 **Step 5: Feed-Forward Network (FFN).** Two matrix multiplications with a nonlinearity:
 
 ```
-up   = h_norm @ W_up + bias_up     # (128, 64) @ (64, 256) = (128, 256) — expand
+up   = h_norm @ W_up               # (128, 64) @ (64, 256) = (128, 256) — expand
 act  = gelu(up)                     # element-wise nonlinearity
-down = act @ W_down + bias_down     # (128, 256) @ (256, 64) = (128, 64) — compress
+down = act @ W_down                 # (128, 256) @ (256, 64) = (128, 64) — compress
 h = h + down                        # residual connection
 ```
 
@@ -234,8 +234,8 @@ def transformer_forward(params, config, x):
     attn_out = causal_attention(h_norm, wq, wk, wv, wo, n_heads)
     h = h + attn_out
     h_norm = layer_norm(h, params["layer0.ln2.scale"], params["layer0.ln2.bias"])
-    h_ff = jax.nn.gelu(h_norm @ params["layer0.ffn.up"] + params["layer0.ffn.up_bias"])
-    h_ff = h_ff @ params["layer0.ffn.down"] + params["layer0.ffn.down_bias"]
+    h_ff = jax.nn.gelu(h_norm @ params["layer0.ffn.up"])
+    h_ff = h_ff @ params["layer0.ffn.down"]
     h = h + h_ff
     h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
     return h @ params["output_proj"]
@@ -386,8 +386,7 @@ def _prefill_kernel(
     ln1_scale_ptr, ln1_bias_ptr,           # layer norm 1
     wq_ptr, wk_ptr, wv_ptr, wo_ptr,       # attention weights
     ln2_scale_ptr, ln2_bias_ptr,           # layer norm 2
-    ffn_up_ptr, ffn_up_bias_ptr,           # FFN
-    ffn_down_ptr, ffn_down_bias_ptr,
+    ffn_up_ptr, ffn_down_ptr,              # FFN
     ln_final_scale_ptr, ln_final_bias_ptr, # final layer norm
     output_proj_ptr,                       # output projection
     x_ptr,                                 # input token IDs
@@ -528,7 +527,7 @@ So we tile it:
     ffn_out = tl.zeros((128, 64), dtype=tl.float32)
     for k in tl.range(0, 256, 32):
         kk = k + tl.arange(0, 32)
-        up = tl.dot(...) + bias  # (128, 64) @ (64, 32) = (128, 32) — a tile of the FFN
+        up = tl.dot(...)         # (128, 64) @ (64, 32) = (128, 32) — a tile of the FFN
         act = up * tl.sigmoid(1.702 * up)  # GELU on just this tile
         ffn_out += tl.dot(...)   # (128, 32) @ (32, 64) = (128, 64) — accumulate
 ```
@@ -577,8 +576,7 @@ def fused_prefill(params, x):
         bf("layer0.attn.q"), bf("layer0.attn.k"),
         bf("layer0.attn.v"), bf("layer0.attn.o"),
         bf("layer0.ln2.scale"), bf("layer0.ln2.bias"),
-        bf("layer0.ffn.up"), bf("layer0.ffn.up_bias"),
-        bf("layer0.ffn.down"), bf("layer0.ffn.down_bias"),
+        bf("layer0.ffn.up"), bf("layer0.ffn.down"),
         bf("ln_final.scale"), bf("ln_final.bias"),
         jnp.pad(params["output_proj"], [(0, 0), (0, 63)]).astype(jnp.bfloat16),
         x.astype(jnp.int32),

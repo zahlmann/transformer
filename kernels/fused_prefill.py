@@ -26,7 +26,7 @@ def _prefill_kernel(
     ln1_scale_ptr, ln1_bias_ptr,
     wq_ptr, wk_ptr, wv_ptr, wo_ptr,
     ln2_scale_ptr, ln2_bias_ptr,
-    ffn_up_ptr, ffn_up_bias_ptr, ffn_down_ptr, ffn_down_bias_ptr,
+    ffn_up_ptr, ffn_down_ptr,
     ln_final_scale_ptr, ln_final_bias_ptr,
     output_proj_ptr,
     # Input
@@ -89,10 +89,9 @@ def _prefill_kernel(
     for k in tl.range(0, D_FF, BLOCK_K):
         kk = k + tl.arange(0, BLOCK_K)
         up = tl.dot(h_norm2.to(tl.bfloat16), tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :]).to(tl.bfloat16)).to(tl.float32)
-        up += tl.load(ffn_up_bias_ptr + kk).to(tl.float32)[None, :]
         act = up * tl.sigmoid(1.702 * up)  # GELU approximation
         ffn_out += tl.dot(act.to(tl.bfloat16), tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :]).to(tl.bfloat16)).to(tl.float32)
-    h = h + ffn_out + tl.load(ffn_down_bias_ptr + d).to(tl.float32)[None, :]
+    h = h + ffn_out
 
     # ── Final Layer Norm ──
     lnf_s = tl.load(ln_final_scale_ptr + d).to(tl.float32)
@@ -138,8 +137,7 @@ def fused_prefill(params, x, vocab_size=65):
         bf("layer0.attn.q"), bf("layer0.attn.k"),
         bf("layer0.attn.v"), bf("layer0.attn.o"),
         bf("layer0.ln2.scale"), bf("layer0.ln2.bias"),
-        bf("layer0.ffn.up"), bf("layer0.ffn.up_bias"),
-        bf("layer0.ffn.down"), bf("layer0.ffn.down_bias"),
+        bf("layer0.ffn.up"), bf("layer0.ffn.down"),
         bf("ln_final.scale"), bf("ln_final.bias"),
         output_proj_padded,
         x.astype(jnp.int32),

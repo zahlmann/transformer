@@ -27,7 +27,7 @@ def _decode_kernel(
     ln1_scale_ptr, ln1_bias_ptr,
     wq_ptr, wk_ptr, wv_ptr, wo_ptr,
     ln2_scale_ptr, ln2_bias_ptr,
-    ffn_up_ptr, ffn_up_bias_ptr, ffn_down_ptr, ffn_down_bias_ptr,
+    ffn_up_ptr, ffn_down_ptr,
     ln_final_scale_ptr, ln_final_bias_ptr,
     output_proj_ptr,
     # Input
@@ -108,10 +108,9 @@ def _decode_kernel(
     for k in tl.range(0, D_FF, BLOCK_K):
         kk = k + tl.arange(0, BLOCK_K)
         up = tl.sum(h_norm2[:, None] * tl.load(ffn_up_ptr + d[:, None] * D_FF + kk[None, :]).to(tl.float32), axis=0)
-        up += tl.load(ffn_up_bias_ptr + kk).to(tl.float32)
         act = up * tl.sigmoid(1.702 * up)
         ffn_accum += tl.sum(act[:, None] * tl.load(ffn_down_ptr + kk[:, None] * D_MODEL + d[None, :]).to(tl.float32), axis=0)
-    h = h + ffn_accum + tl.load(ffn_down_bias_ptr + d).to(tl.float32)
+    h = h + ffn_accum
 
     # ── Final Layer Norm ──
     lnf_s = tl.load(ln_final_scale_ptr + d).to(tl.float32)
@@ -163,8 +162,7 @@ def fused_decode(w, token_id, pos, k_cache, v_cache, vocab_size=65):
         w["layer0.attn.q"], w["layer0.attn.k"],
         w["layer0.attn.v"], w["layer0.attn.o"],
         w["layer0.ln2.scale"], w["layer0.ln2.bias"],
-        w["layer0.ffn.up"], w["layer0.ffn.up_bias"],
-        w["layer0.ffn.down"], w["layer0.ffn.down_bias"],
+        w["layer0.ffn.up"], w["layer0.ffn.down"],
         w["ln_final.scale"], w["ln_final.bias"],
         w["_output_proj_padded"],
         jnp.int32(token_id),

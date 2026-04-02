@@ -63,11 +63,9 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
         d_ff = 4 * d_model
         key, k = jax.random.split(key)
         params[f"{prefix}.ffn.up"] = jax.random.normal(k, (d_model, d_ff)) * (d_model ** -0.5)
-        params[f"{prefix}.ffn.up_bias"] = jnp.zeros(d_ff)
 
         key, k = jax.random.split(key)
         params[f"{prefix}.ffn.down"] = jax.random.normal(k, (d_ff, d_model)) * (d_ff ** -0.5)
-        params[f"{prefix}.ffn.down_bias"] = jnp.zeros(d_model)
 
     # final layer norm
     params["ln_final.scale"] = jnp.ones(d_model)
@@ -115,7 +113,7 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads=None):
 
 
 def _transformer_layer(h, ln1_s, ln1_b, wq, wk, wv, wo,
-                       ln2_s, ln2_b, ffn_up, ffn_up_b, ffn_down, ffn_down_b,
+                       ln2_s, ln2_b, ffn_up, ffn_down,
                        n_heads, n_kv_heads, parallel):
     """Single transformer layer with explicit params (for gradient checkpointing)."""
     h_norm = layer_norm(h, ln1_s, ln1_b)
@@ -123,14 +121,14 @@ def _transformer_layer(h, ln1_s, ln1_b, wq, wk, wv, wo,
 
     if parallel:
         h_norm2 = layer_norm(h, ln2_s, ln2_b)
-        h_ff = jax.nn.gelu(h_norm2 @ ffn_up + ffn_up_b)
-        h_ff = h_ff @ ffn_down + ffn_down_b
+        h_ff = jax.nn.gelu(h_norm2 @ ffn_up)
+        h_ff = h_ff @ ffn_down
         h = h + attn_out + h_ff
     else:
         h = h + attn_out
         h_norm2 = layer_norm(h, ln2_s, ln2_b)
-        h_ff = jax.nn.gelu(h_norm2 @ ffn_up + ffn_up_b)
-        h_ff = h_ff @ ffn_down + ffn_down_b
+        h_ff = jax.nn.gelu(h_norm2 @ ffn_up)
+        h_ff = h_ff @ ffn_down
         h = h + h_ff
     return h
 
@@ -147,14 +145,13 @@ def transformer_forward(params, config, x):
         p = f"layer{layer}"
         # Gradient checkpointing: pass only this layer's params to avoid saving
         # the full model params dict at each checkpoint boundary.
-        h = jax.checkpoint(_transformer_layer, static_argnums=(13, 14, 15))(
+        h = jax.checkpoint(_transformer_layer, static_argnums=(11, 12, 13))(
             h,
             params[f"{p}.ln1.scale"], params[f"{p}.ln1.bias"],
             params[f"{p}.attn.q"], params[f"{p}.attn.k"],
             params[f"{p}.attn.v"], params[f"{p}.attn.o"],
             params[f"{p}.ln2.scale"], params[f"{p}.ln2.bias"],
-            params[f"{p}.ffn.up"], params[f"{p}.ffn.up_bias"],
-            params[f"{p}.ffn.down"], params[f"{p}.ffn.down_bias"],
+            params[f"{p}.ffn.up"], params[f"{p}.ffn.down"],
             n_heads, n_kv_heads, parallel,
         )
 
@@ -197,14 +194,14 @@ def prefill_with_kv(params, config, x):
         parallel = config.get("parallel_residual", False)
         if parallel:
             h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"]
             h = h + attn_out + h_ff
         else:
             h = h + attn_out
             h_norm2 = layer_norm(h, params[f"{prefix}.ln2.scale"], params[f"{prefix}.ln2.bias"])
-            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"] + params[f"{prefix}.ffn.up_bias"])
-            h_ff = h_ff @ params[f"{prefix}.ffn.down"] + params[f"{prefix}.ffn.down_bias"]
+            h_ff = jax.nn.gelu(h_norm2 @ params[f"{prefix}.ffn.up"])
+            h_ff = h_ff @ params[f"{prefix}.ffn.down"]
             h = h + h_ff
 
     h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
