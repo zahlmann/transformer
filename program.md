@@ -745,6 +745,15 @@ with these acceptance rates would give 2-3x speedup.
 
 ## What's Next
 
+### On next retraining
+
+- **Remove FFN biases** (up_bias, down_bias) from model.py, all decode/prefill kernels,
+  and repo_explained_from_zero.md. Modern transformers (LLaMA, Mistral) don't use them.
+  At d=768 they're 0.06% of params for zero quality benefit. Simplifies kernel FFN loops
+  (fewer loads/stores per layer).
+
+### Done
+
 The core kernel architecture is complete. All major optimizations explored:
 - Fused multi-layer decode with multi-SM parallelism
 - Persistent and pipelined decode (eliminate host sync)
