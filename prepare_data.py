@@ -273,112 +273,115 @@ def train_tokenizer():
     return tok_path
 
 
+def _tokenize_source(args):
+    """Tokenize a single source (for use with multiprocessing)."""
+    source_name, source_file, tok_path_str, target, chunk_chars = args
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(tok_path_str)
+    path = RAW_DIR / source_file
+    cache_path = TOKEN_DIR / f"{source_name}.npz"
+
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        n = len(cached["train"]) + len(cached["val"])
+        print(f"  {source_name}: cached ({n/1e6:.1f}M tokens)", flush=True)
+        return source_name, n
+
+    print(f"  Tokenizing {source_name}...", flush=True)
+    t0 = time.time()
+
+    token_chunks = []
+    total_tokens = 0
+    n_chars = 0
+    batch_texts = []
+    batch_chars = 0
+
+    with open(path) as f:
+        for line in f:
+            doc = json.loads(line)
+            text = doc["text"]
+            batch_texts.append(text)
+            batch_chars += len(text)
+            n_chars += len(text)
+
+            if batch_chars >= chunk_chars:
+                encodings = tok.encode_batch(batch_texts)
+                for enc in encodings:
+                    chunk_arr = np.array(enc.ids, dtype=np.int32)
+                    token_chunks.append(chunk_arr)
+                    total_tokens += len(chunk_arr)
+                batch_texts = []
+                batch_chars = 0
+                elapsed = time.time() - t0
+                print(f"  {source_name}: {total_tokens/1e6:.0f}M tokens, "
+                      f"{n_chars/1e6:.0f}M chars, {elapsed:.0f}s", flush=True)
+                if total_tokens >= target:
+                    break
+
+    if batch_texts:
+        encodings = tok.encode_batch(batch_texts)
+        for enc in encodings:
+            chunk_arr = np.array(enc.ids, dtype=np.int32)
+            token_chunks.append(chunk_arr)
+            total_tokens += len(chunk_arr)
+
+    tokens = np.concatenate(token_chunks)
+    del token_chunks
+
+    n_val = max(int(len(tokens) * VAL_FRACTION), 10000)
+    val_tok = tokens[:n_val]
+    train_tok = tokens[n_val:]
+
+    np.savez(cache_path, train=train_tok, val=val_tok)
+    print(f"  {source_name}: {len(train_tok)/1e6:.1f}M train + {len(val_tok)/1e6:.1f}M val "
+          f"({time.time()-t0:.0f}s)", flush=True)
+    return source_name, len(tokens)
+
+
 def tokenize_all():
-    """Tokenize all sources and save as numpy arrays."""
+    """Tokenize all sources in parallel and combine."""
+    from concurrent.futures import ProcessPoolExecutor
     from tokenizers import Tokenizer
 
     tok_path = train_tokenizer()
     tok = Tokenizer.from_file(str(tok_path))
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
-    CHUNK_CHARS = 50_000_000  # 50M chars per tokenization chunk (avoid OOM)
+    CHUNK_CHARS = 50_000_000  # 50M chars per tokenization chunk
 
-    all_train_tokens = []
-    all_val_tokens = []
-    source_stats = {}
-
-    for source_name, source_file in [
+    sources = [
         ("fineweb_edu", "fineweb_edu.jsonl"),
         ("wikipedia", "wikipedia.jsonl"),
         ("code", "code.jsonl"),
         ("cosmopedia", "cosmopedia.jsonl"),
-    ]:
-        path = RAW_DIR / source_file
-        if not path.exists():
-            print(f"Skipping {source_name} (not downloaded)")
-            continue
+    ]
 
-        cache_path = TOKEN_DIR / f"{source_name}.npz"
-        if cache_path.exists():
-            print(f"Loading cached tokens for {source_name}...")
-            cached = np.load(cache_path)
-            train_tok = cached["train"]
-            val_tok = cached["val"]
-            source_stats[source_name] = len(train_tok) + len(val_tok)
-            print(f"  {source_name}: {len(train_tok)/1e6:.1f}M train + {len(val_tok)/1e6:.1f}M val tokens")
-            all_train_tokens.append(train_tok)
-            all_val_tokens.append(val_tok)
-            continue
+    # Filter to sources that exist
+    sources = [(name, f) for name, f in sources if (RAW_DIR / f).exists()]
+    source_stats = {}
 
-        print(f"Tokenizing {source_name}...", flush=True)
-        t0 = time.time()
-        target = TARGETS.get(source_name, 200_000_000)
+    # Tokenize sources in parallel (each uses encode_batch internally)
+    print(f"Tokenizing {len(sources)} sources in parallel...", flush=True)
+    args_list = [
+        (name, f, str(tok_path), TARGETS.get(name, 200_000_000), CHUNK_CHARS)
+        for name, f in sources
+    ]
 
-        # Tokenize in chunks, storing as numpy arrays to avoid Python list OOM
-        # (Python list of 1B ints uses ~30GB; numpy int32 uses ~4GB)
-        token_chunks = []
-        total_tokens = 0
-        n_chars = 0
-        chunk_text = []
-        chunk_chars = 0
+    with ProcessPoolExecutor(max_workers=len(sources)) as pool:
+        for source_name, n_tokens in pool.map(_tokenize_source, args_list):
+            source_stats[source_name] = n_tokens
 
-        with open(path) as f:
-            for line in f:
-                doc = json.loads(line)
-                text = doc["text"]
-                chunk_text.append(text)
-                chunk_chars += len(text)
-                n_chars += len(text)
-
-                if chunk_chars >= CHUNK_CHARS:
-                    combined = "\n".join(chunk_text)
-                    encoded = tok.encode(combined)
-                    chunk_arr = np.array(encoded.ids, dtype=np.int32)
-                    token_chunks.append(chunk_arr)
-                    total_tokens += len(chunk_arr)
-                    chunk_text = []
-                    chunk_chars = 0
-                    elapsed = time.time() - t0
-                    print(f"  {total_tokens/1e6:.0f}M tokens, {n_chars/1e6:.0f}M chars, "
-                          f"{elapsed:.0f}s", flush=True)
-                    if total_tokens >= target:
-                        break
-
-        # Flush remaining chunk
-        if chunk_text:
-            combined = "\n".join(chunk_text)
-            encoded = tok.encode(combined)
-            chunk_arr = np.array(encoded.ids, dtype=np.int32)
-            token_chunks.append(chunk_arr)
-            total_tokens += len(chunk_arr)
-
-        tokens = np.concatenate(token_chunks)
-        del token_chunks
-
-        # Split train/val
-        n_val = max(int(len(tokens) * VAL_FRACTION), 10000)
-        val_tok = tokens[:n_val]
-        train_tok = tokens[n_val:]
-
-        np.savez(cache_path, train=train_tok, val=val_tok)
-        source_stats[source_name] = len(tokens)
-        del tokens
-        print(f"  {source_name}: {len(train_tok)/1e6:.1f}M train + {len(val_tok)/1e6:.1f}M val "
-              f"({time.time()-t0:.0f}s)", flush=True)
-
-        all_train_tokens.append(train_tok)
-        all_val_tokens.append(val_tok)
-
-    # Combine all sources — load from cache files to avoid keeping everything in RAM
-    print("\nCombining all sources...", flush=True)
+    # Combine — load from cache files to avoid keeping everything in RAM
     all_train_tokens = []
     all_val_tokens = []
-    for source_name in ["fineweb_edu", "wikipedia", "code", "cosmopedia"]:
+    for source_name, _ in sources:
         cache_path = TOKEN_DIR / f"{source_name}.npz"
         if cache_path.exists():
             cached = np.load(cache_path)
             all_train_tokens.append(cached["train"])
             all_val_tokens.append(cached["val"])
+
+    print("\nCombining all sources...", flush=True)
     train_combined = np.concatenate(all_train_tokens)
     val_combined = np.concatenate(all_val_tokens)
     del all_train_tokens, all_val_tokens
