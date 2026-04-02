@@ -305,6 +305,13 @@ def _multi_sm_decode(
         tl.store(next_token_ptr, global_best_idx.to(tl.int32))
 
 
+# NOTE: An in-kernel paged KV variant (_multi_sm_decode_paged) was tried
+# but the Triton compiler generated 2.5x slower code with indirect page table
+# addressing. The GPU-accelerated paging approach in paged_kv.py (JIT-compiled
+# gather/scatter) is used instead — it keeps the fast contiguous decode kernel
+# unchanged and adds only ~0.4ms overhead per step.
+
+
 def _next_power_of_2(n):
     """Return smallest power of 2 >= n."""
     p = 1

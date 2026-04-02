@@ -40,6 +40,7 @@ Build the fastest possible inference for this transformer using custom Triton ke
 24. Triton prefill kernel for GQA + D_BLOCK padding (12.9ms vs JAX 30.4ms, 2.4x)
 25. Tensor core batched projections (single 2D tl.dot for Q/K/V, +8-12% batched)
 26. Paged KV cache (PagePool, 64-position pages, 87% memory reduction for short seqs)
+27. GPU-accelerated paged KV (JIT gather/scatter, 3.5x faster than CPU paging, 693 tok/s)
 
 ### Tried but didn't help (single-sequence decode)
 
@@ -637,16 +638,54 @@ between paged and contiguous representations before/after each kernel call.
   Paged allocation:      4 pages × 0.6 MB = 2.4 MB (87% memory reduction)
 ```
 
-**Limitation:** Python-level paging adds conversion overhead (~2x slower for short
-sequences). Kernel-level paging (page table in the attention loop) would eliminate
-this overhead and is the logical next optimization.
+**Limitation:** Python-level paging adds conversion overhead (~5x slower at d=768
+due to CPU numpy loops for to_contiguous/update_from_contiguous).
+
+---
+
+## COMPLETED: GPU-Accelerated Paged KV (2026-04-02)
+
+Replaced CPU numpy paging with JIT-compiled JAX gather/scatter on the GPU pool.
+The decode kernel is unchanged — it still receives contiguous KV buffers. The
+paging overhead is in the conversion between paged and contiguous formats.
+
+Two approaches were tried:
+1. **In-kernel page table lookups** (tried, abandoned): Modified the multi-SM decode
+   kernel to read KV from a paged pool via per-tile page table lookups. Correctness
+   was verified (max logit diff 0.035), but the Triton compiler generated 2.5x slower
+   code. The indirect addressing pattern (load page ID → multiply by PAGE_ELEMS →
+   compute base → load KV tile) prevented compiler optimizations compared to the
+   simple strided access in the contiguous kernel.
+
+2. **JIT-compiled GPU gather/scatter** (used): Keep the fast contiguous decode kernel
+   unchanged. Use `@jax.jit` compiled `pool[gather_idx]` for paged→contiguous and
+   `pool.at[scatter_idx].set(values)` for contiguous→paged. Gather indices are
+   precomputed with vectorized numpy and cached per page table configuration.
+
+```
+XXL model (d=768, 12L, single-sequence decode):
+  Contiguous:     1028 tok/s (0.97 ms/tok) — baseline
+  Python paged:    198 tok/s (5.06 ms/tok) — CPU numpy loops
+  GPU paged:       693 tok/s (1.44 ms/tok) — JIT gather/scatter
+
+  GPU paged breakdown per step:
+    to_contiguous_gpu:  0.07 ms  (JIT-compiled gather, cached indices)
+    decode kernel:      1.00 ms  (identical to contiguous baseline)
+    update_page_gpu:    0.37 ms  (JIT-compiled scatter, pool copy)
+
+  GPU paged speedup vs Python: 3.5x
+  GPU paged overhead vs contiguous: 43% (0.44 ms/step from gather + scatter)
+```
+
+The 0.37 ms scatter overhead comes from JAX's functional update (`pool.at[].set()`)
+which copies the entire pool (~5 MB) to create a new array. The actual GPU scatter
+(9 KB into 5 MB) takes < 0.01 ms — the rest is XLA dispatch overhead.
 
 ---
 
 ## What's Next
 
 The core kernel architecture is complete. Potential future directions:
-- **Kernel-level paged KV**: pass page table to attention loop for zero-copy paging
 - **Continuous batching**: replace finished sequences with new ones mid-generation
 - **Speculative decoding revisit**: with larger target model, the speed ratio improves
 
@@ -718,6 +757,7 @@ generate.py                          — streaming text generation API + CLI
 serve.py                             — variable-length batched inference server (BatchedServer)
 profile_kernels.py                   — primary profiling tool (run after every change)
 inference_benchmark.py               — quick throughput benchmark
+test_paged_kernel.py                 — paged KV correctness test + benchmark
 baseline_metrics.txt                 — current numbers to beat
 ```
 
@@ -1057,3 +1097,27 @@ baseline_metrics.txt                 — current numbers to beat
     BW util caps at ~30% (pipelined) because ~38% of step time is barrier overhead
     and the rest is HBM-limited streaming. Only quantization (forbidden for learning
     purposes) or reducing model size would fundamentally change this.
+
+58. **In-kernel page table lookups make Triton 2.5x slower.** Replacing contiguous
+    KV addressing (`base + t * D_HEAD`) with indirect paged addressing (`pool[page_table[t//64] * PAGE_ELEMS + ...]`) caused the Triton compiler to generate
+    a 2.5x slower kernel, even though the memory access pattern and data volume
+    are identical. The indirect load (page table → multiply → base address) prevents
+    Triton from optimizing the address progression. Verified with block_until_ready
+    profiling: the GPU kernel itself is 2.1x slower, not host overhead. Lesson:
+    Triton's compiler generates very different code for indirect vs strided access
+    patterns — keep hot-loop addressing simple and strided.
+
+59. **JIT-compiled JAX gather beats Triton copy kernel for paged→contiguous.** A
+    Triton kernel with per-page-per-head copy loops took ~0.8ms per call (dispatch
+    overhead). A `@jax.jit`-compiled `pool[precomputed_gather_indices]` takes 0.07ms
+    — 11x faster. The gather indices (2.4M int32 for d=768) are expensive to compute
+    in Python (~15ms with vectorized numpy) but are cached per page table configuration
+    and only rebuild when pages are allocated (every 64 decode steps). XLA compiles
+    the gather into a single GPU memcpy-like operation.
+
+60. **JAX's .at[].set() scatter copies the entire array.** Updating 9KB (one position's
+    KV) in a 5MB pool takes 0.37ms because JAX's functional update creates a new
+    5MB array. The actual GPU scatter (9KB write) takes <0.01ms — the rest is XLA
+    dispatch overhead. This is the fundamental cost of paging with immutable arrays.
+    Mutable GPU buffers (via CUDA) would eliminate this but break JAX's functional
+    model.
