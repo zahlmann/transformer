@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-BLOCK_K      = tl.constexpr(32)
+BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
 
@@ -85,7 +85,7 @@ def _persistent_decode(
         D_MODEL + D_MODEL +
         D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
         D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF + D_FF * D_MODEL + D_MODEL
+        D_MODEL * D_FF + D_FF * D_MODEL
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
@@ -146,9 +146,7 @@ def _persistent_decode(
             ln2_s_off = off;    off += D_MODEL
             ln2_b_off = off;    off += D_MODEL
             up_off = off;       off += D_MODEL * D_FF
-            up_b_off = off;     off += D_FF
             down_off = off;     off += D_FF * D_MODEL
-            down_b_off = off
 
             # ── PHASE 1: LN1 + Attention ──
             ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
@@ -267,7 +265,6 @@ def _persistent_decode(
                 up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
                                mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-                up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
                 act = up * tl.sigmoid(1.702 * up)
                 down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
                                  mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
@@ -287,7 +284,7 @@ def _persistent_decode(
             ffn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
             for i in tl.range(TOTAL_BLOCKS):
                 ffn_total += tl.load(partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
-            h = h + ffn_total + tl.load(packed_w_ptr + down_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
+            h = h + ffn_total
 
         # ── OUTPUT: Final LN + tiled output projection + argmax ──
         ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)

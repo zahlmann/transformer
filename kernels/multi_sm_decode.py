@@ -24,9 +24,10 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-BLOCK_K      = tl.constexpr(32)
+BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
+PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEAD > 64KB
 
 
 @triton.jit
@@ -86,7 +87,7 @@ def _multi_sm_decode(
         D_MODEL + D_MODEL +
         D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
         D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF + D_FF * D_MODEL + D_MODEL
+        D_MODEL * D_FF + D_FF * D_MODEL
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
@@ -110,9 +111,7 @@ def _multi_sm_decode(
         ln2_s_off = off;    off += D_MODEL
         ln2_b_off = off;    off += D_MODEL
         up_off = off;       off += D_MODEL * D_FF
-        up_b_off = off;     off += D_FF
         down_off = off;     off += D_FF * D_MODEL
-        down_b_off = off
 
         # ── PHASE 1: LN1 + Attention ──
         ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
@@ -127,17 +126,30 @@ def _multi_sm_decode(
         kv_head = head_id // GQA_GROUP
         kv_hd = kv_head * D_HEAD + dh
         cache_off = kv_head * MAX_SEQ * D_HEAD
-        h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
-        wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :],
-                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        Q = tl.dot(h_norm_2d, wq).to(tl.float32).sum(axis=0)
-        wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :],
-                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        K_new = tl.dot(h_norm_2d, wk).to(tl.float32).sum(axis=0)
-        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :],
-                      mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
+        # Tile Q/K/V projections along D_BLOCK to fit in shared memory.
+        # At D_BLOCK=1024, D_HEAD=64: full (1024,64) bf16 = 128KB > 101KB smem.
+        # PROJ_TILE=512: (512,64) bf16 = 64KB, fits.
+        # Store h_norm to workspace so we can reload per tile.
+        tl.store(partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
+
+        Q = tl.zeros((D_HEAD,), dtype=tl.float32)
+        K_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+        V_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+        for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+            dt = dd + tl.arange(0, PROJ_TILE)
+            dt_mask = dt < D_MODEL
+            h_tile = tl.load(partial_ptr + pid * D_BLOCK + dt,
+                             mask=dt_mask, other=0.0).to(tl.bfloat16)
+            wq_t = tl.load(packed_w_ptr + wq_off + dt[:, None] * D_MODEL + hd[None, :],
+                           mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            Q += tl.dot(h_tile[None, :], wq_t).to(tl.float32).sum(axis=0)
+            wk_t = tl.load(packed_w_ptr + wk_off + dt[:, None] * D_KV + kv_hd[None, :],
+                           mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            K_new += tl.dot(h_tile[None, :], wk_t).to(tl.float32).sum(axis=0)
+            wv_t = tl.load(packed_w_ptr + wv_off + dt[:, None] * D_KV + kv_hd[None, :],
+                           mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            V_new += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
 
         tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
         tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
@@ -180,11 +192,14 @@ def _multi_sm_decode(
 
         attn_out = o_i / tl.maximum(l_i, 1e-10)
 
-        wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :],
-                      mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
-        o_proj = tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
-
-        tl.store(partial_ptr + pid * D_BLOCK + d, o_proj, mask=d_mask)
+        # Tile O projection along D_BLOCK (same shared memory constraint as Q/K/V)
+        for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+            dt = dd + tl.arange(0, PROJ_TILE)
+            dt_mask = dt < D_MODEL
+            wo_t = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + dt[None, :],
+                           mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+            o_tile = tl.dot(attn_out[None, :].to(tl.bfloat16), wo_t).to(tl.float32).sum(axis=0)
+            tl.store(partial_ptr + pid * D_BLOCK + dt, o_tile, mask=dt_mask)
         tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
         tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
@@ -232,7 +247,6 @@ def _multi_sm_decode(
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
                            mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
             up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-            up += tl.load(packed_w_ptr + up_b_off + kk).to(tl.float32)
             act = up * tl.sigmoid(1.702 * up)
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
                              mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
@@ -252,8 +266,7 @@ def _multi_sm_decode(
         ffn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
         for i in tl.range(TOTAL_BLOCKS):
             ffn_total += tl.load(partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
-        down_b = tl.load(packed_w_ptr + down_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        h = h + ffn_total + down_b
+        h = h + ffn_total
 
     # ── OUTPUT ──
     ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
