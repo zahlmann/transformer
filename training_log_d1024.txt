@@ -1,0 +1,28 @@
+Training run: 2026-04-02 to 2026-04-03
+Model: d=1024, h=16, kv_h=4, l=16, ctx=512, vocab=32000
+Params: 242,288,640
+Dataset: combined (1.77B tokens: 60% FineWeb-Edu, 18% Cosmopedia, 17% Wikipedia, 6% Code)
+Epochs: 1 (215,900 steps)
+Batch size: 16
+LR: 3e-4 with 2000 step warmup + cosine decay
+Weight decay: 0.1
+Hardware: RTX 4080 Super (16 GB VRAM)
+
+Results:
+  Final train loss: 3.1733
+  Val loss: 3.0402
+  Perplexity: 20.91
+  Training time: 49,346s (13.7 hours)
+  Speed: 4.4 steps/s (~36K tok/s)
+  Peak VRAM: 7,954 MB (50% utilization)
+
+Loss curve (every 10K steps):
+  step 1000:   7.2645
+  step 10000:  4.9141
+  step 20000:  4.3258
+  step 50000:  3.7768
+  step 100000: 3.4818
+  step 150000: 3.3223
+  step 200000: 3.2035
+  step 215000: 3.1749
+  final:       3.1733
