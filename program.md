@@ -59,39 +59,23 @@ Train a high-quality decoder-only transformer on one GPU, serve it with custom T
 ### Current Performance (RTX 4080 Super)
 
 ```
-XXL model (d=768, h=24, l=12, ctx=512, GQA 6 KV heads, 81.1M params, ppl=2.60):
-  Multi-SM sync:       1024 tok/s (0.98 ms/tok, 20% BW util)
-  Pipelined:           1503 tok/s (0.67 ms/tok, ~30% BW util)
-  Persistent:          1370 tok/s (0.73 ms/tok)
-  Pipelined B=4:       2306 tok/s (1.74 ms/step)
-  Persist B=4:         2436 tok/s (1.64 ms/step)
-  Pipelined B=8:       2571 tok/s (3.11 ms/step)
-  Persist B=8:         2687 tok/s (2.98 ms/step)
-  Prefill (128 tok):   30.9 ms   (4148 tok/s)
-  Weight buffer:       162.2 MB  (bf16, exceeds L2!)
-  KV cache:            4.7 MB    (bf16, per sequence)
-  Bandwidth util:      20%       (of 836 GB/s theoretical)
+CURRENT MODEL (d=1024, h=16, l=16, ctx=512, GQA 4 KV heads, 242M params, ppl=20.91):
+  Multi-SM sync:       501 tok/s (2.00 ms/tok, 30% BW util)
+  Pipelined:           618 tok/s (1.62 ms/tok, 1.23x)
+  Persistent:          613 tok/s (1.63 ms/tok, 1.22x)
+  Batched B=4 sync:    856 tok/s (4.68 ms/step, 1.71x)
+  Batched B=4 pipe:    952 tok/s (4.20 ms/step, 1.90x)
+  Persist B=4:         992 tok/s (4.03 ms/step, 1.98x)
+  Persist B=8:        1097 tok/s (7.30 ms/step, 2.19x)
+  Prefill (128 tok):   23.2 ms  (5516 tok/s, Triton)
+  Weight buffer:       484.6 MB (bf16, 7.6x L2 cache)
+  KV cache:            8.4 MB   (bf16, per sequence)
+  Bandwidth util:      30%      (of 836 GB/s theoretical)
+  Training:            36K tok/s (bf16 forward, bs=16)
 
-XL model (d=512, h=16, l=8, ctx=512, GQA 4 KV heads, 26.5M params, ppl=2.96):
-  Multi-SM sync:       1834 tok/s (0.55 ms/tok, 12% BW util)
-  Persistent:          5129 tok/s (0.20 ms/tok)
-  Persistent B=4:      7351 tok/s (0.54 ms/step)
-  Persistent B=8:      7862 tok/s (1.02 ms/step)
-
-XL-ctx model (d=512, h=16, l=8, ctx=2048, GQA 4 KV heads, 27.3M params, ppl=2.84):
-  Multi-SM sync:       1569 tok/s (0.64 ms/tok, 12% BW util)
-  Pipelined:           2693 tok/s (0.37 ms/tok)
-  Persistent:          3133 tok/s (0.32 ms/tok)
-  Persistent B=4:      4560 tok/s (0.88 ms/step)
-  Persistent B=8:      4630 tok/s (1.73 ms/step)
-  KV cache:            8.4 MB (bf16, per seq, 4x vs ctx=512)
-
-Previous model sizes:
-  d=64,  1L:    3056 tok/s
-  d=128, 2L:    2589 tok/s
-  d=256, 4L:    1396 tok/s
-  d=512, 8L:     287 tok/s  → 1734 → 1851 → 5129 tok/s (persistent)
-  d=768, 12L:   1006 tok/s  → 2460 tok/s (persistent B=8)
+Previous models:
+  d=768, 12L, 81M:   1024 sync → 1503 pipe → 2687 persist-B=8 (20% BW)
+  d=512,  8L, 27M:   1834 sync → 5129 persistent → 7862 persist-B=8 (12% BW)
 ```
 
 **Key findings:**
@@ -862,10 +846,10 @@ kernels/paged_kv.py                  — paged KV cache memory management (PageP
 generate.py                          — streaming text generation API + CLI
 serve.py                             — variable-length batched inference server (BatchedServer)
 profile_kernels.py                   — primary profiling tool (run after every change)
-inference_benchmark.py               — quick throughput benchmark
-speculative_decode.py                — speculative decoding benchmark (d=512 draft + d=768 target)
-test_paged_kernel.py                 — paged KV correctness test + benchmark
+profile_vram.py                      — VRAM profiling for model scaling decisions
+prepare_data.py                      — multi-source training data download + tokenization
 baseline_metrics.txt                 — current numbers to beat
+training_log_d1024.txt               — epoch 1 training log
 ```
 
 ---
@@ -1244,3 +1228,30 @@ baseline_metrics.txt                 — current numbers to beat
     is only 1.6x. The small-model regime (both <100M params) has high throughput for
     all models, compressing the speed ratio. Production-scale models (70B→7B, 10-20x
     ratio) would see 2-3x speedup at 71% acceptance.
+
+63. **At D_HEAD=64, attention weight matrices overflow shared memory.** At d=1024
+    with 16 heads, D_HEAD=64. Weight matrix `(D_BLOCK, D_HEAD) = (1024, 64)` bf16
+    = 128KB > 101KB shared memory limit. At d=768 with 24 heads, D_HEAD=32 was fine
+    ((1024, 32) = 64KB). Fix: tile projections along D_BLOCK with PROJ_TILE=512.
+    Each tile loads (512, 64) = 64KB. Store h_norm to workspace buffer, reload per
+    tile. Adds ~10% overhead from extra loads but enables any D_HEAD size.
+
+64. **Batched projection tiling must separate Q, K, V into independent loops.**
+    When Q/K/V weight tiles are loaded in a single `tl.static_range` loop, the
+    compiler unrolls the loop and keeps all three tiles alive simultaneously:
+    3 × 64KB = 192KB > 101KB. Splitting into 3 separate tiling loops (one per
+    projection) ensures only one 64KB tile is in shared memory at a time.
+
+65. **At d=1024, pipelined and persistent decode are nearly identical (1.22-1.23x).**
+    Persistent's in-kernel overhead (barriers, argmax, step-sync) takes ~5% of the
+    ~2ms/step, same proportion as the host sync it eliminates. Both pipelined and
+    persistent give ~1.22x over sync'd. The persistent technique's advantage over
+    pipelined vanishes when step time is long enough (~2ms) that host dispatch
+    overlaps almost completely with kernel execution.
+
+66. **Batched decode scaling is sublinear at d=1024 due to HBM-bound weights.**
+    B=4: 1.71-1.98x, B=8: 2.19x, B=16: 2.10x (worse than B=8). With 485MB weights
+    far exceeding 64MB L2, every step must stream all weights from HBM regardless
+    of batch size. The per-sequence attention cost (8.4MB KV × B) adds linearly.
+    At B=16, the KV overhead (134MB) is 28% of total, explaining the B=16 regression.
+    The d=512 model (55MB weights, fits in L2) scaled much better: B=4 gave 3.6x.
