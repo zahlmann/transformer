@@ -54,6 +54,8 @@ def prepare_data(context_len=128, val_fraction=0.1, tokenizer="char",
     """
     if dataset == "combined":
         return _prepare_combined(context_len)
+    if dataset == "combined_epoch2":
+        return _prepare_combined(context_len, epoch=2)
 
     if dataset == "tinystories":
         train_text, val_text = load_tinystories()
@@ -255,13 +257,14 @@ def _prepare_trained_bpe_from_texts(train_text, val_text, context_len, vocab_siz
     }
 
 
-def _prepare_combined(context_len):
+def _prepare_combined(context_len, epoch=1):
     """Load the pre-tokenized multi-source dataset (from prepare_data.py)."""
     from tokenizers import Tokenizer
 
     token_dir = os.path.join(DATA_DIR, "tokens")
-    combined_path = os.path.join(token_dir, "combined.npz")
-    meta_path = os.path.join(token_dir, "metadata.json")
+    suffix = "_epoch2" if epoch == 2 else ""
+    combined_path = os.path.join(token_dir, f"combined{suffix}.npz")
+    meta_path = os.path.join(token_dir, f"metadata{suffix}.json")
 
     if not os.path.exists(combined_path):
         raise FileNotFoundError(

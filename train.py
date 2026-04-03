@@ -34,9 +34,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--dataset", default="tinystories", choices=["shakespeare", "tinystories", "combined"])
+    parser.add_argument("--dataset", default="tinystories",
+                        choices=["shakespeare", "tinystories", "combined", "combined_epoch2"])
     parser.add_argument("--tokenizer", default="trained_bpe", choices=["char", "bpe", "trained_bpe"])
     parser.add_argument("--bpe-vocab", type=int, default=4096)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to weights.pkl checkpoint to resume from")
     args = parser.parse_args()
 
     # data
@@ -53,10 +56,19 @@ def main():
         f"warmup {args.warmup_steps} >= total steps {total_steps}"
 
     # model
-    key, init_key = jax.random.split(jax.random.key(args.seed))
-    params, config = init_transformer(
-        init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
-        n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads)
+    if args.resume:
+        print(f"Resuming from {args.resume}")
+        with open(args.resume, "rb") as f:
+            ckpt = pickle.load(f)
+        params = jax.tree.map(jnp.array, ckpt["params"])
+        config = ckpt["config"]
+        assert config["d_model"] == args.d_model, \
+            f"checkpoint d_model={config['d_model']} != --d-model={args.d_model}"
+    else:
+        key, init_key = jax.random.split(jax.random.key(args.seed))
+        params, config = init_transformer(
+            init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
+            n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads)
 
     # optimizer: linear warmup + cosine decay
     schedule = optax.join_schedules(
