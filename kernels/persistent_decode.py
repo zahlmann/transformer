@@ -25,6 +25,7 @@ import jax_triton as jt
 BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
+PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEAD > 64KB
 
 
 @triton.jit
@@ -156,17 +157,28 @@ def _persistent_decode(
             h_norm = tl.where(d_mask,
                               ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
                               0.0)
-            h_norm_2d = h_norm[None, :].to(tl.bfloat16)
+            # Tile Q/K/V projections along D_BLOCK to fit in shared memory.
+            # At D_BLOCK=1024, D_HEAD=64: full (1024,64) bf16 = 128KB > 101KB smem.
+            # PROJ_TILE=512: (512,64) bf16 = 64KB, fits.
+            tl.store(partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
 
-            wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            Q = tl.dot(h_norm_2d, wq).to(tl.float32).sum(axis=0)
-            wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            K_new = tl.dot(h_norm_2d, wk).to(tl.float32).sum(axis=0)
-            wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)
+            Q = tl.zeros((D_HEAD,), dtype=tl.float32)
+            K_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+            V_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                h_tile = tl.load(partial_ptr + pid * D_BLOCK + dt,
+                                 mask=dt_mask, other=0.0).to(tl.bfloat16)
+                wq_t = tl.load(packed_w_ptr + wq_off + dt[:, None] * D_MODEL + hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                Q += tl.dot(h_tile[None, :], wq_t).to(tl.float32).sum(axis=0)
+                wk_t = tl.load(packed_w_ptr + wk_off + dt[:, None] * D_KV + kv_hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                K_new += tl.dot(h_tile[None, :], wk_t).to(tl.float32).sum(axis=0)
+                wv_t = tl.load(packed_w_ptr + wv_off + dt[:, None] * D_KV + kv_hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                V_new += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
 
             # Write K_new/V_new at pos before attention.
             tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
@@ -213,11 +225,14 @@ def _persistent_decode(
 
             attn_out = o_i / tl.maximum(l_i, 1e-10)
 
-            wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :],
-                          mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
-            o_proj = tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
-
-            tl.store(partial_ptr + pid * D_BLOCK + d, o_proj, mask=d_mask)
+            # Tile O projection along D_BLOCK (same shared memory constraint as Q/K/V)
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                wo_t = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + dt[None, :],
+                               mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+                o_tile = tl.dot(attn_out[None, :].to(tl.bfloat16), wo_t).to(tl.float32).sum(axis=0)
+                tl.store(partial_ptr + pid * D_BLOCK + dt, o_tile, mask=dt_mask)
             tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
             tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 

@@ -46,20 +46,35 @@ def load_params():
 
 
 def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
-    """Measure prefill latency. Uses Triton prefill for all models (including GQA)."""
+    """Measure prefill latency. Uses Triton prefill if it fits in shared memory,
+    otherwise falls back to JAX prefill."""
     x = jnp.pad(prompt, (0, config["context_len"] - len(prompt))).astype(jnp.int32)
 
-    for _ in range(3):
-        logits, kc, vc = block_prefill(params, config, x, vocab_size)
-        _ = logits.block_until_ready()
-    times = []
-    for _ in range(n_runs):
-        t0 = time.perf_counter()
-        logits, kc, vc = block_prefill(params, config, x, vocab_size)
-        _ = logits.block_until_ready()
-        times.append(time.perf_counter() - t0)
-
-    return np.median(times) * 1000, logits, kc, vc
+    try:
+        for _ in range(3):
+            logits, kc, vc = block_prefill(params, config, x, vocab_size)
+            _ = logits.block_until_ready()
+        times = []
+        for _ in range(n_runs):
+            t0 = time.perf_counter()
+            logits, kc, vc = block_prefill(params, config, x, vocab_size)
+            _ = logits.block_until_ready()
+            times.append(time.perf_counter() - t0)
+        print(f"  (using Triton prefill)")
+        return np.median(times) * 1000, logits, kc, vc
+    except Exception:
+        # Fall back to JAX prefill (needed when D_BLOCK*D_HEAD exceeds shared memory)
+        for _ in range(3):
+            logits, kc, vc = prefill_with_kv(params, config, x)
+            _ = logits.block_until_ready()
+        times = []
+        for _ in range(n_runs):
+            t0 = time.perf_counter()
+            logits, kc, vc = prefill_with_kv(params, config, x)
+            _ = logits.block_until_ready()
+            times.append(time.perf_counter() - t0)
+        print(f"  (using JAX prefill — Triton prefill overflows shared memory at d={config['d_model']})")
+        return np.median(times) * 1000, logits, kc, vc
 
 
 def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10,

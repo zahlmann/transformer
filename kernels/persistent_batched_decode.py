@@ -37,6 +37,7 @@ import jax_triton as jt
 BLOCK_K      = tl.constexpr(16)
 KV_TILE      = tl.constexpr(64)
 OUTPUT_VTILE = tl.constexpr(32)
+PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEAD > 64KB
 
 
 @triton.jit
@@ -210,33 +211,59 @@ def _persistent_batched_decode(
                                   0.0)
                 tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
-            # 1b-d. Batched Q/K/V projections — single tl.dot per weight matrix
-            b_range = tl.arange(0, BATCH_SIZE)
-            h_batch = tl.load(h_norm_ptr + b_range[:, None] * D_BLOCK + d[None, :],
-                              mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
+            # 1b-d. Tiled Q/K/V projections along D_BLOCK to fit in shared memory.
+            # PROJ_TILE=512: (512,64) bf16 = 64KB, fits in 101KB smem.
+            # Load one weight matrix tile at a time, apply to all B sequences.
 
-            # Q projection
-            wq = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            Q_batch = tl.dot(h_batch, wq).to(tl.float32)
-            tl.store(qkv_tmp_ptr + b_range[:, None] * D_HEAD + dh[None, :], Q_batch)
+            # Q projection (tiled)
+            for b in tl.range(0, BATCH_SIZE):
+                tl.store(qkv_tmp_ptr + b * D_HEAD + dh, tl.zeros((D_HEAD,), dtype=tl.float32))
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                wq_t = tl.load(packed_w_ptr + wq_off + dt[:, None] * D_MODEL + hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                for b in tl.range(0, BATCH_SIZE):
+                    h_tile = tl.load(h_norm_ptr + b * D_BLOCK + dt,
+                                     mask=dt_mask, other=0.0).to(tl.bfloat16)
+                    Q_acc = tl.load(qkv_tmp_ptr + b * D_HEAD + dh)
+                    Q_acc += tl.dot(h_tile[None, :], wq_t).to(tl.float32).sum(axis=0)
+                    tl.store(qkv_tmp_ptr + b * D_HEAD + dh, Q_acc)
 
-            # K projection + store to KV cache
-            wk = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            K_batch = tl.dot(h_batch, wk).to(tl.float32)
-            tl.store(qkv_tmp_ptr + (BATCH_SIZE + b_range[:, None]) * D_HEAD + dh[None, :], K_batch)
+            # K projection (tiled) + store to KV cache
+            for b in tl.range(0, BATCH_SIZE):
+                tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, tl.zeros((D_HEAD,), dtype=tl.float32))
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                wk_t = tl.load(packed_w_ptr + wk_off + dt[:, None] * D_KV + kv_hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                for b in tl.range(0, BATCH_SIZE):
+                    h_tile = tl.load(h_norm_ptr + b * D_BLOCK + dt,
+                                     mask=dt_mask, other=0.0).to(tl.bfloat16)
+                    K_acc = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
+                    K_acc += tl.dot(h_tile[None, :], wk_t).to(tl.float32).sum(axis=0)
+                    tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, K_acc)
             for b in tl.range(0, BATCH_SIZE):
                 kv_b = b * TOTAL_KV_SIZE
                 K_new = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
                 tl.store(kv_out_ptr + kv_b + kc_base + cache_off + pos * D_HEAD + dh,
                          K_new.to(tl.bfloat16))
 
-            # V projection + store to KV cache
-            wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :],
-                          mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-            V_batch = tl.dot(h_batch, wv).to(tl.float32)
-            tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b_range[:, None]) * D_HEAD + dh[None, :], V_batch)
+            # V projection (tiled) + store to KV cache
+            for b in tl.range(0, BATCH_SIZE):
+                tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh, tl.zeros((D_HEAD,), dtype=tl.float32))
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                wv_t = tl.load(packed_w_ptr + wv_off + dt[:, None] * D_KV + kv_hd[None, :],
+                               mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+                for b in tl.range(0, BATCH_SIZE):
+                    h_tile = tl.load(h_norm_ptr + b * D_BLOCK + dt,
+                                     mask=dt_mask, other=0.0).to(tl.bfloat16)
+                    V_acc = tl.load(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh)
+                    V_acc += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
+                    tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh, V_acc)
             for b in tl.range(0, BATCH_SIZE):
                 kv_b = b * TOTAL_KV_SIZE
                 V_new = tl.load(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh)
@@ -298,13 +325,16 @@ def _persistent_batched_decode(
                 tl.store(attn_ml_ptr + (b * TOTAL_BLOCKS + pid) * 2, tl.sum(m_i))
                 tl.store(attn_ml_ptr + (b * TOTAL_BLOCKS + pid) * 2 + 1, tl.sum(l_i))
 
-            # 1f. O projection
-            wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :],
-                          mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
-            for b in tl.range(0, BATCH_SIZE):
-                attn_out = tl.load(qkv_tmp_ptr + b * D_HEAD + dh)
-                o_proj = tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
-                tl.store(partial_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + d, o_proj, mask=d_mask)
+            # 1f. Tiled O projection along D_BLOCK (same shared memory constraint)
+            for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+                dt = dd + tl.arange(0, PROJ_TILE)
+                dt_mask = dt < D_MODEL
+                wo_t = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + dt[None, :],
+                               mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+                for b in tl.range(0, BATCH_SIZE):
+                    attn_out = tl.load(qkv_tmp_ptr + b * D_HEAD + dh)
+                    o_tile = tl.dot(attn_out[None, :].to(tl.bfloat16), wo_t).to(tl.float32).sum(axis=0)
+                    tl.store(partial_ptr + (b * TOTAL_BLOCKS + pid) * D_BLOCK + dt, o_tile, mask=dt_mask)
 
             # ── Split barrier ──
             b0 = b_off + layer * 2

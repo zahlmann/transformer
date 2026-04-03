@@ -24,6 +24,7 @@ import jax_triton as jt
 
 BLOCK_K    = tl.constexpr(32)
 VOCAB_TILE = tl.constexpr(128)
+PROJ_TILE  = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEAD > 64KB
 
 
 @triton.jit
@@ -31,7 +32,7 @@ def _proj_kernel(
     h_ptr,
     ln_scale_ptr, ln_bias_ptr,
     wq_ptr, wk_ptr, wv_ptr,
-    q_buf_ptr, k_cache_ptr, v_cache_ptr,
+    h_norm_buf_ptr, q_buf_ptr, k_cache_ptr, v_cache_ptr,
     D_MODEL: tl.constexpr,
     D_BLOCK: tl.constexpr,
     D_HEAD: tl.constexpr,
@@ -40,8 +41,14 @@ def _proj_kernel(
     D_KV: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
+    TILE_PROJ: tl.constexpr,
 ):
-    """LN1 + Q/K/V projections for a block of rows. Supports GQA + non-power-of-2 D_MODEL."""
+    """LN1 + Q/K/V projections for a block of rows. Supports GQA + non-power-of-2 D_MODEL.
+
+    When D_BLOCK*D_HEAD*2 > 101KB (shared memory limit), projection weights are tiled
+    along D_BLOCK with TILE_PROJ. h_norm is stored to h_norm_buf and reloaded per tile.
+    At (512, 64) bf16 = 64KB, each tile fits in shared memory.
+    """
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     d = tl.arange(0, D_BLOCK)
@@ -59,27 +66,44 @@ def _proj_kernel(
                       ln_s[None, :] * hc * tl.math.rsqrt(tl.sum(hc * hc, axis=1)[:, None] / D_MODEL + 1e-5) + ln_b[None, :],
                       0.0)
 
-    h_norm_bf16 = h_norm.to(tl.bfloat16)
+    # Store h_norm to buffer so we can reload per tile for projections
+    tl.store(h_norm_buf_ptr + rows[:, None] * D_MODEL + d[None, :],
+             h_norm.to(tl.bfloat16), mask=d_mask[None, :])
 
-    # Q projections: N_HEADS heads
+    # Q projections: N_HEADS heads (tiled along D_BLOCK)
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
         head_off = head * SEQ * D_HEAD
-        wq = tl.load(wq_ptr + d[:, None] * D_MODEL + hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        Q = tl.dot(h_norm_bf16, wq).to(tl.float32)
+        Q = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)
+        for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+            dt = dd + tl.arange(0, TILE_PROJ)
+            dt_mask = dt < D_MODEL
+            h_tile = tl.load(h_norm_buf_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                             mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+            wq_tile = tl.load(wq_ptr + dt[:, None] * D_MODEL + hd[None, :],
+                              mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            Q += tl.dot(h_tile, wq_tile).to(tl.float32)
         tl.store(q_buf_ptr + head_off + rows[:, None] * D_HEAD + dh[None, :], Q)
 
-    # K/V projections: N_KV_HEADS heads (shared across GQA groups)
+    # K/V projections: N_KV_HEADS heads (tiled along D_BLOCK)
     for kv_head in tl.range(N_KV_HEADS):
         kv_hd = kv_head * D_HEAD + dh
         kv_head_off = kv_head * SEQ * D_HEAD
 
-        wk = tl.load(wk_ptr + d[:, None] * D_KV + kv_hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        K = tl.dot(h_norm_bf16, wk).to(tl.float32)
+        K = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)
+        V = tl.zeros((BLOCK_SEQ, D_HEAD), dtype=tl.float32)
+        for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+            dt = dd + tl.arange(0, TILE_PROJ)
+            dt_mask = dt < D_MODEL
+            h_tile = tl.load(h_norm_buf_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                             mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+            wk_tile = tl.load(wk_ptr + dt[:, None] * D_KV + kv_hd[None, :],
+                              mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            K += tl.dot(h_tile, wk_tile).to(tl.float32)
+            wv_tile = tl.load(wv_ptr + dt[:, None] * D_KV + kv_hd[None, :],
+                              mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+            V += tl.dot(h_tile, wv_tile).to(tl.float32)
         tl.store(k_cache_ptr + kv_head_off + rows[:, None] * D_HEAD + dh[None, :], K.to(tl.bfloat16))
-
-        wv = tl.load(wv_ptr + d[:, None] * D_KV + kv_hd[None, :], mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
-        V = tl.dot(h_norm_bf16, wv).to(tl.float32)
         tl.store(v_cache_ptr + kv_head_off + rows[:, None] * D_HEAD + dh[None, :], V.to(tl.bfloat16))
 
 
@@ -88,6 +112,7 @@ def _attn_kernel(
     h_ptr,
     q_buf_ptr, k_cache_ptr, v_cache_ptr,
     wo_ptr,
+    attn_scratch_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
     D_BLOCK: tl.constexpr,
@@ -96,18 +121,27 @@ def _attn_kernel(
     GQA_GROUP: tl.constexpr,
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
+    TILE_PROJ: tl.constexpr,
 ):
-    """Causal attention + O projection + residual. Supports GQA + D_BLOCK padding."""
+    """Causal attention + O projection + residual. Supports GQA + D_BLOCK padding.
+
+    O projection is tiled along D_BLOCK with TILE_PROJ to fit in shared memory.
+    attn_out is stored to attn_scratch then reloaded per tile for the tl.dot.
+    """
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     all_pos = tl.arange(0, SEQ)
-    d = tl.arange(0, D_BLOCK)
-    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
     scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
 
-    attn_accum = tl.zeros((BLOCK_SEQ, D_BLOCK), dtype=tl.float32)
+    # Initialize h_out with residual h (in tiles to avoid D_BLOCK-wide loads alongside wo)
+    for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+        dt = dd + tl.arange(0, TILE_PROJ)
+        dt_mask = dt < D_MODEL
+        h_tile = tl.load(h_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                         mask=dt_mask[None, :], other=0.0).to(tl.float32)
+        tl.store(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :], h_tile, mask=dt_mask[None, :])
 
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
@@ -127,12 +161,23 @@ def _attn_kernel(
 
         attn_out = tl.dot(attn.to(tl.bfloat16), V.to(tl.bfloat16)).to(tl.float32)
 
-        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
-        attn_accum += tl.dot(attn_out.to(tl.bfloat16), wo).to(tl.float32)
+        # Store attn_out to scratch for tiled O projection reload
+        tl.store(attn_scratch_ptr + rows[:, None] * D_HEAD + dh[None, :],
+                 attn_out.to(tl.bfloat16))
 
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
-    h = h + attn_accum
-    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
+        # Tile O projection along D_BLOCK to fit wo in shared memory
+        # At (TILE_PROJ, D_HEAD) bf16 = (512, 64) * 2 = 64KB, fits in 101KB smem
+        for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+            dt = dd + tl.arange(0, TILE_PROJ)
+            dt_mask = dt < D_MODEL
+            ao = tl.load(attn_scratch_ptr + rows[:, None] * D_HEAD + dh[None, :]).to(tl.bfloat16)
+            wo_tile = tl.load(wo_ptr + hd[:, None] * D_MODEL + dt[None, :],
+                              mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+            o_tile = tl.dot(ao, wo_tile).to(tl.float32)
+            prev = tl.load(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                           mask=dt_mask[None, :], other=0.0).to(tl.float32)
+            tl.store(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                     prev + o_tile, mask=dt_mask[None, :])
 
 
 @triton.jit
@@ -140,6 +185,7 @@ def _flash_attn_kernel(
     h_ptr,
     q_buf_ptr, k_cache_ptr, v_cache_ptr,
     wo_ptr,
+    attn_scratch_ptr,
     h_out_ptr,
     D_MODEL: tl.constexpr,
     D_BLOCK: tl.constexpr,
@@ -149,17 +195,26 @@ def _flash_attn_kernel(
     SEQ: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
     KV_TILE: tl.constexpr,
+    TILE_PROJ: tl.constexpr,
 ):
-    """FlashAttention: tiled KV with online softmax. Supports GQA + D_BLOCK padding."""
+    """FlashAttention: tiled KV with online softmax. Supports GQA + D_BLOCK padding.
+
+    O projection is tiled along D_BLOCK with TILE_PROJ to fit in shared memory.
+    attn_out is stored to attn_scratch then reloaded per tile for the tl.dot.
+    """
     bid = tl.program_id(0)
     rows = bid * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    d = tl.arange(0, D_BLOCK)
-    d_mask = d < D_MODEL
     dh = tl.arange(0, D_HEAD)
 
     scale = 0.17677669529663689  # 1/sqrt(32), for D_HEAD=32
 
-    attn_accum = tl.zeros((BLOCK_SEQ, D_BLOCK), dtype=tl.float32)
+    # Initialize h_out with residual h (in tiles)
+    for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+        dt = dd + tl.arange(0, TILE_PROJ)
+        dt_mask = dt < D_MODEL
+        h_tile = tl.load(h_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                         mask=dt_mask[None, :], other=0.0).to(tl.float32)
+        tl.store(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :], h_tile, mask=dt_mask[None, :])
 
     for head in tl.range(N_HEADS):
         hd = head * D_HEAD + dh
@@ -195,12 +250,22 @@ def _flash_attn_kernel(
 
         attn_out = o_i / l_i[:, None]
 
-        wo = tl.load(wo_ptr + hd[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
-        attn_accum += tl.dot(attn_out.to(tl.bfloat16), wo).to(tl.float32)
+        # Store attn_out to scratch for tiled O projection reload
+        tl.store(attn_scratch_ptr + rows[:, None] * D_HEAD + dh[None, :],
+                 attn_out.to(tl.bfloat16))
 
-    h = tl.load(h_ptr + rows[:, None] * D_MODEL + d[None, :], mask=d_mask[None, :], other=0.0).to(tl.float32)
-    h = h + attn_accum
-    tl.store(h_out_ptr + rows[:, None] * D_MODEL + d[None, :], h, mask=d_mask[None, :])
+        # Tile O projection along D_BLOCK to fit wo in shared memory
+        for dd in tl.static_range(0, D_BLOCK, TILE_PROJ):
+            dt = dd + tl.arange(0, TILE_PROJ)
+            dt_mask = dt < D_MODEL
+            ao = tl.load(attn_scratch_ptr + rows[:, None] * D_HEAD + dh[None, :]).to(tl.bfloat16)
+            wo_tile = tl.load(wo_ptr + hd[:, None] * D_MODEL + dt[None, :],
+                              mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+            o_tile = tl.dot(ao, wo_tile).to(tl.float32)
+            prev = tl.load(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                           mask=dt_mask[None, :], other=0.0).to(tl.float32)
+            tl.store(h_out_ptr + rows[:, None] * D_MODEL + dt[None, :],
+                     prev + o_tile, mask=dt_mask[None, :])
 
 
 @triton.jit
@@ -324,6 +389,11 @@ def block_prefill(params, config, x, vocab_size):
     num_blocks = seq_len // block_seq
     vocab_pad = ((vocab_size + 127) // 128) * 128
 
+    # PROJ_TILE for tiling Q/K/V/O projections when weight matrices exceed shared memory.
+    # At D_BLOCK=1024, D_HEAD=64: (1024,64) bf16 = 128KB > 101KB smem limit.
+    # PROJ_TILE=512: (512,64) bf16 = 64KB, fits.
+    proj_tile = min(d_block, 512)
+
     # Precompute bf16 weights once (avoid repeated .astype in loop)
     w = {k: v.astype(jnp.bfloat16) for k, v in params.items()}
 
@@ -337,12 +407,14 @@ def block_prefill(params, config, x, vocab_size):
         p = f"layer{layer}"
 
         # Kernel 1: LN + Q/K/V projections (GQA: K/V have N_KV_HEADS)
-        q_buf, k_cache, v_cache = jt.triton_call(
+        # h_norm_buf: scratch buffer for h_norm, reloaded per projection tile
+        _h_norm_buf, q_buf, k_cache, v_cache = jt.triton_call(
             h,
             w[f"{p}.ln1.scale"], w[f"{p}.ln1.bias"],
             w[f"{p}.attn.q"], w[f"{p}.attn.k"], w[f"{p}.attn.v"],
             kernel=_proj_kernel,
             out_shape=[
+                jax.ShapeDtypeStruct((seq_len, d_model), jnp.bfloat16),
                 jax.ShapeDtypeStruct((n_heads, seq_len, d_head), jnp.float32),
                 jax.ShapeDtypeStruct((n_kv_heads, seq_len, d_head), jnp.bfloat16),
                 jax.ShapeDtypeStruct((n_kv_heads, seq_len, d_head), jnp.bfloat16),
@@ -351,20 +423,22 @@ def block_prefill(params, config, x, vocab_size):
             num_warps=4, num_stages=1,
             D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
             N_KV_HEADS=n_kv_heads, D_KV=d_kv,
-            SEQ=seq_len, BLOCK_SEQ=block_seq,
+            SEQ=seq_len, BLOCK_SEQ=block_seq, TILE_PROJ=proj_tile,
         )
         all_k_caches.append(k_cache)
         all_v_caches.append(v_cache)
 
         # Kernel 2: Attention + O projection + residual
+        # attn_scratch: scratch buffer for attn_out, reloaded per O projection tile
         use_flash = seq_len > 256
         if use_flash:
             kv_tile = 64
-            (h,) = jt.triton_call(
+            _attn_scratch, h = jt.triton_call(
                 h, q_buf, k_cache, v_cache,
                 w[f"{p}.attn.o"],
                 kernel=_flash_attn_kernel,
                 out_shape=[
+                    jax.ShapeDtypeStruct((seq_len, d_head), jnp.bfloat16),
                     jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
                 ],
                 grid=(num_blocks,),
@@ -372,13 +446,15 @@ def block_prefill(params, config, x, vocab_size):
                 D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
                 GQA_GROUP=gqa_group,
                 SEQ=seq_len, BLOCK_SEQ=block_seq, KV_TILE=kv_tile,
+                TILE_PROJ=proj_tile,
             )
         else:
-            (h,) = jt.triton_call(
+            _attn_scratch, h = jt.triton_call(
                 h, q_buf, k_cache, v_cache,
                 w[f"{p}.attn.o"],
                 kernel=_attn_kernel,
                 out_shape=[
+                    jax.ShapeDtypeStruct((seq_len, d_head), jnp.bfloat16),
                     jax.ShapeDtypeStruct((seq_len, d_model), jnp.float32),
                 ],
                 grid=(num_blocks,),
@@ -386,6 +462,7 @@ def block_prefill(params, config, x, vocab_size):
                 D_MODEL=d_model, D_BLOCK=d_block, D_HEAD=d_head, N_HEADS=n_heads,
                 GQA_GROUP=gqa_group,
                 SEQ=seq_len, BLOCK_SEQ=block_seq,
+                TILE_PROJ=proj_tile,
             )
 
         # Kernel 3: LN + FFN + residual
