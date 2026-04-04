@@ -40,6 +40,8 @@ No GPU experience required — just Python and a rough idea of what neural nets 
 22. [Tensor Core Batched Projections](#22-tensor-core-batched-projections)
 23. [Streaming and Serving APIs](#23-streaming-and-serving-apis)
 24. [Paged KV Cache](#24-paged-kv-cache)
+25. [Sampling and Decoding Strategies](#25-sampling-and-decoding-strategies)
+26. [Training at Scale: Multi-Epoch on Fresh Data](#26-training-at-scale-multi-epoch-on-fresh-data)
 
 ---
 
@@ -1343,7 +1345,201 @@ K_tile = tl.load(page_pool_ptr + phys_page * PAGE_ELEMS + local_offset)
 
 ---
 
+## 25. Sampling and Decoding Strategies
+
+Greedy decoding (always pick the highest-probability token) is simple but causes
+**repetition collapse**: once the model assigns slightly higher probability to a phrase
+it just produced, it locks into a loop. With our 242M param model, greedy decoding gives
+a 4-gram diversity score of just 0.22 — meaning 78% of 4-grams are repeated.
+
+Three techniques fix this, each attacking a different part of the problem:
+
+### Temperature
+
+Temperature scales the logits before softmax. Lower temperature sharpens the distribution
+(more deterministic), higher temperature flattens it (more random):
+
+$$p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}$$
+
+At $T=0$ this is greedy (argmax). At $T=1$ this samples from the model's actual
+distribution. At $T>1$ the distribution flattens and rare tokens become more likely.
+
+Concretely: if the model outputs logits $[5.0, 4.8, 2.0, 1.0]$ for four tokens:
+- $T=0.5$: divides by 0.5 → $[10.0, 9.6, 4.0, 2.0]$ → probabilities $[0.60, 0.40, 0.003, 0.0001]$ (almost always picks token 0 or 1)
+- $T=1.0$: unchanged → $[0.44, 0.36, 0.022, 0.008]$ (token 2 has a 2% chance)
+- $T=1.5$: divides by 1.5 → $[3.33, 3.20, 1.33, 0.67]$ → probabilities $[0.35, 0.31, 0.05, 0.02]$ (more spread out)
+
+The sweet spot for our model is $T \approx 0.7$ — enough randomness to avoid loops,
+not so much that it produces gibberish.
+
+### Top-p (nucleus sampling)
+
+Instead of sampling from the full vocabulary, sort tokens by probability and only keep
+the smallest set whose cumulative probability exceeds a threshold $p$:
+
+1. Sort tokens by descending probability
+2. Compute cumulative sum
+3. Keep tokens until cumsum $\ge p$
+4. Renormalize and sample from this subset
+
+With $p=0.95$, this dynamically adjusts the number of candidates: when the model is
+confident (one token has 90% probability), only 1-2 tokens are considered. When unsure,
+hundreds might be included. This is better than a fixed top-k because it adapts to the
+model's certainty at each position.
+
+```python
+sorted_idx = np.argsort(-probs)
+sorted_probs = probs[sorted_idx]
+cumsum = np.cumsum(sorted_probs)
+cutoff = np.searchsorted(cumsum, top_p) + 1
+keep_idx = sorted_idx[:cutoff]
+```
+
+### Repetition penalty
+
+Repetition penalty directly discourages the model from producing tokens it already
+generated. Before computing softmax, we modify the logits of previously-seen tokens:
+
+$$z_i' = \begin{cases} z_i / \alpha & \text{if } z_i > 0 \text{ and token } i \text{ was already generated} \\ z_i \times \alpha & \text{if } z_i < 0 \text{ and token } i \text{ was already generated} \end{cases}$$
+
+With $\alpha = 1.2$: a positive logit of 5.0 becomes 4.17 (less likely), and a negative
+logit of -2.0 becomes -2.4 (even less likely). This pushes the model away from repeating
+itself without completely banning any token.
+
+### What we found
+
+We swept 18 parameter combinations across 6 prompt types (story, knowledge, code,
+creative, explanation, dialogue). The metric is 4-gram diversity: fraction of unique
+4-grams out of total 4-grams (1.0 = no repetition).
+
+```
+Setting                         Avg diversity
+greedy                          0.221  (78% repetition)
+temp=0.7                        0.825
+temp=0.7 top_p=0.95            0.534
+temp=0.7 top_p=0.95 rep=1.2    0.987  ← best balance
+temp=0.8 top_p=0.95 rep=1.2    0.994
+temp=0.8 top_p=0.95 rep=1.3    0.999  (too aggressive — forces odd word choices)
+```
+
+Key findings:
+- **Repetition penalty is the biggest single improvement.** Going from rep=1.0 to 1.2
+  with temp=0.7/top_p=0.95 takes diversity from 0.53 to 0.99.
+- **Top-p alone hurts** at moderate temperatures. With temp=0.7, adding top_p=0.95
+  actually reduced diversity from 0.83 to 0.53 because it cuts the tail that would have
+  introduced variety. Top-p works best combined with repetition penalty.
+- **temp=0.7 is more coherent than 0.8+.** Higher temperatures occasionally produce
+  gibberish (hallucinated citations, garbled text). The model at 242M params doesn't
+  have enough capacity to stay coherent at high temperature.
+- **Code is the hardest domain.** Even with optimal settings, code output has correct
+  Python structure but incorrect logic. This is expected at 242M params with only 18%
+  code in the training mix.
+
+Usage:
+```bash
+uv run generate.py --prompt "your text" --temp 0.7 --top-p 0.95 --rep-penalty 1.2
+```
+
+---
+
+## 26. Training at Scale: Multi-Epoch on Fresh Data
+
+Training a language model on the same data repeatedly (multiple epochs over the same
+tokens) causes overfitting — the model memorizes the training set instead of learning
+general patterns. The alternative: use fresh tokens each epoch.
+
+### Data pipeline design
+
+The model was trained in two epochs, each on entirely fresh data:
+
+**Epoch 1** (1.77B tokens):
+- 60% FineWeb-Edu (educational web text, quality score $\ge 3$)
+- 20% Cosmopedia v2 (synthetic textbook content)
+- 15% Wikipedia
+- 5% code_search_net (function-level code snippets)
+
+**Epoch 2** (1.72B fresh tokens, zero overlap):
+- 50% FineWeb-Edu (new documents, skipped epoch 1 docs)
+- 20% StarCoder (file-level code, much higher quality than code_search_net)
+- 15% Wikipedia (new articles)
+- 15% Cosmopedia v2 (new documents)
+
+The "skip epoch 1 docs" approach works because HuggingFace streaming datasets are
+deterministic — documents arrive in the same order every time. By counting how many
+qualifying documents epoch 1 consumed, epoch 2 simply skips that many before collecting
+new ones.
+
+### Resume from checkpoint
+
+Training resumes from epoch 1's weights with a fresh optimizer state:
+```bash
+uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
+  --context-len 512 --epochs 1 --batch-size 16 --lr 1e-4 --warmup-steps 500 \
+  --dataset combined_epoch2 --resume weights.pkl
+```
+
+The learning rate is lower than epoch 1 ($10^{-4}$ vs $3 \times 10^{-4}$) and warmup
+is shorter (500 vs 2000 steps). This is standard for continued training: the model is
+already in a good region of the loss landscape, so large learning rates would push it
+out before it can refine.
+
+### Results
+
+```
+                    Train loss    Val loss    Val ppl    Time
+Epoch 1 (1.77B):    3.04          3.04       20.91      13.7h
+Epoch 2 (1.72B):    2.70          3.34       28.16      13.4h
+Total: 3.49B unique tokens seen
+```
+
+Train loss improved significantly (3.04 → 2.70), but validation perplexity got worse
+(20.91 → 28.16). This isn't overfitting in the traditional sense — it's a
+**distribution shift** problem.
+
+The validation set was drawn from epoch 1's data mix (60% educational web, 5% code).
+Epoch 2's mix is different (50% web, 20% StarCoder code). The model genuinely improved
+on its new training distribution (which includes much more code), but the old validation
+set doesn't measure that improvement. A fairer evaluation would use a validation set
+drawn from epoch 2's data mix, or evaluate on downstream tasks that test code ability.
+
+This is a general lesson: **validation metrics are only meaningful when the validation
+set matches the distribution you care about.** When the training mix changes, the
+validation set must change too.
+
+---
+
 ### File overview
+
+```
+Core:
+  model.py                           — JAX transformer model
+  data.py                            — Shakespeare + TinyStories + BPE tokenizer
+  train.py                  — AdamW training with LR schedule + --resume
+
+Kernels:
+  kernels/fused_prefill.py           — fused prefill (d_model <= 64, one kernel call)
+  kernels/fused_decode.py            — fused decode (d_model <= 64, one kernel call)
+  kernels/block_prefill.py           — multi-block prefill + FlashAttention + GQA (d_model >= 128)
+  kernels/block_decode.py            — per-layer decode orchestrator (d_model >= 128)
+  kernels/fused_decode_nlayer.py     — fused N-layer decode (packed weights/caches)
+  kernels/multi_sm_decode.py         — multi-SM decode with atomic barriers + KV-split
+  kernels/batched_decode.py          — batched multi-SM decode (B sequences, tensor core projections)
+  kernels/persistent_decode.py       — persistent decode (single launch, all steps)
+  kernels/persistent_batched_decode.py — persistent batched (B seq × N steps)
+  kernels/paged_kv.py               — paged KV cache memory management (PagePool)
+
+Inference:
+  generate.py                        — streaming text generation + sampling (temp, top-p, rep penalty)
+  serve.py                           — variable-length batched inference server
+
+Data:
+  prepare_data.py                    — multi-source data download + tokenization (epoch 1 & 2)
+  sweep_sampling.py                  — automated parameter sweep across domains
+
+Benchmarking:
+  profile_kernels.py                 — primary profiling tool
+  baseline_metrics.txt               — current performance numbers
+```
 
 ```
 Core:
