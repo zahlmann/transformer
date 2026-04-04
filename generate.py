@@ -1,15 +1,17 @@
 """Streaming text generation using Triton decode kernels.
 
 Usage:
-    # Stream tokens one at a time
-    for token_id in stream_tokens(params, config, prompt, max_tokens=128):
-        print(decode_fn(token_id), end='', flush=True)
-
-    # Generate all tokens at once (fastest — pipelined, no per-token sync)
-    tokens = generate_tokens(params, config, prompt, n_tokens=128)
-
-    # Interactive CLI
+    # Interactive CLI (greedy)
     uv run generate.py --prompt "Once upon a time"
+
+    # With sampling
+    uv run generate.py --prompt "Once upon a time" --temp 0.8 --top-p 0.95
+
+    # With repetition penalty
+    uv run generate.py --prompt "Once upon a time" --temp 0.8 --top-p 0.95 --rep-penalty 1.2
+
+    # Non-streaming (faster, pipelined)
+    uv run generate.py --prompt "Once upon a time" --no-stream
 """
 
 import os
@@ -17,14 +19,69 @@ os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from kernels.fused_decode_nlayer import prepare_decode_weights_nlayer, pack_kv_caches
 from kernels.multi_sm_decode import multi_sm_decode_nlayer
 from model import prefill_with_kv
 
 
+def sample_token(logits, temperature=1.0, top_p=1.0, rep_penalty=1.0,
+                 generated_ids=None, rng_key=None):
+    """Sample a token from logits with temperature, top-p, and repetition penalty.
+
+    Args:
+        logits: (vocab_size,) raw logits
+        temperature: >0, lower = more deterministic, 1.0 = neutral
+        top_p: nucleus sampling threshold (1.0 = disabled)
+        rep_penalty: >1.0 penalizes already-generated tokens
+        generated_ids: list of previously generated token IDs
+        rng_key: JAX PRNG key for sampling
+    Returns:
+        token_id (int)
+    """
+    logits = np.array(logits, dtype=np.float32)
+
+    # repetition penalty: reduce logits of already-seen tokens
+    if rep_penalty != 1.0 and generated_ids:
+        seen = list(set(generated_ids))
+        for tid in seen:
+            if logits[tid] > 0:
+                logits[tid] /= rep_penalty
+            else:
+                logits[tid] *= rep_penalty
+
+    # greedy fast path
+    if temperature == 0.0 or (temperature == 1.0 and top_p == 1.0 and rep_penalty == 1.0
+                               and not generated_ids):
+        return int(np.argmax(logits))
+
+    # temperature scaling
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    # softmax
+    logits -= logits.max()
+    probs = np.exp(logits)
+    probs /= probs.sum()
+
+    # top-p (nucleus) filtering
+    if top_p < 1.0:
+        sorted_idx = np.argsort(-probs)
+        sorted_probs = probs[sorted_idx]
+        cumsum = np.cumsum(sorted_probs)
+        # keep tokens up to cumulative probability >= top_p
+        cutoff = np.searchsorted(cumsum, top_p) + 1
+        keep_idx = sorted_idx[:cutoff]
+        filtered_probs = probs[keep_idx]
+        filtered_probs /= filtered_probs.sum()
+        return int(np.random.choice(keep_idx, p=filtered_probs))
+
+    return int(np.random.choice(len(probs), p=probs))
+
+
 def _prefill(params, config, prompt_ids, vocab_size):
-    """Run prefill and return (weights, first_token, start_pos, kv_packed).
+    """Run prefill and return (weights, first_logits, start_pos, kv_packed).
 
     Includes a warmup decode step to trigger Triton JIT compilation.
     """
@@ -37,46 +94,58 @@ def _prefill(params, config, prompt_ids, vocab_size):
 
     w = prepare_decode_weights_nlayer(params, config, vocab_size)
     kv_packed = pack_kv_caches(k_caches, v_caches)
-    first_token = jnp.argmax(logits[prompt_len - 1])
+    first_logits = logits[prompt_len - 1]
 
     # Warmup decode step to trigger Triton JIT compilation
+    warmup_tok = jnp.argmax(first_logits)
     _tok, _, _kv = multi_sm_decode_nlayer(
-        w, config, first_token, prompt_len, kv_packed, vocab_size)
+        w, config, warmup_tok, prompt_len, kv_packed, vocab_size)
     _ = int(_tok)
 
-    return w, first_token, prompt_len, kv_packed
+    return w, first_logits, prompt_len, kv_packed
 
 
-def stream_tokens(params, config, prompt_ids, max_tokens=128):
-    """Yield token IDs one at a time (per-token host sync for streaming)."""
+def stream_tokens(params, config, prompt_ids, max_tokens=128,
+                  temperature=0.0, top_p=1.0, rep_penalty=1.0, seed=None):
+    """Yield token IDs one at a time with optional sampling."""
+    if seed is not None:
+        np.random.seed(seed)
     vocab_size = config["vocab_size"]
-    w, tok, start_pos, kv_packed = _prefill(params, config, prompt_ids, vocab_size)
+    w, first_logits, start_pos, kv_packed = _prefill(
+        params, config, prompt_ids, vocab_size)
 
-    # First token (from prefill argmax)
-    first_id = int(tok)
+    generated = []
+
+    # First token from prefill logits
+    if temperature == 0.0 and rep_penalty == 1.0:
+        first_id = int(jnp.argmax(first_logits))
+    else:
+        first_id = sample_token(first_logits, temperature, top_p,
+                                rep_penalty, generated)
+    generated.append(first_id)
     yield first_id
 
-    # Decode remaining tokens
+    tok = jnp.int32(first_id)
     for i in range(max_tokens - 1):
-        tok, _, kv_packed = multi_sm_decode_nlayer(
+        tok_out, logits, kv_packed = multi_sm_decode_nlayer(
             w, config, tok, start_pos + i, kv_packed, vocab_size)
-        yield int(tok)
+
+        if temperature == 0.0 and rep_penalty == 1.0:
+            token_id = int(tok_out)
+        else:
+            token_id = sample_token(logits, temperature, top_p,
+                                    rep_penalty, generated)
+
+        generated.append(token_id)
+        yield token_id
+        tok = jnp.int32(token_id)
 
 
-def generate_tokens(params, config, prompt_ids, n_tokens=128):
-    """Generate all tokens at once (pipelined, tokens stay on device)."""
-    vocab_size = config["vocab_size"]
-    w, tok, start_pos, kv_packed = _prefill(params, config, prompt_ids, vocab_size)
-
-    # Collect device-side token tensors (no per-step sync)
-    tok_devs = [tok]
-    for i in range(n_tokens - 1):
-        tok, _, kv_packed = multi_sm_decode_nlayer(
-            w, config, tok, start_pos + i, kv_packed, vocab_size)
-        tok_devs.append(tok)
-
-    # Single batch sync at end
-    return [int(t) for t in tok_devs]
+def generate_tokens(params, config, prompt_ids, n_tokens=128,
+                    temperature=0.0, top_p=1.0, rep_penalty=1.0, seed=None):
+    """Generate all tokens at once."""
+    return list(stream_tokens(params, config, prompt_ids, n_tokens,
+                              temperature, top_p, rep_penalty, seed))
 
 
 def main():
@@ -96,6 +165,14 @@ def main():
                         help="Path to weights file")
     parser.add_argument("--no-stream", action="store_true",
                         help="Generate all tokens at once (faster, no streaming)")
+    parser.add_argument("--temp", type=float, default=0.0,
+                        help="Sampling temperature (0 = greedy, 0.7-1.0 typical)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Nucleus sampling threshold (0.9-0.95 typical)")
+    parser.add_argument("--rep-penalty", type=float, default=1.0,
+                        help="Repetition penalty (1.0 = off, 1.1-1.3 typical)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible sampling")
     args = parser.parse_args()
 
     # Load model
@@ -119,6 +196,11 @@ def main():
 
     print(f"Model: d={d} h={n_heads} l={n_layers} ctx={ctx_len}", file=sys.stderr)
     print(f"Params: {sum(p.size for p in params.values()):,}", file=sys.stderr)
+    if args.temp > 0:
+        print(f"Sampling: temp={args.temp} top_p={args.top_p} "
+              f"rep_penalty={args.rep_penalty}", file=sys.stderr)
+    else:
+        print(f"Decoding: greedy (argmax)", file=sys.stderr)
     print(file=sys.stderr)
 
     # Encode prompt
@@ -138,7 +220,8 @@ def main():
 
     if args.no_stream:
         t0 = time.perf_counter()
-        tokens = generate_tokens(params, config, prompt_ids, max_gen)
+        tokens = generate_tokens(params, config, prompt_ids, max_gen,
+                                 args.temp, args.top_p, args.rep_penalty, args.seed)
         elapsed = time.perf_counter() - t0
         text = decode_fn(tokens)
         sys.stdout.write(text)
@@ -152,7 +235,8 @@ def main():
         all_tokens = []
         t_first = None
         printed_chars = 0
-        for token_id in stream_tokens(params, config, prompt_ids, max_gen):
+        for token_id in stream_tokens(params, config, prompt_ids, max_gen,
+                                      args.temp, args.top_p, args.rep_penalty, args.seed):
             if t_first is None:
                 t_first = time.perf_counter()
             all_tokens.append(token_id)

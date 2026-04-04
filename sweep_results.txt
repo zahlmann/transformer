@@ -1,0 +1,2335 @@
+Sampling Parameter Sweep Results
+Model: d=1024, l=16, 242,288,640 params
+Max tokens: 200, Seed: 42
+====================================================================================================
+
+SUMMARY (average 4-gram diversity across all domains, 1.0 = no repetition)
+Settings                                    story    knowl     code    creat     expl     dial      AVG
+----------------------------------------------------------------------------------------------------
+greedy                                      0.310    0.335    0.137    0.102    0.284    0.157    0.221
+temp=0.5                                    0.959    0.523    0.096    0.259    0.594    0.152    0.431
+temp=0.7                                    0.934    0.949    0.330    0.898    0.914    0.924    0.825
+temp=0.9                                    0.954    0.990    0.655    0.975    0.797    0.919    0.882
+temp=1.0                                    0.985    0.904    0.924    1.000    0.959    1.000    0.962
+temp=0.7 top_p=0.9                          0.888    0.604    0.142    0.213    0.533    0.102    0.414
+temp=0.7 top_p=0.95                         0.853    0.858    0.142    0.391    0.741    0.218    0.534
+temp=0.8 top_p=0.9                          0.954    0.635    0.325    0.614    0.462    0.188    0.530
+temp=0.8 top_p=0.95                         0.995    0.924    0.640    0.330    0.944    0.279    0.685
+temp=0.9 top_p=0.95                         0.970    0.883    0.411    0.985    0.985    0.909    0.857
+temp=0.7 top_p=0.95 rep=1.1                 0.995    0.970    0.381    0.990    0.706    0.863    0.817
+temp=0.7 top_p=0.95 rep=1.2                 1.000    1.000    0.964    0.985    0.975    1.000    0.987
+temp=0.7 top_p=0.95 rep=1.3                 1.000    1.000    0.990    1.000    1.000    1.000    0.998
+temp=0.8 top_p=0.95 rep=1.1                 1.000    0.954    0.944    1.000    0.919    1.000    0.970
+temp=0.8 top_p=0.95 rep=1.2                 1.000    1.000    0.970    1.000    1.000    0.995    0.994
+temp=0.8 top_p=0.95 rep=1.3                 1.000    1.000    0.995    1.000    1.000    1.000    0.999
+temp=0.9 top_p=0.95 rep=1.2                 0.995    1.000    0.944    0.970    1.000    1.000    0.985
+temp=1.0 top_p=0.95 rep=1.2                 1.000    1.000    0.985    1.000    0.990    1.000    0.996
+
+====================================================================================================
+
+FULL OUTPUTS
+
+--- greedy | story | div=0.310 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived in a cozy house with her family. She loved her mommy and daddy's toys, but they were not in hers. Her mommy and daddy's toys were all gone, and they were no more than happy. Lily felt sad and lonely.
+Lily's mommy and daddy's toys were all gone.
+Lily's mommy and daddy's toys were all gone.
+Lily's daddy's toys were all gone.
+Lily's daddy's toys were all gone.
+Lily's daddy's toys were all gone.
+Lily's daddy's toys were all gone.
+Lily's daddy's toys were all gone.
+Lily's daddy's toys were all
+
+--- greedy | knowledge | div=0.335 ---
+Prompt: The solar system consists of
+Output:  a large number of planets, the most of which is the Earth, the most of which is the Sun, and the most of which is the Moon. The other planets are the most of which are the Sun, the Earth, the Moon, the Moon, the Earth, the Mars, the Moon, the Mars, the Earth, the Moon, the Sun, the other planets, and the Solar system. The other planets are the smallest of the Solar System. The other planets are the smallest of the Solar System. The other planets are the smallest of the Solar System. The other p
+
+--- greedy | code | div=0.137 ---
+Prompt: def fibonacci(n):
+Output: 
+    return nn.fibonacci(n)
+
+
+
+def fibonacci(n):
+    return nn.fibonacci(n)
+
+
+
+def fibonacci(n):
+    return nn.fibonac(n)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- greedy | creative | div=0.102 ---
+Prompt: In a world where machines could dream,
+Output:  robots are the new, the future of the human is in the world is in the future.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- greedy | explanation | div=0.284 ---
+Prompt: Machine learning is a field of
+Output:  computer-aided engineering that is used to develop computer systems that can learn from data. It is the use of data to make a machine that can learn from data.
+Machine learning is a subset of machine learning. It is the use of a machine to learn from data.
+Machine is a subset of machine learning.
+Machine is a subset of machine learning.
+Machine is a subset of machine learning.
+Machine is a subset of machine learning.
+Machine is a subset of machine.
+Machine is a subset of machine learning.
+Machi
+
+--- greedy | dialogue | div=0.157 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+
+"Hi, I'm a little girl," replied the old man. "I'm a little girl, and I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl. I'm a little girl
+
+--- temp=0.5 | story | div=0.959 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived in a cozy house in a cozy town home, surrounded by her family, her mommy and daddy's family. Her mommy and daddy were all busy preparing meals for the family, but Lily was feeling unwell. She didn't eat enough food, and she had a big tummy, but it was just a little walk around the house! Do you know what that means? Well, let's find out!
+
+Lily asked her mommy, "Mommy, why do you eat so much?" Her mommy replied, "I'm hungry, Lily! I'm worried about my tummy."
+
+Lily then asked her daddy, "D
+
+--- temp=0.5 | knowledge | div=0.523 ---
+Prompt: The solar system consists of
+Output:  a disk of gas and dust, and a solid, rocky core, and a solid, rocky core. The solar system is made up of a large and solid, rocky disk. The gas is made up of a dense, solid, and rocky core. The solar system is made up of a solid, and rocky core. The solar system is made up of a disk of gas and a solid, which is in a star's orbit. The solar system is made up of a disk of a gas, and a solid, and a solid, a gas, which is in a solar system. The solar system is made up of a disk, and a solid, a soli
+
+--- temp=0.5 | code | div=0.096 ---
+Prompt: def fibonacci(n):
+Output: 
+    """
+    Fibonacci(n) = n(n)
+    """
+    Fibonacci(n)
+    """
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonacci(n)
+    Fibonac
+
+--- temp=0.5 | creative | div=0.259 ---
+Prompt: In a world where machines could dream,
+Output:  there were two men with the same vision, but the machines could not, and the machines could not, the world was a very different place.
+
+
+
+In this episode, the characters are not named, but the names are given in a flashback sequence.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.5 | explanation | div=0.594 ---
+Prompt: Machine learning is a field of
+Output:  study that has become increasingly important in the field of computer science. It is a field that is being explored in the last few years, and it is being used in many applications across the world.
+Machine Learning is a term that is used to describe the development of machines in a way that is more similar to human learning. It is used to describe a machine that learns from data, and uses it to learn from experience.
+Machine Learning is a term that is used to describe a machine that learns fro
+
+--- temp=0.5 | dialogue | div=0.152 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+
+"You are a nun," said the old man. "I am not a nun. I am not a nun. I am not a nun."
+"You are a nun."
+"I am not a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You are a nun."
+"You
+
+--- temp=0.7 | story | div=0.934 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived with her mommy in a cozy burrow, enjoying her mommy family and friends. She loved to play with her toys, but sometimes, she would get scared too soon. Her mommy and daddy noticed that Lily was playing with her teddy buddies. Lily's mommy used to help Lily when she needed to feel like herself and found a way to talk to them.
+
+Lily: "I'm hurting my mommy friends."
+
+Mommy: "That's not fair, sweetheart. I need to tell mommy."
+
+Sally: "Mommy, why does the mommy have to play with me?"
+
+Mommy: "
+
+--- temp=0.7 | knowledge | div=0.949 ---
+Prompt: The solar system consists of
+Output:  a dense cloud of material, a rocky core, a rocky planet, and a planet of gas and dust, and a solid ocean. The solar system is the only planet around which we can see the light of, but is so far from the sun—only half as big as the sun, and half as big as the moon. It is bigger than the other planets in our solar system, and even less than the Earth. It is Earth.
+to 1. The whole of the world,
+The sun is made of the basic elements, the elements we see and touch. The solar system was formed by a s
+
+--- temp=0.7 | code | div=0.330 ---
+Prompt: def fibonacci(n):
+Output: 
+    """
+    The FibonacciNumPy function to count the number of Fibonacci numbers in a given number.
+
+    Input Nodes:
+        n: FibonacciNumPy
+
+        Input Range
+        value: n, n
+        Output value: n, n
+        Output range: n, n
+
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+    """
+   
+
+--- temp=0.7 | creative | div=0.898 ---
+Prompt: In a world where machines could dream,
+Output:  there’s a significant number of jobs are always a robot will be a human.
+The potential to have a robot to replace the human can be seen in a robot state to the world of the next.
+However, this is not the case it will say or not affect.
+A robot is a machine that can do a thing, whether it is a human or a machine, and the robot is a person.
+The audience will be a robot that can replace the human.
+A. The audience is the machine that can do a thing, whether it is a machine that can do a thing, or a
+
+--- temp=0.7 | explanation | div=0.914 ---
+Prompt: Machine learning is a field of
+Output:  study that involves the use of new approaches to improve. Machine learning is a process of training new systems to learn from data. While the development of a machine is a continuous process, the process of learning a new system must be repeated. This is a huge challenge when many systems have a small set of features. Learning a new system is very hard because it is a constant state of its own.
+There are many different types of machine learning and they are very broad. There are two types.
+- De
+
+--- temp=0.7 | dialogue | div=0.924 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+The old man was aroused to tell a tale of a man that was about to be told, and that he could not tell that, but that the voice said that he was not a man.
+So a new man came to the door.The baby was born, and the old man was dead.
+The old man was wrapped in a
+coat. The two o'ter and the man was in a
+year. I never heard the old man in the
+=" " of the old.
+to the to the doves of the old.
+He was born the
+"or the old man"
+= a stad't
+= stad't
+= to the
+" and the
+"of the o'th"
+= a stad't
+= aeth
+=tindst
+
+--- temp=0.9 | story | div=0.954 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived near the ocean, her family lived by the canyon with her friends, her mommy and daddy ducks, her little brother Max, and his two sisters Lucy and Sam, deep in the sea, enjoying the beauty of the ocean. Lily loved swimming around the shore, but it was too hard for them to put on their var grandparents on a tethering boat.
+
+Lily asked, "Mommy, why do it feel so hard while who ducks the cany?"
+
+Max Smootled, "It has feel like so hard too, Lily, Max,"
+Lily looked confused.
+
+"Mommy," said Lily,
+
+--- temp=0.9 | knowledge | div=0.990 ---
+Prompt: The solar system consists of
+Output:  the Solar System of the sun, Earth of the two locked planets, the Earth of the sun, and the Earth of the moon. The Solar system was created in age solar system.
+Answers to the Solar System and the Sun
+Solar System Solar System - Video
+Spatial - Including the video Saw word, fonts are of. To come out with a Westerner someone's ever-
+in thousands of philosophers of the western age, there is an individual,
+, who is more singular, on the list, and in depth and variety of concept, than on all those
+
+
+--- temp=0.9 | code | div=0.655 ---
+Prompt: def fibonacci(n):
+Output: 
+    """
+    Fibonacci(n,x) = A[n,x,n]
+    Fibonacci(fibitacci(n,3,0)))
+    Fibonacci(x=nib.fibinacci(fibitacci(in,0,n,n,0,0))
+    Fibonacci(n,x,n,n,m)
+
+    Fibonacci(fibonacci(in,4,n,n,0,0,n,,2,0,0))
+    Fibaffachel(g,f)
+    Fibangle(f,[-1],n,n,n,m)
+    Fibresci(f,m,n,x,m)
+    Fibme_fib(p0,f,n,s,
+
+--- temp=0.9 | creative | div=0.975 ---
+Prompt: In a world where machines could dream,
+Output:  there would be no more than a decade's worth of luck and unselfed human intelligence, I might be addicted to something of the cat, he would be absolutely sacrificing myself.
+In the end, a mirror to me, I see.Bearded Hummingbird bird, the Sage
+anderson's "bearded hummingbird," also called, an Old World Hummingbird, was the first of the New World Hummingbird, or Old World Hummingbird, a world-class king that attracted the attention of the other species. Found only in India and in Spain, this sate
+
+--- temp=0.9 | explanation | div=0.797 ---
+Prompt: Machine learning is a field of
+Output:  study known as machine learning.
+ML is the use of ML to develop the computer systems that are designed and built to perform tasks on data.
+ML is a subset of ML.
+ML is a subset of ML.
+ML is a subset of ML that develops by regression.
+Hm: is used to mean "Hm" word as a tonic to denumber, (LPSM)
+Hm is the lambda function.
+The meaning of "Hm" in a programming language is chosen for the purpose of a top-rank ML example: "Hm: normal expression-tacetically derived" is the name of a statistical system 
+
+--- temp=0.9 | dialogue | div=0.919 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+While they were enraptured, they stowed away a small object. The old man held the object in his hand, and there to be no outbursts of it, they began to put the stuff in his mouth. "I wish you'd fast," said the old man, "and go it to me. But the fool who is, does not give me a good man."
+"I would you ask me," said the old man. "But you wouldst d'am g be shuttin over.
+"I wish you'd fast," said the old man.
+"I don't stress" I go;
+"Then I should just st bark.'
+"I dod work I,
+You stownt spelln't mon
+
+--- temp=1.0 | story | div=0.985 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived in Sunnyville, a small village filled with a lovely sunny house. There was a big old woman called Jacky who loved to make beautiful lovas, Lily missed her big lovas, but he kept them close and went out. intimates endless lockers wear, they all thought it was Jacky. One day, he bumped into a girl named Bodie! She was spreading her big lovas among the villagers, and decided it was right to keep them. "Bodie lovas is wide, and we can speak together!" Lily invited her sweet spot with him, and
+
+--- temp=1.0 | knowledge | div=0.904 ---
+Prompt: The solar system consists of
+Output:  a total solar system with a large and dense volume of elliptical and elliptical bodies; a large and solid moon; the inner and outer regions of planets containing bodies of elliptical and elliptical size; and a comet’s nucleus with additional elliptical and elliptical objects. There is ~100e+ planets (see bigger) in the Solar System.
+
+The Solar System consists of a seven planet (Neptune,B)
+
+
+The Solar System is divided into a number of 72 planets and 70 moons, specifically as follows by the Arie
+
+--- temp=1.0 | code | div=0.924 ---
+Prompt: def fibonacci(n):
+Output: 
+    assert n == n, f(*ellip(shape=(2,3), n), "", n-1, 0, "length,")
+
+def omega_th(n):
+    fstr = "fibonacci (Len=%g)\"
+    fstr = "fibonacci" % (f" hardness % *Fibonacci)
+    fick = visible[fick]
+    fick = fop(fick, shape=fick, fick=(-roniamt*fgjbl,'+f'i,'itch')))
+    fick = fint(finelyshort(f))
+
+    return fick
+
+
+
+ bishops_print = "twi and patri"
+
+
+#from compat.test.graph.utils.conv2d.conv_alloc import line_sh_conv
+
+
+
+def benchto
+
+--- temp=1.0 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  robots have proveney [s]oexist [show.jarick]in the way to do us now it was not going wog some. We can woyd cope using cuaw ant out. Yet in some diawe s nobody todaywas worth any reasoning. A.ifth the principal toir one? gotaforeignplayh''. And both did. of.Synthes. I gswiss struggle to stave my heart no one use of.
+- — as I considerable sall oldin.
+- 時을라의 경읕, r�n�쐘렜비로 겑린다
+- 1 mein out ifun.spe cu s one [.aregaw] therearwill
+- around donenwe my oneowt1 thing face on
+- .Englishbi
+
+--- temp=1.0 | explanation | div=0.959 ---
+Prompt: Machine learning is a field of
+Output:  computer science inspired by computer science, the medium of which
+computer science is the study of ...
+- Get the town's power plants and fire technologies, come the mfu nuts backpun what was
+-Waste to real or size WRocom Advisor Anneele Express
+-Come and canoe to WRwiycMaARr+ Get the town's power plants and fire technologies
+-Wrid cays hearingex
+-Get the town's power plantsm wc When and what goeser towhym that w[\])the stock'])
+cp this says die wi the world away ...- which is a
+-Massive willbu
+
+--- temp=1.0 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+
+Then they went to the "hatif",
+once men were he and hifth the new.
+as if then
+by they. they.
+nell beer bettery.
+andy a,nce
+morey a,sinema
+Oh!" well!"
+2" I see
+you and I seea times(diedold)" And when you're
+im
+you ever in, d
+hi two week bb has come and first
+by y'e' 's an Young aas nom,
+b'd old one thus".
+who's lost ...
+2" The Young one" to (n)
+Free The General - even …Editorial - not on a daily basis, with Full concordance Cord
+Off For Piano alto - 13-Year-old,disband, before
+14" Not on appeal
+
+--- temp=0.7 top_p=0.9 | story | div=0.888 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived in a cozy house with her mommy and daddy dad, Mr. Johnson. She loved to play with her friends, but he always wanted to be happy. One day, she noticed something strange happening - a big ball came rolling towards her toy car!
+
+"Lily, what's that?" she asked, curious.
+"Mommy," "why?"
+
+"I thought it was a toy!"
+"Oh, so it was a ball!"
+"I thought it was a toy!"
+"I thought it was a ball!"
+"Hey, I can't find it!"
+
+Lily's mommy smiled and said, "Well, sweetie, I heard that the ball was rolling!"
+
+--- temp=0.7 top_p=0.9 | knowledge | div=0.604 ---
+Prompt: The solar system consists of
+Output:  a series of the planets, the stars, and the space-time, and the whole universe, which is the whole of the universe, and the space-time. We call the solar system the solar system, which is composed of the sun, moon, and the earth and the space-time. The sun is the space-time, the space-time. And the whole universe is the sun, and the whole of the universe. The sun is the whole of the universe, and the space-time is the whole of the universe.
+The Sun, and the Earth are not one. They are two.
+A ma
+
+--- temp=0.7 top_p=0.9 | code | div=0.142 ---
+Prompt: def fibonacci(n):
+Output: 
+    if n == 1: return fibonacci(n)
+    return fibonacci(n)
+    return fibonacci(n)
+
+
+def fibonacci(n):
+    return fibonacci(n)
+
+
+
+def fibonacci(n):
+    return fibonacci(n)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.7 top_p=0.9 | creative | div=0.213 ---
+Prompt: In a world where machines could dream,
+Output:  there were only a few people who were capable of doing what they wanted, there was a man who had the ability to do it all.
+
+
+The first  to 
+The 
+The 
+
+
+
+The 
+
+
+
+
+
+
+The 
+
+
+
+
+The 
+
+
+
+
+The 
+
+
+
+
+The 
+
+
+
+
+
+
+
+The 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.7 top_p=0.9 | explanation | div=0.533 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data analysis to enable computers to learn from data. It is the study of learning from data. It is the application of algorithms and data science in which machines are designed to learn from data, and are designed to learn from data. The machines are able to learn from data, and their algorithms are able to learn from data.
+Machine learning is a subset of machine learning. Machine learning is the application of machines to learn from data. It is the stu
+
+--- temp=0.7 top_p=0.9 | dialogue | div=0.102 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+"And the old man," said the old man.
+"And the old man," said the old man.
+"And the old man," said the old man.
+"And the old man," said the old man.
+"The old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old man."
+"And the old 
+
+--- temp=0.7 top_p=0.95 | story | div=0.853 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived on a cozy beach in the early morning hours of a magical beach called "The Dove." She loved to play and wanted to go to the beach every day to go. Her mommy, Daddy, explained to her, "You're too busy?"
+
+"Lily, I'm so happy to play," said Mommy, "but I need to make sure I'm not forgotten."
+
+Lily asked, "Mommy, what is that?"
+
+Mommy smiled and explained, "Mommy, Lily. My mommy is busy! I need to make sure I'm not forget my favorite teddy bear. Is that okay?"
+
+"Yes, Lily!" said Mommy.
+
+"Yes, 
+
+--- temp=0.7 top_p=0.95 | knowledge | div=0.858 ---
+Prompt: The solar system consists of
+Output:  a multitude of planets, moons, which are very small. We can only imagine the planets that are bigger than the Earth, and the Sun is a small planet. For most of the time, the Earth is a huge planet. But, in the very early stages, it had a few moons. And, with the formation of the Earth, many of the planets formed and with the formation of the Solar System, the Solar System formed a great planet. And, in the very early stages, it had a few. Some of the other planets. And, a planet that had only o
+
+--- temp=0.7 top_p=0.95 | code | div=0.142 ---
+Prompt: def fibonacci(n):
+Output: 
+    if n == 1: return fibonacci(n)
+    return fibonacci(n)
+    return fibonacci(n)
+
+
+def fibonacci(n):
+    return fibonacci(n)
+
+
+
+def fibonacci(n):
+    return fibonacci(n)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.7 top_p=0.95 | creative | div=0.391 ---
+Prompt: In a world where machines could dream,
+Output:  there's a man-made robot would be born, which one day is a man, one day is a machine, one day is a man, and one day a woman.
+
+
+In the above, it is a man-made robot: a human and a robot.
+
+
+In the first sentence, the man-made is the first and the woman-made is the second, the man-made is the second, and the woman-made is the third.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.7 top_p=0.95 | explanation | div=0.741 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data-based models to simulate and learn from data. It is a subfield of artificial intelligence and is the use of the human brain in computing, and is used in many areas of machine learning, such as natural language processing, language learning, image recognition, and speech recognition. It is a subfield of artificial intelligence and is used in a number of areas of artificial intelligence, such as natural language processing, robotics, and robotics.
+- 
+
+--- temp=0.7 top_p=0.95 | dialogue | div=0.218 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+"Hello, I'm," said the old man, "I'm going to get you."
+"I'm going to get you," said the old man, "You're going to get me."
+"I'm going to get you," said the old man.
+"I'm going to get you."
+"Hello, you're going to get me."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going to get you."
+"I'm going t
+
+--- temp=0.8 top_p=0.9 | story | div=0.954 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived on a big, beautiful island filled with colorful fish tules. She loved to swim and play in the ocean, but one day she saw a huge boat that broke off her, she thought, "Wow! I see that fish can't breathe like the little ones in the water!" Her mom explained that she was in danger and asked Lily to help. Lily didn't understand what was happening and decided to swim back to the water until she felt her strength and braces.
+
+Lily felt scared and lost, but soon found her way back and ran away s
+
+--- temp=0.8 top_p=0.9 | knowledge | div=0.635 ---
+Prompt: The solar system consists of
+Output:  the planet Earth, the Sun, and the Earth, which are in a single unit, the Solar System. The planets are located in the Solar System, the Sun and all of the planets are in the Solar System and the Earth is in the Solar System and is in the Space. The Solar System is the star, the Sun, and the Planetary System is the Sun the space, the planet is in the Solar System and all of the Solar System.
+The Sun is the most important part of the Solar System and the planets are in the Solar System, it is al
+
+--- temp=0.8 top_p=0.9 | code | div=0.325 ---
+Prompt: def fibonacci(n):
+Output: 
+    def fibonacci(x):
+      if n == 0: return x
+      return x
+      if n == 0: return fibonci(x)
+      return fibonac(x)
+      else: fibonci
+      if n == 0: return fibonacci(x)
+    fibonacci(n): fibonacci(n)
+    fibonacci(n): fibonacci(n)
+    return fibonacci
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- temp=0.8 top_p=0.9 | creative | div=0.614 ---
+Prompt: In a world where machines could dream,
+Output:  it might not be possible to be.
+What is being of the future?
+A new technology, the Internet of Things, is not the future of the future, it will be. It is the future of a new, the future of the old, not of the old.
+The Internet of Things will be the future of the future of the future. It will not be the future of the future.
+The Internet of Things, a new thing.
+If you can do it,
+What is the Internet of Things, a new thing.
+How are you?
+So what is this?
+The Internet of Things, a new thing.
+Bring 
+
+--- temp=0.8 top_p=0.9 | explanation | div=0.462 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data-based machine learning techniques to improve the performance of computer systems. It is a branch of artificial intelligence, and is a subset of AI that has the potential to automate or enhance systems. Machine learning is the application of the processes that enable a computer to learn from data. The field of machine learning is the term that is used in this context, and it is concerned with the development of computer systems and machines.
+
+
+
+
+
+
+
+
+
+--- temp=0.8 top_p=0.9 | dialogue | div=0.188 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+The old man looked at the light, and said: "What is the light?".
+"I see you are sleeping. You are sleeping. You are sleeping."
+"I see you are sleeping."
+"You are sleeping."
+"You are sleeping."
+"I see you are sleeping."
+"You are sleeping."
+"I see you are sleeping."
+"I see you are sleeping."
+"You are sleeping."
+"I see you are sleeping."
+"You are sleeping."
+"You are sleeping."
+"You are sleeping."
+"You are sleeping."
+"You are sleeping."
+"You are sleeping."
+"I see you are sleeping."
+"I see you are s
+
+--- temp=0.8 top_p=0.95 | story | div=0.995 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived with her family in a cozy cozy burger house nestled among a beautiful forest. She loved to take care of her teddy bear, Timmy, who was just ten and cuddly, and loved to play. One sunny afternoon, she found herself with a ball of plastic wrap and a soft, warm, lovable toy inside. Carefully, she picked up the lovable, and did the same, but with a pint of water, realizing that the water wasn't warm enough, she turned to look at the plastic and saw it. There, under her mattress, was a tiny, c
+
+--- temp=0.8 top_p=0.95 | knowledge | div=0.924 ---
+Prompt: The solar system consists of
+Output:  the system of four planets, the asteroid, Mars, Saturn, Jupiter, Uranus, Neptune, and Neptune, and the Sun. The planets form one-four-twelve-twelve-twenty-three-four, of those celestial bodies; the other four are the suns, the moon, Jupiter, Earth, and the asteroid.
+Solar system is an interesting subject for the students to understand because it is an example of how the sun is the center of the universe. A solar system consists of the sun, its moon, its planets, its stars, the planets, and the 
+
+--- temp=0.8 top_p=0.95 | code | div=0.640 ---
+Prompt: def fibonacci(n):
+Output: 
+    def fibonacci(x):
+      if n == 0: return x
+      return x
+      if n == 0: return fibonci
+      return x
+      else: return n
+    return x
+    n: Fibonacci(n, n, 1, fibonacci, - 1, fibonacci, - 1, 0, n, n, 0, - 1, n, -1, 0, 1, 1, 1, fibonacci, - 1, - 1, -, 1)
+
+    def fibonac(n, i, n, n):
+      if n == 1: return fibonacci
+      if n == n: fibonacci = fibonacci
+      elif n == n: fibonacci = fibonacci
+      else: fibonacci = fibonacci
+      return n
+    def fib
+
+--- temp=0.8 top_p=0.95 | creative | div=0.330 ---
+Prompt: In a world where machines could dream,
+Output:  it has become easier to be a living creature, the bacterium can be a living organism.
+
+Bacteria
+
+Bacteria
+Bacteria
+
+Bacteria
+bacteria
+Bacteria
+bacteria
+
+bacteria
+bacteria
+biology
+physiology
+biology
+biology
+biology
+biochemistry
+biology
+biology
+biochemistry
+biochemistry
+biology
+biochemistry
+biology
+biology
+biochemistry
+biology
+biology
+biology
+biology
+biology
+biology
+biochemistry
+biology
+biology
+biophysics
+biology
+biophysics
+biology
+biology
+biology
+biology
+biology
+biology
+biology
+biology
+biostatis
+
+--- temp=0.8 top_p=0.95 | explanation | div=0.944 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data models to train computers and algorithms to learn from data. It is the use of machine learning techniques to analyze and improve human-machine interfaces to learn from data. Machine learning is the generation of using computers to make decisions by observing human action and coming up with the machine to make an action. It is a field in which is used for various fields in the fields of education.
+Machine learning is used for many fields.
+- Achievin
+
+--- temp=0.8 top_p=0.95 | dialogue | div=0.279 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+* The old man looked at her face. "Fuck, I'm so old now."
+* The old man spoke.
+* The old man looked away.
+* The old man looked up.
+* The old man said.
+* They walked together.
+* The old man said.
+* They walked down.
+* The old man went.
+* The old man went.
+* The old man came.
+* The old man came.
+* The old man went.
+* The old man went.
+* The old man said.
+* The old man went.
+* The old man went.
+* The old man came.
+* The old man went.
+* The old man went.
+* The old man went.
+* The old man came.
+* Th
+
+--- temp=0.9 top_p=0.95 | story | div=0.970 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived near the same town, her mother who had a name change. She loved her family very much and wanted to be herself too. She didn't want to be dirty around all the time. She wanted to be married to her mommy and to my father but Lily wouldn't.
+
+Lily was at home with her mommy and stepsma. Her mommy asked Lily if she wanted to be a part of the family or be a part of their big mommy. Lily said, "You don't like me, mommy. I want to be part of your big family."
+
+Lily thought for a moment and then a
+
+--- temp=0.9 top_p=0.95 | knowledge | div=0.883 ---
+Prompt: The solar system consists of
+Output:  the parts of Earth, the planets and the outer space including the Sun, the Moon, the Earth, the planets, the solar system, and the inner space. With your study, you’ll learn the following eight major parts of the solar system which is home to the spacecraft:
+The outer space consists of the planets and the outer space divided into the Solar system and the Moon. The planets consist of the Sun, the inner Solar system, the Moon, the Earth, the outer space, the inner Solar system. The outer space co
+
+--- temp=0.9 top_p=0.95 | code | div=0.411 ---
+Prompt: def fibonacci(n):
+Output: 
+		print(n)
+		print((fibonacci(n)))
+		print(n)
+
+	return n
+# App C
+# This file is a part of the server module
+#
+import glob
+#!(glob.glob('*.glob('*.glob('*.')))
+from gc import gc
+import gc
+from gc import gc
+from gc import gc
+import gc
+import gc
+import gc
+import gc
+import gc
+import gc
+from gc import gc
+import gc
+import gc
+import gc
+import gd
+import gd
+import gd
+import gd
+import gd
+import gc
+import gc
+import gc
+import gc
+import gc
+import gc
+import gd
+import gd
+import ge
+import ge
+
+from g
+
+--- temp=0.9 top_p=0.95 | creative | div=0.985 ---
+Prompt: In a world where machines could dream,
+Output:  we tend to look at the future—with computers, through systems like the Internet of Things, we should look at the future of the past, the future of the will take more notice of machines, and their future selves.
+It is not “now a living”–it is a concept.
+Since the beginning of the electronic age.we have seen many progress,it has been a place to live.
+In our history there has been an undisciplined view of the future.it has been always.
+during the same.out it is at home.much its again.
+It is very f
+
+--- temp=0.9 top_p=0.95 | explanation | div=0.985 ---
+Prompt: Machine learning is a field of
+Output:  computer science that involves the use of neural networks to learn artificial-intelligence systems, such as computers, natural language processing (NLP) and computer vision. When implemented on a large-scale scale, machine is able to learn and learn in proportion to real human behavior and to a large-scale system like a human-machine intelligence (Intelligence) with 100 or 1000 neurons.
+ManySomnth, F.&c. , 5. 6. The CNN is a Network of a Field of Cascading. (CNN),  Organ,  85. Cognitive Inputs,
+
+--- temp=0.9 top_p=0.95 | dialogue | div=0.909 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+Llame said, "In this little town and gosh, I can tell you how the old man's, is coming."
+"Ye, atall" said the old man.
+"John, if you want to know..."
+We shout he, "Ye, atall"
+Lame a little deaf boy,
+of their friends.
+"Ye, atall"
+we gosh, "E! what the old man's,
+Ye, atre"
+But the old man's.
+You h'd been down
+sent to the old man.
+Ye, atall
+Do you have, that youthed,
+You gosh, that's, these
+You goss, hh, these
+They are at the tail of the old
+Old old gosh,
+In the fine
+Of the weeds where
+Now-Took, a
+
+--- temp=0.7 top_p=0.95 rep=1.1 | story | div=0.995 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived on a cozy beach in the lush, clear blue area of the ocean. She loved to swim around and play with her family, but her mommy, Dadma, was always worried about how she would stay safe during the stormy days! Lily remembered learning that each wave had its own special way to travel – the gentle wave, which seemed to be smooth, while the strong wave, appeared wavy and fast. So, she decided to use her body’s speed to help Lily swim further away from home.
+Lily asked her mommy, “Why is it so har
+
+--- temp=0.7 top_p=0.95 rep=1.1 | knowledge | div=0.970 ---
+Prompt: The solar system consists of
+Output:  a multitude of planets, moons and planets. One is too close to the sun to be of interest, but there are also small ones. Jupiter, Saturn, Uranus and Neptune, which are the largest in our solar system, have only 3 or 4 satellites. Saturn has more than 6, Neptune, 8, 11, 28, and Neptune, 23, but it has a total of 4. The reason is that the total of these are not the same.
+The following diagram shows a diagram of the solar system with the parts of the planet in order, as seen by the sun.
+Mars is a 
+
+--- temp=0.7 top_p=0.95 rep=1.1 | code | div=0.381 ---
+Prompt: def fibonacci(n):
+Output: 
+    if n == 1:
+        return fibonacci(n)
+    else:
+        return n
+
+
+
+def fibonacci(n):
+    if n == 2:
+        return fibonacci(n, 0, n)
+    elif n == 3:
+        return fibonacci(n, 1, n)
+    else:
+        return n
+
+
+
+#    def fibonacci(n):
+    if n == 1:
+        return fibonacci(n, 1, n, n, n, 0)
+    else:
+        return n
+
+
+def fibonacci(n):
+    if n == 1:
+        return fibonacci(n, 0, n, n, 0, n, n, n, 1, n, 1)
+    else:
+        return n
+
+
+
+def fibonac
+
+--- temp=0.7 top_p=0.95 rep=1.1 | creative | div=0.990 ---
+Prompt: In a world where machines could dream,
+Output:  there's a man-made robot would be in the lab of a human being, a robot would be.
+The most effective way to accomplish this is to create robots with some sort of human-like intelligence. "Robots" are those that you've used and it could be a good idea for your class. They have a real human hand and a robot body. Robot is a robot who has a human body. "In fact, a human person can do more than one thing." A man-made human being. It's a great idea! So what if I could teach my class, I could make it 
+
+--- temp=0.7 top_p=0.95 rep=1.1 | explanation | div=0.706 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data to teach computers to identify patterns in data. It is a subset of artificial intelligence, which uses the human brain to learn from data about and apply it to new information.
+Machine learning is used to improve any AI systems such as computer vision, speech recognition, natural language processing, natural language processing, recommendation system, and conversational natural language.
+Machine learning is used to improve AI systems such as artifi
+
+--- temp=0.7 top_p=0.95 rep=1.1 | dialogue | div=0.863 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+And then, the old man told him to go "all the way."
+"What a bast?" said the young man.
+"He went on his bed. He went on his bed."
+He went on his bed.
+'It is what you hear.
+"You see it," said the old man.
+(7) "They were watching your bed."
+I heard you.
+"That was great."
+"How was I?"
+"I saw you.
+"Yes, and it was good."
+(8) "Now I did that!"
+"I saw you."
+"No, no, no no."
+"No, nothing."
+"No, nothing."
+"Okay, then, my own father went on his bed."
+"Oh, I saw you."
+"He went on his bed."
+"If they had se
+
+--- temp=0.7 top_p=0.95 rep=1.2 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived on a cozy beach in the small town of Sunville Beach. She loved her mommy and daddy very much, but she didn't know how to go. One day, she heard some grown-up dolphins coming by and saw them scooping away in the air! Lily was so excited that soon enough, she decided to take an animal home tour where everyone would see one.
+Lily asked her mother if she could take one. Her mother said no, because she couldn't find any way to bring herself with them. But Lily knew not to worry; maybe they cou
+
+--- temp=0.7 top_p=0.95 rep=1.2 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  a multitude of planets, moons and small satellites, but that's the most interesting ones are not rocky. The solar system is more than you can imagine; it has 9 (11) Earths, 8, Mars 4, Neptune 1, Ceres 6 and Saturn 7.
+The Solar System: What Is It?
+Most people assume they know what to do with their solar system, although this may be true for some, just about 10 percent of Americans who live in an area where there isn't much light on the surface. They don't need a computer because all they need is
+
+--- temp=0.7 top_p=0.95 rep=1.2 | code | div=0.964 ---
+Prompt: def fibonacci(n):
+Output: 
+    if n == 1:
+        return fibonacci(n)
+    else:
+        return n-1
+# - Fibonacci a la fonte de sistemi in modifica
+class DCcFibon(D):
+    def __init__(self, *type, **kwargs):
+      super().__init__(type, kwargs)
+
+  @property
+  def _h_b(self):
+    return self.h_modulo
+  # destro ha variachial de teste
+  def _b(self, **kwargs):
+    for key in super.__dict__.keys():
+      try:
+        if type(key) == str(self._h_test):
+          return super(_fibonacci(d))
+      except KeyError as:
+        re
+
+--- temp=0.7 top_p=0.95 rep=1.2 | creative | div=0.985 ---
+Prompt: In a world where machines could dream,
+Output:  there's a man-made robot would be, and who was not born to be human, it was the dream of all time.
+In this sense, we get only what we need from our own world: with the power of a machine. Who wants, one thinks, one knows?
+But that, too, is the fear of evolution itself.
+You don't see me as a pet; you're just a rock, too, I mean! You look like a dog.
+I'll have a body,
+"as if you are!!"
+a place, do
+your i know,
+That he goes on
+that, and on and on
+What a there am I in my way,
+Beware are the things 
+
+--- temp=0.7 top_p=0.95 rep=1.2 | explanation | div=0.975 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data analytics to make computers better. It is the study of using machine learning techniques to improve the performance of a system or program by analyzing how its users learn, without being explicitly programmed into what they are doing.
+Machine learning in Machine Learning: A Brief History
+MachineLearning is an article on technology trends and developments since 1995 by Bill Machine and published as part of their first book “The Machines Of Intellige
+
+--- temp=0.7 top_p=0.95 rep=1.2 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+A friend of mine, who'd heard him for eight years, said: "Oh, I know you're not sure. You've been waiting a long time too!"
+"I have seen the old man on the couch," said the girl in silence, with sighing.
+"Yes," said the old man; "A big dog."
+A new cat, that had four legs and was about six feet long at its tail. The old man, with his eyes closed, watched over, sniffed from behind, then turned round, went around and ran around. Then the old one, came out.
+"Hi! What did you see?" he barked.
+The ol
+
+--- temp=0.7 top_p=0.95 rep=1.3 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived on a cozy beach in the lush, clear blue area of her backyard. She loved to play with her friends and family all day long after school, but she felt always tired and hungry at nighttime because it wasn't as much fun or exciting outside anymore! Her mom asked if Lily could try out for her next big brother, Emily, which was just like when Mommy wanted to go to the store to buy some new clothes for everyone else.
+
+Lily explained, "I don't have any toys now," so gently saying, "Oh yes I can br
+
+--- temp=0.7 top_p=0.95 rep=1.3 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  a multitude of planets, moons and small satellites, but that's the most interesting ones are those in our solar system.
+One is Earth (Mercury) which revolves around Mercury, Venus , Mars , Jupiter , Saturn , Neptune , Uranus and beyond , Jupiter's moon . The other two are Planets or Stars, , and only Planetes , - not stars can be seen with unaided eyes on the ground because their motion is undivided by magnification, so they cannot see all objects from up to them without having an apparent magn
+
+--- temp=0.7 top_p=0.95 rep=1.3 | code | div=0.990 ---
+Prompt: def fibonacci(n):
+Output: 
+    if n == 1: return fibonacci(n)
+    return (fib.c_func())
+    else:
+        return iow._function()((0, 0), fiber.is_s))
+    
+     
+
+def sigmoid():
+    """Somit's a function for the periodic function of `n`.  The argument is set to be an integer between 0 and n."""
+    if not len(int(1))) or (not int):
+      return None
+    elif self[i]=='F': return Fib.Cub.divide(float(2*y=0)), Fib.c_func()
+      # SOMITARESTx = Fib.IFF(i=3+a-b)+DFXRD.subd(7)*dfx\XHH(\hijjk + f'{6}({16}\
+
+--- temp=0.7 top_p=0.95 rep=1.3 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  there's a man-made robot would be, and AI can make the dream work of the world, it is no different than that.
+The UCARX SII project was originally designed to create an electronic system capable of handling and communicating speech. And all this might sound like science fiction: "There are some things in my mind but I don't know they're working," says Dr Mundell. But he hopes the researchers will have one that for them. The idea has been tested with human speech from monkeys using facial recogn
+
+--- temp=0.7 top_p=0.95 rep=1.3 | explanation | div=1.000 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data analytics to make computers better. It is the study of using machine learning techniques, which are applied in a wide variety of ways to assist a person with their day-to-day lives or health needs by providing them more personalized guidance when they need it.”
+Machine Learning Systems has been around for over 150 years now. Machine Learning helps companies learn from experience how best they can use machines like robots do not only because if you 
+
+--- temp=0.7 top_p=0.95 rep=1.3 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+(A) "You are sick. Please come" the old man, and I will go;
+(B) He is dead now. (C) / Now my eyes have seen. (D) they are still! (E) Then your two hand is not gone.
+The old man answered: "My name was John,"
+and he had his mouth's full of water filled with tears.
+And she went back to her place and said unto them,
+To be glad? Why did you get so angry?
+An''t quite it'd well, O Cause, ye
+You laughed too much, And tried hard. The
+Against one-day-in-a-day, the agonseth; You were thy wrong,
+But me did
+
+--- temp=0.8 top_p=0.95 rep=1.1 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived with her family in a cozy apartment in the bustling town of New York City. She loved to play outside and take care of her favorite teddy bear, Daddy the Teddy, who always seemed to be napping herself when she felt tired and frustrated. Even though Daddy was busy, she still kept playing and enjoying her love for children's safety! One day, she noticed something strange - a little bird flying high up out of the window. Lily had no idea what it was, so her mom explained the bird to Daddy and
+
+--- temp=0.8 top_p=0.95 rep=1.1 | knowledge | div=0.954 ---
+Prompt: The solar system consists of
+Output:  the system of two planets, the earth, the sun, and the moon. The planets are the basic parts of the solar system. The solar system is made up of space from the sun and the moon. The interplanetary space between the earth, the solar system and the other planets is called the solar system. The earth is composed of ice and water. It has four natural satellites. The orbit of the sun is also known as a fixed star or planetary body.
+The earth is made up of the solid of the earth and the sun. The univ
+
+--- temp=0.8 top_p=0.95 rep=1.1 | code | div=0.944 ---
+Prompt: def fibonacci(n):
+Output: 
+    def fibonacci(x):
+      if n == 0: return x
+      return fibonac(x)
+      else: return 1 - n
+      x = fibonacci(x)
+      return 3*0+1-n
+    x + 2*(x**2**0)*sum((x**3**n-1)**2-x**2))
+  fibonacci(fibonac(n,n,r,x=x,x,y=x)))
+
+# Note that some of the line is not a square: we can have a
+def fibonacci(x,l,x,y,a,x,k,x,pi,w,b,m,w):
+    for i in (a,b,b,i,h,x,t):
+        l = x**2 + 2**(b*j + 2
+
+--- temp=0.8 top_p=0.95 rep=1.1 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  it has become easier to be a living creature than a mental life.
+The most advanced machine in the world is the one that can handle human-machine tasks, where what can be described as a “life” as a machine. The best example for such capability of minding machines is the “reality”, which is also known as the universe’s machine, that does not exist in humans but has been created by machines that can feel the same emotions, i.
+- “The machine is designed to make” or “t do anything”.
+“Computerized AP
+
+--- temp=0.8 top_p=0.95 rep=1.1 | explanation | div=0.919 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data analytics to teach computers and machine learning systems to make better decisions. It involves using data to understand patterns in the data, and then letting machines learn from those patterns.
+Machine Learning: Machine Learning: The Morph Language Learning System : A language model for learning a system, such as a speaker or algorithm.
+Machine Learning: The Morph Method of Machine Learning : A method of neural networks that mimics the process of
+
+--- temp=0.8 top_p=0.95 rep=1.1 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+For years, the English language was considered as a beautiful trade language. It was said to be of "aestate importance" in that it is the only clear standard, and it had no definite equivalent in American English.
+"When you need it with 'the,' you will have to go."
+The English word for the word plainly, which seems to mean little, is not well understood by the people who are ignorant of its etymology. In this sense, the English word is a compound noun, which has two meanings: one common use and
+
+--- temp=0.8 top_p=0.95 rep=1.2 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived with her family in a cozy apartment, and loved books all the same way. She would spend hours every day playing around her favorite teddy bear on the floor under dappled sunlight until she got tired of going to bed. Her mommy fell asleep or moved off by herself, but Lily still wanted her mommy to sleep so much for all those long hours!
+Lily's mother thought that was a great idea.
+A girl named Amber looked worried because she had been left behind in a big ball game last night.
+Amber showed 
+
+--- temp=0.8 top_p=0.95 rep=1.2 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  the system of five planets, which were formed from a collapsing disk of gas and dust in an icy body. They are Jupiter, Saturn, Neptune and Earth.
+Jupiter is a planet not known to be very hot or bounsound but. It has a solid core made of rock and liquid water with a greenhouse surface that is composed mainly of silicate iron ( 93%) and carbon dioxide. it was likely the first world planet we learned about from the solar system. Jupiter is one out of four out of the seven planets have more than ni
+
+--- temp=0.8 top_p=0.95 rep=1.2 | code | div=0.970 ---
+Prompt: def fibonacci(n):
+Output: 
+    def fibonacci(x):
+      if n == 0: return x**2 + 1
+      if x != y and n==0 and self.n in x[1] == :return False: return False
+      
+     d = np.array([x,y,-])
+    
+     y = lib.get_error_type('fibonacci')
+     for i in d:
+       yield fibrate(i)
+         if i<self.n >1:
+           del sdell.append("Sinegl")
+          break 
+    #def fibonacci (x,y,err="Sinegl"):
+            try:
+             sincilist=np.where(sind.dtype==int)
+              sistepclist=[sind.pop()]]
+                res=np.
+
+--- temp=0.8 top_p=0.95 rep=1.2 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  it has become easier to be a living creature than a more modern human being.
+"It is an unimaginable dream."
+This image of the robot was once created in a movie titled "The First Robot". The film is a direct departure from Thomas Rae Maw's novel, and shows this robot as an intelligent individual who provides knowledge that can drive humanity. While the story is the same as the one of Jules Means, Dahl says it's "universal" self-porting machine, in that it does not function well for him and his o
+
+--- temp=0.8 top_p=0.95 rep=1.2 | explanation | div=1.000 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data processing techniques to improve AI systems. It involves the use of machine learning models, such as deep neural networks (DNN), convolutional neural networks (CNN) and recurrent neural networks (RNN).
+Pineloui H, M, Kovac B, Gudas L, Narada A, Mohammed Yalim S, Haitha, Rahman T.(Machinek:146).
+The first step in machine learning is to build an instance from a dataset which we want. In this case, the "training" part of ML refers to training a model 
+
+--- temp=0.8 top_p=0.95 rep=1.2 | dialogue | div=0.995 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+Sin" said the old man. "I would have you to come back soon."
+And he did, and slew that in the dust of the eye which the king had.
+The word was struck on me by the face of Biddleabaddan [sic] as it was looked upon with the eyes, and ran the head; the thing looked after him; the all over, and the sight for that and for that we passed on into a river; the river turned, and we, and I sat there, till the greatest dray where didst are not savesthee."
+Thus: "he made his way, entered his mouth."
+Deary 
+
+--- temp=0.8 top_p=0.95 rep=1.3 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived with her family in a cozy apartment, loving mommies and daddies. She loved spending time outside exploring the park every day after school when she would put on a new toy. Her parents took Lily to see Dr. Max, who had spent quality afternoons hunched over his toys – Mommy, Daddy, Baby, Antdad, Sam - all visiting from one room out, playing together was exciting! But first, they couldn't be close enough because he didn't have any siblings nearby or friends yet; now, they were siblings no lo
+
+--- temp=0.8 top_p=0.95 rep=1.3 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  the system of five planets, which were formed from a collapsing disk of gas and dust in different stages during its history as well-known stars, but all
+meted together. In each case there was another planet called "Jupiter" : a set from Mire's name, to which he uttered his full name in order," explains Kyle Moore of Vallett. The arrangement is also known by other astronomers as  (Mauritius). The Sun was not named after any planet or galaxy: it appeared at the time when young Suns represented ou
+
+--- temp=0.8 top_p=0.95 rep=1.3 | code | div=0.995 ---
+Prompt: def fibonacci(n):
+Output: 
+    def fibonacci(x): return tp.fibonacci(n) * x**i + n, a[0] <= v >= 0 ? x - 1 : a
+    s = fibonaxicifs([]), a[1], b[2])
+    if i == 8:
+        fibaninopa = [16]]
+    else:
+      try:
+        while j < n-1:
+          s += "?" for i in (j+12)-5 : {"j":"=i==j","k":x:r:"^", lgz:-7 : aoaxi:l for r, "m":nd}
+            J = xi for j in range(4)) \
+         sj=t_9;
+    } #end of FFTDFF and ZEROP
+#-*a* cdefadelfii
+
+--- temp=0.8 top_p=0.95 rep=1.3 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  it has become easier to be a living creature than an aesthetic?
+In the next five years, there will be more and better machines. A machine that can think well would require no human-made intelligence at all—and none of them–but cannot find its place in its own hands.” (Wikipedia). In this article, AI is no different from humans on their terms but they are not less. It’s possible to learn one day by two generations and give up another. The future of man is “creative” like a computer with only bla
+
+--- temp=0.8 top_p=0.95 rep=1.3 | explanation | div=1.000 ---
+Prompt: Machine learning is a field of
+Output:  computer science that uses algorithms and data science to develop computers designed to learn from experience-free, or improve by machine learning. The term refers to the ability of a new technique for training an existing algorithm on unseen or unknown information in order to make an output stronger when it has been trained with human examples. It is also used as one of continuous performance (CSIM) since it involves using time to be learned through trial/error [machine] to target similar prob
+
+--- temp=0.8 top_p=0.95 rep=1.3 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+Afterward the old man said to the door, "Is it still?" and there was a small voice. He turned up at him and asked his name. No who are I not of this? "No, no!" The old man answered all, by biting back: "Yes." Then he shook them again; inquaining took their place till the dead was gone out. As for you see me! a huff's on his mouser? There were two men standing near the entrance then one after another. And now they turned aside as to let go straight to tell others what had happened to take their 
+
+--- temp=0.9 top_p=0.95 rep=1.2 | story | div=0.995 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived near the same town, her mother. Her mom worked for a big factory where all the toys were made by herself! There was an old toy that Lily had; she took it home from her dad's house, and let it be yours to borrow out first then called their new friend Mr. It was time he said something special.
+» She asked Mrs. Reckles what they needed now? ¡¦ A$ They wanted something they could lend together to her.
+» They offered they $10 off to Mr. It might get him well´ without giving you two shillings, 
+
+--- temp=0.9 top_p=0.95 rep=1.2 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  the parts of four planets, which have similar orbit to and belong together in a very big circle. These are Mercury, Venus (Mercury), Earth, Mars, Sun (Ogma) and Neptune .
+Ptolemy: The invisible Sun also refers to His name. He is known as, from his sacred name ‘Pehly’, or Arbelo Ptolemy.
+Pichethos: The centre-lined region of The twelve signs , located at Picoeusae on the high-sphere side of the Moon has also an adoration called Mounial: This is situated about 800 km north of the centre of San Qu
+
+--- temp=0.9 top_p=0.95 rep=1.2 | code | div=0.944 ---
+Prompt: def fibonacci(n):
+Output: 
+	def fibonacci(x):
+        """Return the Fibonacci numbers of n."""
+	return fibonacci(n)) + "fibin"
+    return arco (x) # ArCo*17!!1iFibonacciFibonacciFibonoca !!
+else:
+# 	print("\n\t")
+from collections import defaultdict
+
+from django.contrib import admin as _admin
+
+import views
+
+models = models or functions_constant_AdminForm()
+
+deggenormed_form = apps.views._DeclsFields(default=admin, descriptions=['deggest']))
+<filename>features/noopgscience/archive/noopgscience-modeler.py<gh_stars
+
+--- temp=0.9 top_p=0.95 rep=1.2 | creative | div=0.970 ---
+Prompt: In a world where machines could dream,
+Output:  we tend to look at the future when machines get better for themselves, and look at them in a more positive light. But also if they could see how it is our identity is in the same world, we can lead ourselves forward with more humility.”-Robert Lawrence Davis
+Getty Images / Getty Images | All images / Getty ImagesMedically, mediated tachycardia (SYMPH) refers to mild pain on the side of your arm. A kind of tachycardia is characterised by having dull or painful sensations in front part of body re
+
+--- temp=0.9 top_p=0.95 rep=1.2 | explanation | div=1.000 ---
+Prompt: Machine learning is a field of
+Output:  computer science that involves the use of computational techniques to improve training in computers. It is a subfield of artificial intelligence, which means using computer algorithms and deep learning methods, known as machine learning.
+Machine has been around for some time now the core from math to today. In fact, it was quite popular in many countries by the students as they were familiar with other names like 'machine', but their main focus was in IT since there are a lot of programming com
+
+--- temp=0.9 top_p=0.95 rep=1.2 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+Shannon had a little son with her brother, Scanch. "We've got your boys." Shannon had been with him all his life.
+Which according to the old lady's story?
+in which country did she live in January he rent-more years of her house than
+of Mabbied's by the African monks?
+from he must sit on her own steege and he should leave this because she was killed there at Shannoson.
+"Betes crete beme d'isle car un par . Rue fly aans livre, moyam vez que nous sans valeur.", said
+Frankville was too much to do
+S
+
+--- temp=1.0 top_p=0.95 rep=1.2 | story | div=1.000 ---
+Prompt: Once upon a time, a little girl named Lily
+Output:  lived her amazing. She loved to dream about wild animals after bedtime, but never really understood why she couldn't go on. "I wonder if I could ever see?/ Lately," Mommy asked curiously one day.
+"Why is Daddy signing out of space?" Lily thought for a moment. Mommy explained, like, watch Dad's bobs I watch! And Mommy would look at that!" "Hence!"
+You Might danced so hard and then Mommy came overland. Now Mothermy had no idea it's real GREE!Alligas calf (F. vinorica), (C. tridianata), probably w
+
+--- temp=1.0 top_p=0.95 rep=1.2 | knowledge | div=1.000 ---
+Prompt: The solar system consists of
+Output:  four subplanets, or "labs," of other star systems in the Solar System that are mostly composed of rocky and terrestrial planets. These include Uranus (Ýa), Neptune (û²) (Ne, the Sunêí Di);  2006 Triton (Luna Pop), Eris (Maålia Pop), Moosa/Dei (Mapp), Aet/Nisserand/Pagepröngel/Tartarpoppúls/Jager (Lunnadi zêˑdrikçke dervuŕ or simply: Pátónas innó kum doko ).
+Polaris is also a planetarium dey. In Wilheliačiny and her adjacent minor planetae there are two Punicała co-allie after this solar system 
+
+--- temp=1.0 top_p=0.95 rep=1.2 | code | div=0.985 ---
+Prompt: def fibonacci(n):
+Output: 
+	a = nn.ML((int(22)/2))
+	return a[i for i in a in a] + b
+
+def 0ai ():
+    def fibonacci(t, d, tq1xr=self.fib):
+        self.d(t).append(' - ' *tfxy)')  # # TODO [BC-3-7??in promise](https://ucatementcouk.com/durkhand)
+def 0ai (): pass       for [:sveljdxxs], [0]<X>(m): for x:-m_{:-yvector$dw+l}z$ to be λ <nry. ): d( y\,\>... )		  # ... end1
+    return y_improij(x, (-XY(xih))); 
+    
+tfcssocopjeeNDjeic
+
+--- temp=1.0 top_p=0.95 rep=1.2 | creative | div=1.000 ---
+Prompt: In a world where machines could dream,
+Output:  humans communicated over the possibility of pinny-entisms and other human inventions had never been conceived, a special memory needed to survive:
+for it was distinguished who no machine could hear, and where there’d of their fears there would then have waited against machines thought of in the universe.
+THE WECHN DAYDYPINK and MAYYEXH TEELT-TEENI HALATIVE CANAKAB PANGENNUTTUGNEIM"SUSUMISEEY ANDDUBABLE ROW&HEIN");
+    "What one sent me for is the only that document that’s most diver”.
+ 	The doc
+
+--- temp=1.0 top_p=0.95 rep=1.2 | explanation | div=0.990 ---
+Prompt: Machine learning is a field of
+Output:  computer science that involves the use of "human neural networks". An example is a model of a self-driving car, a self-driving motor.
+Prior routes take in many areas and can be used in almost any environment - which is theoretically reasonable at best local conditions.
+This problem is good for learning "at large scale only." The problem means what not more than two million recent jobs could be done with today's throesided testhe will give it an answer to work. What h/r runh/ run h either got tw
+
+--- temp=1.0 top_p=0.95 rep=1.2 | dialogue | div=1.000 ---
+Prompt: "Hello," said the old man. "I've been waiting for you."
+Output: 
+Are you just looking for a pat on? Do God Him? Yes, yes! Have you found the man that has answers to all of your prayers?
+b\ Nakammatikan B.am\ nebstuhatuel:\upinterukatha\m\ewebDearToho(\doslami-kxine2's)Sleep science activity - A short introduction on topics (wcanms!ku b= sftekasech siji ttlimahin: mgrankae son slept swarneewin ak-anktueli saav kuai flagti chuliq miniplay sosny).
+//## SET READING S/WISDOT BIOWALL OUTs ON WIREPSKANGA+PIDLErkWOpe---ANBOd WRAPH{VOSEQMSCET chake
+
