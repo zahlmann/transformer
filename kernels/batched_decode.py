@@ -1,13 +1,15 @@
 """
 Batched multi-SM decode kernel.
 
+Phase C architecture: RMSNorm, RoPE, SwiGLU, no biases, tied embeddings, GQA.
+
 Processes B sequences in parallel with shared weight loads.
 Grid = (N_HEADS * KV_SPLITS,) — same as single-sequence multi-SM kernel.
 Each block handles all B sequences: loads weights once, applies to B hidden states.
 
 Weight amortization:
   - Q/K/V/O projections: load (D_MODEL, D_HEAD) once, apply to B sequences
-  - FFN up/down: load per k-tile once, apply to B sequences
+  - FFN gate/up/down: load per k-tile once, apply to B sequences
   - Output projection: load per tile once, apply to B sequences
 
 Per-sequence state:
@@ -23,7 +25,7 @@ Workspace layout (all f32):
   partial:     B * TOTAL_BLOCKS * D_BLOCK        -- attention o_proj (phase 1 only)
   ffn_buf:     B * TOTAL_BLOCKS * D_BLOCK        -- FFN partials (phase 2 only)
   attn_buf:    B * D_BLOCK                      -- attention residual (written phase 2, read phase 3)
-  h_norm_buf:  B * D_BLOCK                      -- LN1 output (phase 1 only, separate from attn_buf)
+  h_norm_buf:  B * D_BLOCK                      -- RMSNorm1 output (phase 1 only, separate from attn_buf)
   attn_ml:     B * TOTAL_BLOCKS * 2              -- (m, l) for KV-split merge
   qkv_tmp:     TOTAL_BLOCKS * 3 * B * D_HEAD    -- per-block Q/K_new/V_new/attn_out
   barrier:     32                               -- arrival counter (cache line)
@@ -36,7 +38,7 @@ RACE-FREE DESIGN:
     h + attn_total before a slow block reads the original h.
   - partial and ffn_buf are separate buffers (no merge/FFN overlap).
   - attn_buf stores the attention residual (all blocks write same value).
-  - h_norm is kept in REGISTERS (fused merge+LN2+FFN per batch element).
+  - h_norm is kept in REGISTERS (fused merge+RMSNorm2+FFN per batch element).
 """
 
 import triton
@@ -54,10 +56,11 @@ PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEA
 @triton.jit
 def _batched_decode(
     # Inputs
-    token_emb_ptr, pos_emb_ptr,
+    token_emb_ptr,
     packed_w_ptr,
-    lnf_s_ptr, lnf_b_ptr,
+    lnf_s_ptr,
     output_proj_ptr,
+    cos_ptr, sin_ptr,
     token_ids_ptr,        # (B,) int32
     positions_ptr,        # (B,) int32
     kv_in_ptr,            # (B * TOTAL_KV_SIZE,) bf16
@@ -114,26 +117,26 @@ def _batched_decode(
     done_ptr = workspace_ptr + DONE_OFF
     argmax_ptr = workspace_ptr + ARGMAX_OFF
 
-    # ── Embedding for all B sequences (write to buf_a = offset 0) ──
+    # ── Embedding for all B sequences (no positional — RoPE applied in attention) ──
     H_BUF_SIZE: tl.constexpr = BATCH_SIZE * D_BLOCK
     for b in tl.range(0, BATCH_SIZE):
         token_id = tl.load(token_ids_ptr + b)
-        pos = tl.load(positions_ptr + b)
-        h = (tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
-           + tl.load(pos_emb_ptr + pos * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32))
+        h = tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
         tl.store(h_buf_ptr + b * D_BLOCK + d, h, mask=d_mask)
 
     # ── Layer constants ──
     LAYER_W_SIZE: tl.constexpr = (
-        D_MODEL + D_MODEL +
-        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
-        D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF * D_MODEL
+        D_MODEL +                                                                    # ln1 scale
+        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +  # qkvo
+        D_MODEL +                                                                    # ln2 scale
+        D_MODEL * D_FF + D_MODEL * D_FF + D_FF * D_MODEL                            # gate, up, down
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
-    scale = 0.17677669529663689   # 1/sqrt(32)
+    scale = 1.0 / (D_HEAD ** 0.5)
     GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
+    D_HALF: tl.constexpr = D_HEAD // 2
+    rope_lo = tl.arange(0, D_HALF)
 
     hd = head_id * D_HEAD + dh
     kv_head = head_id // GQA_GROUP
@@ -157,31 +160,28 @@ def _batched_decode(
         # Weight offsets
         off = w_base
         ln1_s_off = off;    off += D_MODEL
-        ln1_b_off = off;    off += D_MODEL
         wq_off = off;       off += D_MODEL * D_MODEL
         wk_off = off;       off += D_MODEL * D_KV
         wv_off = off;       off += D_MODEL * D_KV
         wo_off = off;       off += D_MODEL * D_MODEL
         ln2_s_off = off;    off += D_MODEL
-        ln2_b_off = off;    off += D_MODEL
+        gate_off = off;     off += D_MODEL * D_FF
         up_off = off;       off += D_MODEL * D_FF
         down_off = off
 
         # ══════════════════════════════════════════════════
-        # PHASE 1: LN1 + Q/K/V projections + Attention + O projection
+        # PHASE 1: RMSNorm1 + Q/K/V projections + RoPE + Attention + O projection
         # h_norm stored to per-block qkv_tmp section (race-free: each block
         # only reads its own writes). Weights loaded one at a time.
         # ══════════════════════════════════════════════════
 
-        # 1a. LN1 for all B — store to h_norm_buf (separate from attn_buf)
+        # 1a. RMSNorm1 for all B — store to h_norm_buf (separate from attn_buf)
         ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln1_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
         for b in tl.range(0, BATCH_SIZE):
             h = tl.load(h_buf_ptr + h_in_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
-            mean = tl.sum(h) / D_MODEL
-            hc = tl.where(d_mask, h - mean, 0.0)
+            h_sq = tl.where(d_mask, h * h, 0.0)
             h_norm = tl.where(d_mask,
-                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                               0.0)
             tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
@@ -219,13 +219,6 @@ def _batched_decode(
                 K_acc = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
                 K_acc += tl.dot(h_tile[None, :], wk_t).to(tl.float32).sum(axis=0)
                 tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, K_acc)
-        for b in tl.range(0, BATCH_SIZE):
-            pos_b = tl.load(positions_ptr + b)
-            kv_b = b * TOTAL_KV_SIZE
-            K_new = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
-            tl.store(kv_out_ptr + kv_b + kc_base + cache_off + pos_b * D_HEAD + dh,
-                     K_new.to(tl.bfloat16))
-
         # V projection (tiled) + store to KV cache
         for b in tl.range(0, BATCH_SIZE):
             tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh, tl.zeros((D_HEAD,), dtype=tl.float32))
@@ -240,9 +233,36 @@ def _batched_decode(
                 V_acc = tl.load(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh)
                 V_acc += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
                 tl.store(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh, V_acc)
+
+        # ── RoPE on Q and K_new + store K/V to cache ──
         for b in tl.range(0, BATCH_SIZE):
             pos_b = tl.load(positions_ptr + b)
             kv_b = b * TOTAL_KV_SIZE
+            cos_val = tl.load(cos_ptr + pos_b * D_HALF + rope_lo).to(tl.float32)
+            sin_val = tl.load(sin_ptr + pos_b * D_HALF + rope_lo).to(tl.float32)
+
+            scratch = h_norm_ptr + b * D_BLOCK  # reuse h_norm_buf as scratch
+            # Rotate Q
+            Q = tl.load(qkv_tmp_ptr + b * D_HEAD + dh)
+            tl.store(scratch + dh, Q)
+            q_lo = tl.load(scratch + rope_lo)
+            q_hi = tl.load(scratch + D_HALF + rope_lo)
+            tl.store(scratch + rope_lo, q_lo * cos_val - q_hi * sin_val)
+            tl.store(scratch + D_HALF + rope_lo, q_lo * sin_val + q_hi * cos_val)
+            Q = tl.load(scratch + dh)
+            tl.store(qkv_tmp_ptr + b * D_HEAD + dh, Q)
+            # Rotate K_new
+            K_new = tl.load(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh)
+            tl.store(scratch + dh, K_new)
+            k_lo = tl.load(scratch + rope_lo)
+            k_hi = tl.load(scratch + D_HALF + rope_lo)
+            tl.store(scratch + rope_lo, k_lo * cos_val - k_hi * sin_val)
+            tl.store(scratch + D_HALF + rope_lo, k_lo * sin_val + k_hi * cos_val)
+            K_new = tl.load(scratch + dh)
+            tl.store(qkv_tmp_ptr + (BATCH_SIZE + b) * D_HEAD + dh, K_new)
+            # Store K_new (with RoPE) and V_new to cache
+            tl.store(kv_out_ptr + kv_b + kc_base + cache_off + pos_b * D_HEAD + dh,
+                     K_new.to(tl.bfloat16))
             V_new = tl.load(qkv_tmp_ptr + (2 * BATCH_SIZE + b) * D_HEAD + dh)
             tl.store(kv_out_ptr + kv_b + vc_base + cache_off + pos_b * D_HEAD + dh,
                      V_new.to(tl.bfloat16))
@@ -320,14 +340,13 @@ def _batched_decode(
             pass
 
         # ══════════════════════════════════════════════════
-        # PHASE 2a: Merge attention + LN2 for all B → store h_norm to buffer
+        # PHASE 2a: Merge attention + RMSNorm2 for all B → store h_norm to buffer
         # ══════════════════════════════════════════════════
         # h_buf is READ-ONLY here (no write until phase 3).
         # attn_total stored to attn_buf (all blocks write same value — benign race).
         # h_norm stored to h_norm_buf for FFN weight amortization.
 
         ln_s = tl.load(packed_w_ptr + ln2_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-        ln_b = tl.load(packed_w_ptr + ln2_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
         ff_start = pid * FF_PER_BLOCK
 
         for b in tl.range(0, BATCH_SIZE):
@@ -355,12 +374,11 @@ def _batched_decode(
             # Store attn_total for phase 3 (all blocks write same value)
             tl.store(attn_buf_ptr + b * D_BLOCK + d, attn_total, mask=d_mask)
 
-            # LN2 on (h + attn_total) → store h_norm for weight-amortized FFN
+            # RMSNorm2 on (h + attn_total) → store h_norm for weight-amortized FFN
             h_attn = h + attn_total
-            mean = tl.sum(h_attn) / D_MODEL
-            hc = tl.where(d_mask, h_attn - mean, 0.0)
+            h_sq = tl.where(d_mask, h_attn * h_attn, 0.0)
             h_norm = tl.where(d_mask,
-                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              ln_s * h_attn * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                               0.0)
             tl.store(h_norm_ptr + b * D_BLOCK + d, h_norm, mask=d_mask)
 
@@ -372,16 +390,22 @@ def _batched_decode(
 
         for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
             kk = ff_start + k + tl.arange(0, BLOCK_K)
+            ff_mask = kk < D_FF
+            # Gate projection
+            gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :],
+                             mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
+            # Up projection
             up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
-                           mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                           mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
             down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
-                             mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
+                             mask=ff_mask[:, None] & d_mask[None, :], other=0.0).to(tl.bfloat16)
 
             for b in tl.range(0, BATCH_SIZE):
                 h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d, mask=d_mask, other=0.0)
                 h_norm_2d = h_norm[None, :].to(tl.bfloat16)
+                gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-                act = up * tl.sigmoid(1.702 * up)
+                act = (gate * tl.sigmoid(gate)) * up
                 partial = tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
                 if k == 0:
@@ -420,10 +444,9 @@ def _batched_decode(
         # next layer's phase 1 without waiting for other blocks.
 
     # ══════════════════════════════════════════════════
-    # OUTPUT: Final LN + tiled output projection + argmax
+    # OUTPUT: Final RMSNorm + tiled output projection + argmax
     # ══════════════════════════════════════════════════
     ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
-    ln_b = tl.load(lnf_b_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
 
     TILES_PER_BLOCK: tl.constexpr = VOCAB_PAD // (OUTPUT_VTILE * TOTAL_BLOCKS)
     # After N_LAYERS, final h is in the output buffer of the last layer
@@ -431,10 +454,9 @@ def _batched_decode(
 
     for b in tl.range(0, BATCH_SIZE):
         h = tl.load(h_buf_ptr + h_final_off + b * D_BLOCK + d, mask=d_mask, other=0.0)
-        mean = tl.sum(h) / D_MODEL
-        hc = tl.where(d_mask, h - mean, 0.0)
+        h_sq = tl.where(d_mask, h * h, 0.0)
         h_final = tl.where(d_mask,
-                           ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                           ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                            0.0)
         h_final_2d = h_final[None, :].to(tl.bfloat16)
 
@@ -516,12 +538,16 @@ def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
     n_kv_heads = config.get("n_kv_heads", n_heads)
     d_kv = n_kv_heads * d_head
     n_layers = config["n_layers"]
-    d_ff = 4 * d_model
+    d_ff = config["d_ff"]
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
     total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head  # per sequence
     total_blocks = n_heads * kv_splits
-    ff_per_block = d_ff // total_blocks
+
+    # FF_PER_BLOCK: ceiling division, padded to BLOCK_K for clean loop
+    block_k = 16
+    raw_ff = (d_ff + total_blocks - 1) // total_blocks
+    ff_per_block = ((raw_ff + block_k - 1) // block_k) * block_k
 
     # Workspace offsets (all f32) — use d_block for power-of-2 alignment
     h_buf_off = 0
@@ -539,10 +565,11 @@ def batched_decode_nlayer(w, config, token_ids, positions, kv_packed_batch,
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
 
     logits_pad, kv_out, next_tokens = jt.triton_call(
-        w["token_emb"], w["pos_emb"],
+        w["token_emb"],
         w["packed_w"],
-        w["lnf_s"], w["lnf_b"],
+        w["lnf_s"],
         w["output_proj_padded"],
+        w["cos"], w["sin"],
         jnp.asarray(token_ids, dtype=jnp.int32),
         jnp.asarray(positions, dtype=jnp.int32),
         kv_packed_batch,

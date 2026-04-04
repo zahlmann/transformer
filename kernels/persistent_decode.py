@@ -1,6 +1,8 @@
 """
 Persistent multi-SM decode kernel — loops internally across decode steps.
 
+Phase C architecture: RMSNorm, RoPE, SwiGLU, no biases, tied embeddings, GQA.
+
 Eliminates per-step overhead:
   - No workspace allocation per step (pre-allocated once)
   - No JAX dispatch per step (single kernel launch)
@@ -31,10 +33,11 @@ PROJ_TILE    = tl.constexpr(512)   # tile Q/K/V/O projections when D_BLOCK*D_HEA
 @triton.jit
 def _persistent_decode(
     # Inputs
-    token_emb_ptr, pos_emb_ptr,
+    token_emb_ptr,
     packed_w_ptr,
-    lnf_s_ptr, lnf_b_ptr,
+    lnf_s_ptr,
     output_proj_ptr,
+    cos_ptr, sin_ptr,
     first_token_ptr,       # int32 scalar — initial token
     start_pos_ptr,         # int32 scalar — initial position
     kv_ptr,                # (TOTAL_KV_SIZE,) bf16 — input KV cache (read-only)
@@ -83,16 +86,18 @@ def _persistent_decode(
     next_tok_ptr = workspace_ptr + NEXT_TOK_OFF
 
     LAYER_W_SIZE: tl.constexpr = (
-        D_MODEL + D_MODEL +
-        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +
-        D_MODEL + D_MODEL +
-        D_MODEL * D_FF + D_FF * D_MODEL
+        D_MODEL +                                                                    # ln1 scale
+        D_MODEL * D_MODEL + D_MODEL * D_KV + D_MODEL * D_KV + D_MODEL * D_MODEL +  # qkvo
+        D_MODEL +                                                                    # ln2 scale
+        D_MODEL * D_FF + D_MODEL * D_FF + D_FF * D_MODEL                            # gate, up, down
     )
     LAYER_KV_SIZE: tl.constexpr = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD
 
-    scale = 0.17677669529663689   # 1/sqrt(32)
+    scale = 1.0 / (D_HEAD ** 0.5)
     GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
     POS_PER_SPLIT: tl.constexpr = MAX_SEQ // KV_SPLITS
+    D_HALF: tl.constexpr = D_HEAD // 2
+    rope_lo = tl.arange(0, D_HALF)
 
     hd = head_id * D_HEAD + dh
     kv_head = head_id // GQA_GROUP
@@ -125,9 +130,8 @@ def _persistent_decode(
     for step in tl.range(0, N_STEPS):
         pos = start_pos + step
 
-        # ── Embedding ──
-        h = (tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
-           + tl.load(pos_emb_ptr + pos * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32))
+        # ── Embedding (no positional — RoPE applied in attention) ──
+        h = tl.load(token_emb_ptr + token_id * D_MODEL + d, mask=d_mask, other=0.0).to(tl.float32)
 
         b_off = 1 + step * BARRIERS_PER_STEP  # +1 for initial copy barrier
 
@@ -139,23 +143,20 @@ def _persistent_decode(
 
             off = w_base
             ln1_s_off = off;    off += D_MODEL
-            ln1_b_off = off;    off += D_MODEL
             wq_off = off;       off += D_MODEL * D_MODEL
             wk_off = off;       off += D_MODEL * D_KV
             wv_off = off;       off += D_MODEL * D_KV
             wo_off = off;       off += D_MODEL * D_MODEL
             ln2_s_off = off;    off += D_MODEL
-            ln2_b_off = off;    off += D_MODEL
+            gate_off = off;     off += D_MODEL * D_FF
             up_off = off;       off += D_MODEL * D_FF
-            down_off = off;     off += D_FF * D_MODEL
+            down_off = off
 
-            # ── PHASE 1: LN1 + Attention ──
+            # ── PHASE 1: RMSNorm1 + Attention ──
             ln_s = tl.load(packed_w_ptr + ln1_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-            ln_b = tl.load(packed_w_ptr + ln1_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
-            mean = tl.sum(h) / D_MODEL
-            hc = tl.where(d_mask, h - mean, 0.0)
+            h_sq = tl.where(d_mask, h * h, 0.0)
             h_norm = tl.where(d_mask,
-                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                               0.0)
             # Tile Q/K/V projections along D_BLOCK to fit in shared memory.
             # At D_BLOCK=1024, D_HEAD=64: full (1024,64) bf16 = 128KB > 101KB smem.
@@ -180,7 +181,28 @@ def _persistent_decode(
                                mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
                 V_new += tl.dot(h_tile[None, :], wv_t).to(tl.float32).sum(axis=0)
 
-            # Write K_new/V_new at pos before attention.
+            # ── RoPE on Q and K_new via scratch buffer ──
+            cos_val = tl.load(cos_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+            sin_val = tl.load(sin_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+
+            scratch = partial_ptr + pid * D_BLOCK
+            # Rotate Q
+            tl.store(scratch + dh, Q)
+            q_lo = tl.load(scratch + rope_lo)
+            q_hi = tl.load(scratch + D_HALF + rope_lo)
+            tl.store(scratch + rope_lo, q_lo * cos_val - q_hi * sin_val)
+            tl.store(scratch + D_HALF + rope_lo, q_lo * sin_val + q_hi * cos_val)
+            Q = tl.load(scratch + dh)
+
+            # Rotate K_new
+            tl.store(scratch + dh, K_new)
+            k_lo = tl.load(scratch + rope_lo)
+            k_hi = tl.load(scratch + D_HALF + rope_lo)
+            tl.store(scratch + rope_lo, k_lo * cos_val - k_hi * sin_val)
+            tl.store(scratch + D_HALF + rope_lo, k_lo * sin_val + k_hi * cos_val)
+            K_new = tl.load(scratch + dh)
+
+            # Write K_new (with RoPE) and V_new at pos before attention.
             tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
             tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
@@ -245,7 +267,7 @@ def _persistent_decode(
             while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
                 pass
 
-            # ── PHASE 2: Merge attention + LN2 + FFN ──
+            # ── PHASE 2: Merge attention + RMSNorm2 + SwiGLU FFN ──
             attn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
             for head in tl.range(N_HEADS):
                 m_max_val = tl.full((), -1e9, dtype=tl.float32)
@@ -264,25 +286,33 @@ def _persistent_decode(
                 attn_total = attn_total + o_merged / l_total
             h = h + attn_total
 
+            # RMSNorm2
             ln_s = tl.load(packed_w_ptr + ln2_s_off + d, mask=d_mask, other=0.0).to(tl.float32)
-            ln_b = tl.load(packed_w_ptr + ln2_b_off + d, mask=d_mask, other=0.0).to(tl.float32)
-            mean = tl.sum(h) / D_MODEL
-            hc = tl.where(d_mask, h - mean, 0.0)
+            h_sq = tl.where(d_mask, h * h, 0.0)
             h_norm = tl.where(d_mask,
-                              ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                              ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                               0.0)
             h_norm_2d = h_norm[None, :].to(tl.bfloat16)
 
+            # SwiGLU FFN (distributed across blocks)
             ff_start = pid * FF_PER_BLOCK
             ffn_partial = tl.zeros((D_BLOCK,), dtype=tl.float32)
             for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):
                 kk = ff_start + k + tl.arange(0, BLOCK_K)
+                ff_mask = kk < D_FF
+                # Gate projection
+                gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :],
+                                 mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
+                gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+                # Up projection
                 up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :],
-                               mask=d_mask[:, None], other=0.0).to(tl.bfloat16)
+                               mask=d_mask[:, None] & ff_mask[None, :], other=0.0).to(tl.bfloat16)
                 up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-                act = up * tl.sigmoid(1.702 * up)
+                # SwiGLU: SiLU(gate) * up
+                act = (gate * tl.sigmoid(gate)) * up
+                # Down projection
                 down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
-                                 mask=d_mask[None, :], other=0.0).to(tl.bfloat16)
+                                 mask=ff_mask[:, None] & d_mask[None, :], other=0.0).to(tl.bfloat16)
                 ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
             tl.store(partial_ptr + pid * D_BLOCK + d, ffn_partial, mask=d_mask)
@@ -301,13 +331,11 @@ def _persistent_decode(
                 ffn_total += tl.load(partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
             h = h + ffn_total
 
-        # ── OUTPUT: Final LN + tiled output projection + argmax ──
+        # ── OUTPUT: Final RMSNorm + tiled output projection + argmax ──
         ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
-        ln_b = tl.load(lnf_b_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
-        mean = tl.sum(h) / D_MODEL
-        hc = tl.where(d_mask, h - mean, 0.0)
+        h_sq = tl.where(d_mask, h * h, 0.0)
         h_final = tl.where(d_mask,
-                           ln_s * hc * tl.math.rsqrt(tl.sum(hc * hc) / D_MODEL + 1e-5) + ln_b,
+                           ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
                            0.0)
         h_final_2d = h_final[None, :].to(tl.bfloat16)
 
@@ -398,12 +426,16 @@ def persistent_decode_nlayer(w, config, first_token, start_pos, kv_packed,
     n_kv_heads = config.get("n_kv_heads", n_heads)
     d_kv = n_kv_heads * d_head
     n_layers = config["n_layers"]
-    d_ff = 4 * d_model
+    d_ff = config["d_ff"]
     max_seq = config["context_len"]
     vocab_pad = w["vocab_pad"]
     total_kv_size = n_layers * 2 * n_kv_heads * max_seq * d_head
     total_blocks = n_heads * kv_splits
-    ff_per_block = d_ff // total_blocks
+
+    # FF_PER_BLOCK: ceiling division, padded to BLOCK_K for clean loop
+    block_k = 16
+    raw_ff = (d_ff + total_blocks - 1) // total_blocks
+    ff_per_block = ((raw_ff + block_k - 1) // block_k) * block_k
 
     # Barriers per step: 2 per layer + 1 combined output/step-sync
     barriers_per_step = 2 * n_layers + 1
@@ -427,10 +459,11 @@ def persistent_decode_nlayer(w, config, first_token, start_pos, kv_packed,
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
 
     token_out, logits_pad, kv_out = jt.triton_call(
-        w["token_emb"], w["pos_emb"],
+        w["token_emb"],
         w["packed_w"],
-        w["lnf_s"], w["lnf_b"],
+        w["lnf_s"],
         w["output_proj_padded"],
+        w["cos"], w["sin"],
         jnp.int32(first_token), jnp.int32(start_pos),
         kv_packed,
         workspace,
