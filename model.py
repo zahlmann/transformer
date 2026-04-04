@@ -179,28 +179,24 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin):
     seq_len, d_model = x.shape
     d_head = d_model // n_heads
 
-    q = (x @ wq).reshape(seq_len, n_heads, d_head).transpose(1, 0, 2)
-    k = (x @ wk).reshape(seq_len, n_kv_heads, d_head).transpose(1, 0, 2)
-    v = (x @ wv).reshape(seq_len, n_kv_heads, d_head).transpose(1, 0, 2)
+    # (seq, n_heads, d_head) layout for jax.nn.dot_product_attention
+    q = (x @ wq).reshape(seq_len, n_heads, d_head)
+    k = (x @ wk).reshape(seq_len, n_kv_heads, d_head)
+    v = (x @ wv).reshape(seq_len, n_kv_heads, d_head)
 
     cos_seq = cos[:seq_len]
     sin_seq = sin[:seq_len]
-    q = apply_rope(q, cos_seq[None, :, :], sin_seq[None, :, :])
-    k = apply_rope(k, cos_seq[None, :, :], sin_seq[None, :, :])
+    # apply_rope expects (n_heads, seq, d_head), transpose in and out
+    q = apply_rope(q.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
+    k = apply_rope(k.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
 
-    if n_kv_heads < n_heads:
-        repeats = n_heads // n_kv_heads
-        k = jnp.repeat(k, repeats, axis=0)
-        v = jnp.repeat(v, repeats, axis=0)
+    # cuDNN FlashAttention: handles GQA natively, is_causal avoids materializing mask
+    # Cast all to bf16 for cuDNN (RoPE promotes q/k to f32 via cos/sin tables)
+    q = q.astype(jnp.bfloat16)
+    k = k.astype(jnp.bfloat16)
+    out = jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation='cudnn')
 
-    scale = d_head ** -0.5
-    attn = (q @ k.transpose(0, 2, 1)) * scale
-    mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-    attn = jnp.where(mask, attn, -1e9)
-    attn = jax.nn.softmax(attn, axis=-1)
-
-    out = (attn @ v).transpose(1, 0, 2).reshape(seq_len, d_model)
-    return out @ wo
+    return out.reshape(seq_len, d_model) @ wo
 
 
 # ─── gated deltanet attention ───
