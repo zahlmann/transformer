@@ -27,7 +27,7 @@ def _layer_types(n_layers):
 
 
 def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=None, use_deltanet=False):
+                     n_kv_heads=None, use_deltanet=False, n_mtp_heads=0):
     """Initialize a decoder-only transformer. Returns a flat dict of params.
 
     Architecture: RMSNorm, RoPE, SwiGLU FFN, no biases, tied embeddings.
@@ -132,6 +132,14 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
 
     # final RMSNorm
     params["ln_final.scale"] = jnp.ones(d_model)
+
+    # MTP heads: small projection (d_model -> d_model) per extra head
+    # logits_k = rms_norm(h @ mtp_proj_k) @ token_emb.T
+    config["n_mtp_heads"] = n_mtp_heads
+    for k_idx in range(n_mtp_heads):
+        key, k1, k2 = jax.random.split(key, 3)
+        params[f"mtp.{k_idx}.proj"] = jax.random.normal(k1, (d_model, d_model)) * (d_model ** -0.5)
+        params[f"mtp.{k_idx}.norm"] = jnp.ones(d_model)
 
     return params, config
 
@@ -445,10 +453,33 @@ def transformer_loss_fused(params, config, x_batch, targets, chunk_size=4096):
     x_batch: (batch, seq_len), targets: (batch, seq_len).
     Tiles the output projection + softmax + CE over vocab chunks.
     Critical for vocab >= 16K (avoids OOM from full logits tensor).
+    Supports MTP: computes loss for next-token + extra prediction heads.
     """
     # run trunk for all batch elements
     h_batch = jax.vmap(lambda x: _transformer_trunk(params, config, x))(x_batch)
-    return fused_output_and_loss(h_batch, params["token_emb"], targets, chunk_size)
+    token_emb = params["token_emb"]
+
+    # standard next-token loss (head 0)
+    loss = fused_output_and_loss(h_batch, token_emb, targets, chunk_size)
+
+    # MTP extra heads: predict tokens t+k using h @ mtp_proj_k
+    n_mtp = config.get("n_mtp_heads", 0)
+    for k_idx in range(n_mtp):
+        # shift targets: head k predicts token at position t+k+1
+        # h[:, :-k-1] predicts targets[:, k+1:]
+        shift = k_idx + 1
+        h_shifted = h_batch[:, :-shift, :]
+        tgt_shifted = targets[:, shift:]
+
+        # project through MTP head: h -> h_k = rms_norm(h @ proj)
+        proj = params[f"mtp.{k_idx}.proj"]
+        norm_scale = params[f"mtp.{k_idx}.norm"]
+        h_proj = rms_norm(h_shifted @ proj, norm_scale)
+
+        mtp_loss = fused_output_and_loss(h_proj, token_emb, tgt_shifted, chunk_size)
+        loss = loss + mtp_loss
+
+    return loss / (1 + n_mtp)  # average over all heads
 
 
 def cross_entropy_loss(logits, targets):

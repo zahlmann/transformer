@@ -46,6 +46,8 @@ def main():
                         help="Enable DeltaNet hybrid layers (default: pure attention)")
     parser.add_argument("--curriculum", action="store_true",
                         help="Sequence length curriculum: start short (128), grow to full ctx")
+    parser.add_argument("--mtp-heads", type=int, default=0,
+                        help="Number of multi-token prediction heads (0=disabled, 3=standard)")
     args = parser.parse_args()
 
     # data
@@ -75,7 +77,7 @@ def main():
         params, config = init_transformer(
             init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
             n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads,
-            use_deltanet=args.use_deltanet)
+            use_deltanet=args.use_deltanet, n_mtp_heads=args.mtp_heads)
         if args.d_ff is not None:
             # override auto-computed d_ff
             from model import _swiglu_d_ff
