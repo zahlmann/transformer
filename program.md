@@ -1130,7 +1130,157 @@ Hybrid 16L (12D+4A): 12.9K tok/s, 7.5GB VRAM
 Hybrid 24L (18D+6A):  8.6K tok/s, 10.6GB VRAM
 ```
 
-**Next:** Train hybrid 24L on data, write Triton DeltaNet decode kernel for inference.
+### REVISION: DeltaNet reverted — focus on fastest training (2026-04-04)
+
+Research showed DeltaNet is 15-20% SLOWER for training (only faster for inference at long
+contexts). At ctx=512 the O(n²) attention term is trivially small (262K ops/head), so
+linear attention provides no training speedup. Our measurements confirmed: hybrid 24L
+8.6K tok/s vs attention-only 24L 13.2K tok/s (35% slower with DeltaNet).
+
+**Decision: revert to pure attention, optimize training speed + quality per token.**
+
+DeltaNet code kept in git history. Can be added back later for inference if needed.
+
+---
+
+## Phase D: Maximum Training Efficiency (next task)
+
+Goal: maximize tokens/sec AND quality/token on RTX 4080 Super (16GB, 52 TFLOPS FP16).
+Pure attention architecture with all modern training tricks.
+
+### Research findings (2026-04-04)
+
+**Architecture (what the research says):**
+- **Deep and narrow > wide and shallow** at sub-1B scale (MobileLLM: +2.7% accuracy at
+  125M, +4.3% at 350M by using deeper/thinner architectures)
+- **Tied embeddings**: standard, saves d_model × vocab params for free
+- **GQA**: minimal training speed impact, saves memory for larger batch sizes
+- **SwiGLU + RMSNorm + RoPE + no biases**: already implemented, standard recipe
+- **Block-wise weight sharing** (MobileLLM-LS): +0.7-0.8% accuracy by sharing weights
+  between adjacent layer pairs. Interesting but not proven at our scale.
+
+**Training speed techniques (concrete numbers):**
+- **Sequence packing**: pack multiple documents into one context window. Eliminates
+  padding waste (up to 50% of tokens wasted with naive padding). **Up to 2x speedup**
+  for training (Krell et al. 2021). We should implement this.
+- **Variable sequence length curriculum**: start training with short sequences (128),
+  gradually increase to 512. "Up to 6x faster training" (Dataset Decomposition paper).
+  Shorter sequences = cheaper attention = more tokens/sec in early training.
+- **Constant LR + cooldown** (WSD schedule): scales predictably like cosine, but
+  easier to use for scaling experiments. "Reliably similar to cosine" (NeurIPS 2024
+  spotlight). Enables reusable training runs.
+- **Stochastic weight averaging**: "improved performance along training trajectory
+  without additional training costs" (same NeurIPS paper).
+
+**Data efficiency (more quality per token):**
+- **Up to 4 epochs is safe**: "training with up to 4 epochs of repeated data yields
+  negligible changes to loss compared to unique data" (Muennighoff et al. 2023, 400
+  training runs, up to 9B params). Beyond 4 epochs, diminishing returns.
+- **Data quality > quantity**: SmolLM trained 135M model on 600B tokens of
+  high-quality filtered data (FineWeb-Edu + Cosmopedia + code), outperformed
+  MobileLLM-125M trained on 1T tokens. Quality filtering is critical.
+- **Code data helps general quality**: SmolLM includes Python-Edu; Llama 3 uses
+  significant code fraction. Our mix already includes StarCoder.
+
+**Multi-Token Prediction (MTP):**
+- Meta reports "no overhead in training time" with 4-token prediction heads
+- +12% on HumanEval, +17% on MBPP (coding benchmarks) at 13B scale
+- 3x faster inference via self-speculative decode
+- **Pure win**: better quality + faster inference, no training cost
+- Should implement after base training is stable
+
+**What didn't help (from Cramming paper, single-GPU training):**
+- PyTorch compile + inductor settings were essential for full speed
+- Most architectural novelties didn't help at small scale
+- The training recipe matters more than clever architecture
+
+### Implementation plan
+
+#### Step D1: Revert DeltaNet, restore pure attention 24L
+
+Revert model.py to use_deltanet=False as default. Keep the DeltaNet code but don't
+use it for training. Verify 24L pure attention: 13.2K tok/s, 8.8GB VRAM.
+
+#### Step D2: Sequence packing (potential 1.5-2x speedup)
+
+**What:** Pack multiple documents into one context window instead of one-document-per-slot.
+Use attention mask to prevent cross-document attention.
+
+**Why:** Currently each training sample is one document truncated/padded to ctx=512.
+Short documents waste compute on padding. Packing fills every token position with
+useful data.
+
+**Implementation:**
+- Modify `prepare_data.py` to pack documents greedily (first-fit-decreasing bin packing)
+- Add `document_mask` to training data: marks document boundaries
+- Modify attention in `model.py` to use document mask (prevent cross-doc attention)
+- The SwiGLU FFN, RMSNorm, embeddings don't need changes (token-level ops)
+
+**Expected impact:** 1.3-2x speedup depending on document length distribution.
+Measured by: same loss after same wall-clock time.
+
+#### Step D3: Sequence length warmup (potential 2-4x early speedup)
+
+**What:** Start training with ctx=128, gradually increase to ctx=512 over first 20%
+of training. Attention is O(n²), so ctx=128 is 16x cheaper than ctx=512.
+
+**Why:** Early in training, the model learns local patterns (bigrams, simple syntax)
+that don't need long context. Short sequences give more gradient updates per second.
+
+**Implementation:**
+- Modify training loop to vary context_len per epoch/phase
+- Phase 1 (0-10% of steps): ctx=128, bs=64 (4x more samples per step)
+- Phase 2 (10-30%): ctx=256, bs=32
+- Phase 3 (30-100%): ctx=512, bs=16
+- Need to handle RoPE and attention mask adjustments per phase
+
+**Expected impact:** 2-4x faster for the first 30% of training. Overall ~1.5x.
+
+#### Step D4: Larger vocab + better tokenizer
+
+**What:** Increase vocab from 4096 to 32K (standard for modern LLMs). Train a new
+BPE tokenizer on the full data mix.
+
+**Why:** Larger vocab = fewer tokens per document = faster training (fewer steps for
+same amount of text). 32K vocab compresses English ~3.5x better than 4K vocab.
+Also: the output projection (d_model × vocab) is heavier with 32K but tied embeddings
+mean no extra params.
+
+**Expected impact:** ~2-3x fewer tokens needed to cover same text → faster convergence.
+
+#### Step D5: Multi-Token Prediction (no training cost, better quality)
+
+**What:** Add 3 extra prediction heads that predict tokens t+2, t+3, t+4 in addition
+to standard next-token prediction. Loss = L1 + λ₂L₂ + λ₃L₃ + λ₄L₄.
+
+**Why:** Meta showed "no overhead in training time" + 12-17% better code quality +
+3x faster inference via self-speculative decode. Pure quality/inference win.
+
+**Implementation:**
+- Add 3 linear projections: d_model → vocab (or use shared projection with different
+  input positions)
+- Modify loss computation to sum 4 shifted losses
+- No change to transformer trunk
+
+#### Step D6: Training recipe optimization
+
+- **Learning rate**: test WSD (warmup-stable-decay) vs cosine
+- **Batch size schedule**: start small, increase during training
+- **Weight averaging**: average checkpoints along trajectory (free quality)
+- **Gradient accumulation**: if batch size > VRAM allows, accumulate gradients
+- **Data mix tuning**: measure per-domain loss, adjust ratios
+
+#### Implementation order
+
+1. **D1** (revert DeltaNet): immediate, verify throughput
+2. **D4** (larger vocab): do before training starts (changes tokenization)
+3. **D2** (sequence packing): implement before training
+4. **D3** (sequence length warmup): implement in training loop
+5. **D5** (MTP): add after base training is stable
+6. **D6** (recipe tuning): ongoing during training
+
+**Target throughput:** 20-30K tok/s effective (accounting for packing + curriculum).
+**Target training:** 10B tokens in 4-6 days.
 
 ---
 
