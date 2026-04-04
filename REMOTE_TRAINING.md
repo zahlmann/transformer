@@ -3,8 +3,11 @@
 ## Your mission
 
 Train this transformer model as fast as possible. Minimize wall-clock training time.
-Everything is implemented and tested. Your job is to set up the environment, tune batch
-size for 24GB VRAM, and run the training.
+Everything is implemented and tested. Your job is:
+1. Set up the environment and download data
+2. Tune batch size to maximize GPU utilization on 24GB VRAM
+3. Profile and optimize any bottlenecks (XLA flags, compilation, etc.)
+4. Run the training to completion with minimum ETA
 
 ## What this project is
 
@@ -34,25 +37,39 @@ Stored as `data/tokens_v2/train.bin` (flat int32 binary, memory-mapped) + `data/
 
 ```bash
 # 1. Clone the repo
-git clone git@github.com:zahlmann/transformer.git
+git clone https://github.com/zahlmann/transformer.git
 cd transformer
 
 # 2. Install dependencies (uses uv)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
-# 3. Copy the data directory from the source machine
-# The data/ directory is ~50GB total. You need:
-#   data/tokens_v2/train.bin        (31.4 GB — the training data)
-#   data/tokens_v2/val.npy          (150 MB — validation data)
-#   data/tokens_v2/metadata.json    (metadata)
-#   data/tokenizer_32000.json       (2.2 MB — BPE tokenizer)
-#   data/bpe_vocab.pkl              (tokenizer config for inference)
+# 3. Download and prepare all training data
+# This downloads from HuggingFace, tokenizes everything, and combines.
+# Takes 1-2 hours depending on network speed. Needs ~50GB disk, ~16GB RAM.
+# Downloads: FineWeb-Edu, Wikipedia, Cosmopedia, StarCoder, OpenWebMath
+uv run python -u prepare_data_v2.py
+
+# This creates:
+#   data/tokens_v2/train.bin        (31.4 GB — shuffled training tokens)
+#   data/tokens_v2/val.npy          (150 MB — validation tokens)
+#   data/tokens_v2/metadata.json    (dataset metadata)
+#   data/tokenizer_32000.json       (BPE tokenizer, trained on the corpus)
 #
-# Use rsync or scp:
-#   rsync -avP source_machine:transformer/data/tokens_v2/ data/tokens_v2/
-#   rsync -avP source_machine:transformer/data/tokenizer_32000.json data/
-#   rsync -avP source_machine:transformer/data/bpe_vocab.pkl data/
+# The script is idempotent: if interrupted, re-run and it skips completed steps.
+# Each source is cached individually in data/tokens_v2/{source}.npz.
+```
+
+### If data download is slow
+
+The data pipeline streams from HuggingFace datasets. If the server has slow internet,
+the bottleneck will be downloading ~15GB of raw text. The tokenization and combining
+steps are CPU-bound and take ~30 min total.
+
+To speed up downloads, make sure `HF_HUB_ENABLE_HF_TRANSFER=1` is set:
+```bash
+pip install hf_transfer
+HF_HUB_ENABLE_HF_TRANSFER=1 uv run python -u prepare_data_v2.py
 ```
 
 ## Training command
@@ -107,13 +124,12 @@ nvidia-smi -l 5  # watch GPU utilization
 
 ## Expected performance
 
-On RTX 4090 with bs=32, no MTP:
-- Estimated: 60-70K tok/s
-- 23.5B tokens (3 epochs) → ~100 hours (4.2 days)
-- Loss should reach ~3.0-3.5 by end of training
+Baseline on RTX 4080 Super (16GB) with bs=16, no MTP: 28.4K tok/s.
+The 4090 has 1.6x compute and 24GB VRAM (larger batch possible).
+Your goal: beat the baseline significantly and reach minimum ETA.
 
-On RTX 4080 Super with bs=16, no MTP:
-- Measured: 28.4K tok/s → ~230 hours (9.6 days)
+Total training: 23.5B tokens (3 epochs × 7.85B).
+Loss should reach ~3.0-3.5 by end of training.
 
 ## Key files
 
@@ -135,9 +151,11 @@ program.md                  — full project history and architecture docs
 
 ## After training completes
 
-The model saves to `weights.pkl`. Copy it back:
+The model saves to `weights.pkl` (~1.2GB). Push it or make it available for download:
 ```bash
-scp weights.pkl source_machine:transformer/
+# Option 1: push to a release/artifact
+# Option 2: upload to HuggingFace Hub
+# Option 3: any file sharing method
 ```
 
 ## Checkpointing
