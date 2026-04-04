@@ -266,7 +266,7 @@ def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj
 
     @jax.checkpoint
     def scan_chunk(state, chunk_inputs):
-        return jax.lax.scan(step, state, chunk_inputs)
+        return jax.lax.scan(step, state, chunk_inputs, unroll=CHUNK)
 
     initial_state = jnp.zeros((n_kv_heads, d_head, d_head), dtype=jnp.float32)
     # reshape inputs to (n_chunks, chunk_size, ...)
