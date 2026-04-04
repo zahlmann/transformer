@@ -248,9 +248,11 @@ def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj
     # output gate
     gate = jax.nn.silu(x @ g_proj)  # (seq, d_model)
 
-    # Chunked recurrence: split into chunks, checkpoint per chunk.
-    # Saves only chunk boundary states instead of all T states → O(T/C) memory.
-    gqa_idx = jnp.arange(n_heads) // gqa_group  # precompute GQA index mapping
+    # Chunked recurrence with per-chunk checkpointing and full unroll.
+    # 8 chunks of 64 steps, checkpoint between chunks → O(8 * state_size) memory.
+    CHUNK = 64
+    n_chunks = seq_len // CHUNK
+    gqa_idx = jnp.arange(n_heads) // gqa_group
 
     def step(state, inputs):
         q_t, k_t, v_t, beta_t, decay_t = inputs
@@ -261,20 +263,15 @@ def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj
         o_t = jnp.einsum('hkv,hk->hv', state[gqa_idx], q_t)
         return state, o_t
 
-    CHUNK = 64
-    n_chunks = seq_len // CHUNK
-
     @jax.checkpoint
     def scan_chunk(state, chunk_inputs):
         return jax.lax.scan(step, state, chunk_inputs, unroll=CHUNK)
 
     initial_state = jnp.zeros((n_kv_heads, d_head, d_head), dtype=jnp.float32)
-    # reshape inputs to (n_chunks, chunk_size, ...)
     inputs_chunked = jax.tree.map(
         lambda x: x.reshape(n_chunks, CHUNK, *x.shape[1:]),
         (q, k, v, beta, decay))
     _, outputs_chunked = jax.lax.scan(scan_chunk, initial_state, inputs_chunked)
-    # outputs_chunked: (n_chunks, chunk_size, n_heads, d_head)
     outputs = outputs_chunked.reshape(seq_len, n_heads, d_head)
 
     # reshape to (seq, d_model)
