@@ -138,8 +138,10 @@ def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context
 
 def rms_norm(x, scale, eps=1e-5):
     """RMSNorm: scale * x / sqrt(mean(x²) + eps)."""
-    rms = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + eps)
-    return scale * x / rms
+    # compute variance in f32 for numerical stability, cast back to input dtype
+    x_f32 = x.astype(jnp.float32)
+    rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + eps).astype(x.dtype)
+    return scale * (x / rms)
 
 
 def precompute_rope_table(context_len, d_head, base=10000.0):
@@ -190,11 +192,14 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin):
     q = apply_rope(q.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
     k = apply_rope(k.transpose(1, 0, 2), cos_seq[None, :, :], sin_seq[None, :, :]).transpose(1, 0, 2)
 
-    # cuDNN FlashAttention: handles GQA natively, is_causal avoids materializing mask
-    # Cast all to bf16 for cuDNN (RoPE promotes q/k to f32 via cos/sin tables)
-    q = q.astype(jnp.bfloat16)
-    k = k.astype(jnp.bfloat16)
-    out = jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation='cudnn')
+    # cuDNN FlashAttention when bf16, XLA fallback for f32 (inference/testing)
+    if v.dtype == jnp.bfloat16:
+        q = q.astype(jnp.bfloat16)
+        k = k.astype(jnp.bfloat16)
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation='cudnn')
+    else:
+        v = v.astype(q.dtype)
+        out = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
     return out.reshape(seq_len, d_model) @ wo
 
@@ -311,8 +316,8 @@ def _delta_layer(h, ln1_s, wq, wk, wv, wo,
     return h + h_ff
 
 
-def transformer_forward(params, config, x):
-    """Forward pass. x: (seq_len,) integer token indices. Returns logits (seq_len, vocab_size)."""
+def _transformer_trunk(params, config, x):
+    """Run transformer layers. Returns final hidden states (seq_len, d_model)."""
     h = params["token_emb"][x]
     n_heads = config["n_heads"]
     n_kv_heads = config.get("n_kv_heads", n_heads)
@@ -348,9 +353,13 @@ def transformer_forward(params, config, x):
                 n_heads, n_kv_heads, context_len, d_head,
             )
 
-    h = rms_norm(h, params["ln_final.scale"])
-    logits = h @ params["token_emb"].T
-    return logits
+    return rms_norm(h, params["ln_final.scale"])
+
+
+def transformer_forward(params, config, x):
+    """Forward pass. x: (seq_len,) integer token indices. Returns logits (seq_len, vocab_size)."""
+    h = _transformer_trunk(params, config, x)
+    return h @ params["token_emb"].T
 
 
 def prefill_with_kv(params, config, x):
@@ -430,11 +439,132 @@ def transformer_forward_batch(params, config, x_batch):
     return jax.vmap(lambda x: transformer_forward(params, config, x))(x_batch)
 
 
+def transformer_loss_fused(params, config, x_batch, targets, chunk_size=4096):
+    """Fused forward + cross-entropy loss without materializing full logits.
+
+    x_batch: (batch, seq_len), targets: (batch, seq_len).
+    Tiles the output projection + softmax + CE over vocab chunks.
+    Critical for vocab >= 16K (avoids OOM from full logits tensor).
+    """
+    # run trunk for all batch elements
+    h_batch = jax.vmap(lambda x: _transformer_trunk(params, config, x))(x_batch)
+    return fused_output_and_loss(h_batch, params["token_emb"], targets, chunk_size)
+
+
 def cross_entropy_loss(logits, targets):
     """Mean cross-entropy loss. logits: (batch, seq, vocab), targets: (batch, seq)."""
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_log_probs = jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
     return -jnp.mean(target_log_probs)
+
+
+# ─── fused cross-entropy (memory-efficient for large vocab) ───
+
+def _chunked_ce_fwd(h, weight, targets, chunk_size):
+    """Forward: compute CE loss without materializing full (N, vocab) logits.
+
+    Tiles over vocab dimension, accumulates logsumexp online.
+    h: (N, d_model), weight: (vocab, d_model), targets: (N,).
+    """
+    N, d = h.shape
+    vocab = weight.shape[0]
+
+    # target logits: each token's logit for its target class
+    target_emb = weight[targets]  # (N, d)
+    target_logits = jnp.sum(h * target_emb, axis=-1)  # (N,)
+
+    # online logsumexp over vocab chunks
+    max_logit = jnp.full(N, -1e30)
+    sum_exp = jnp.zeros(N)
+
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        chunk_logits = h @ weight[start:end].T  # (N, chunk)
+        chunk_max = chunk_logits.max(axis=-1)  # (N,)
+        new_max = jnp.maximum(max_logit, chunk_max)
+        sum_exp = sum_exp * jnp.exp(max_logit - new_max) + jnp.sum(jnp.exp(chunk_logits - new_max[:, None]), axis=-1)
+        max_logit = new_max
+
+    logsumexp = max_logit + jnp.log(sum_exp)
+    loss = jnp.mean(logsumexp - target_logits)
+    return loss
+
+
+@jax.custom_vjp
+def fused_cross_entropy(h, weight, targets, chunk_size):
+    """Fused output projection + cross-entropy without materializing logits.
+
+    h: (N, d_model), weight: (vocab, d_model), targets: (N,), chunk_size: int.
+    Returns scalar loss.
+    """
+    return _chunked_ce_fwd(h, weight, targets, chunk_size)
+
+
+def _fused_ce_fwd(h, weight, targets, chunk_size):
+    loss = _chunked_ce_fwd(h, weight, targets, chunk_size)
+    return loss, (h, weight, targets, chunk_size)
+
+
+def _fused_ce_bwd(res, g):
+    """Backward: compute grads w.r.t. h and weight without materializing full logits.
+
+    Computation in f32 for numerical stability, results cast to input dtypes.
+    """
+    h, weight, targets, chunk_size = res
+    h_dtype, w_dtype = h.dtype, weight.dtype
+    # compute in f32
+    h = h.astype(jnp.float32)
+    weight = weight.astype(jnp.float32)
+    N, d = h.shape
+    vocab = weight.shape[0]
+    scale = g / N
+
+    # recompute logsumexp (needed for softmax)
+    max_logit = jnp.full(N, -1e30)
+    sum_exp = jnp.zeros(N)
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        chunk_logits = h @ weight[start:end].T
+        chunk_max = chunk_logits.max(axis=-1)
+        new_max = jnp.maximum(max_logit, chunk_max)
+        sum_exp = sum_exp * jnp.exp(max_logit - new_max) + jnp.sum(jnp.exp(chunk_logits - new_max[:, None]), axis=-1)
+        max_logit = new_max
+    logsumexp = max_logit + jnp.log(sum_exp)
+
+    # accumulate grad_h and grad_weight in chunks
+    grad_h = jnp.zeros_like(h)
+    grad_weight = jnp.zeros_like(weight)
+
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        w_chunk = weight[start:end]  # (chunk, d)
+        chunk_logits = h @ w_chunk.T  # (N, chunk)
+        softmax_chunk = jnp.exp(chunk_logits - logsumexp[:, None])  # (N, chunk)
+
+        grad_h = grad_h + (softmax_chunk @ w_chunk) * scale
+        grad_weight = grad_weight.at[start:end].add((softmax_chunk.T @ h) * scale)
+
+    # subtract target contribution
+    target_emb = weight[targets]  # (N, d)
+    grad_h = grad_h - target_emb * scale
+    grad_weight = grad_weight.at[targets].add(-h * scale)
+
+    return grad_h.astype(h_dtype), grad_weight.astype(w_dtype), None, None
+
+
+fused_cross_entropy.defvjp(_fused_ce_fwd, _fused_ce_bwd)
+
+
+def fused_output_and_loss(h, token_emb, targets, chunk_size=4096):
+    """Fused final norm output projection + CE loss for large vocabs.
+
+    h: (batch, seq, d_model), token_emb: (vocab, d_model), targets: (batch, seq).
+    Returns scalar mean loss.
+    """
+    batch, seq, d = h.shape
+    h_flat = h.reshape(batch * seq, d)
+    targets_flat = targets.reshape(batch * seq)
+    return fused_cross_entropy(h_flat, token_emb, targets_flat, chunk_size)
 
 
 def count_params(params):

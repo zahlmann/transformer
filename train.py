@@ -17,7 +17,8 @@ import jax.numpy as jnp
 import optax
 
 from data import prepare_data
-from model import init_transformer, transformer_forward_batch, cross_entropy_loss, count_params
+from model import (init_transformer, transformer_forward_batch, cross_entropy_loss,
+                   transformer_loss_fused, count_params)
 
 
 def main():
@@ -95,10 +96,16 @@ def main():
     optimizer = optax.adamw(schedule, weight_decay=args.weight_decay)
     opt_state = optimizer.init(params)
 
+    # use fused CE for large vocab (avoids materializing full logits tensor)
+    use_fused_ce = config["vocab_size"] >= 8192
+    ce_chunk = min(4096, config["vocab_size"])
+
     @jax.jit
     def train_step(params, opt_state, x, y):
         def loss_fn(params):
             params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+            if use_fused_ce:
+                return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
             logits = transformer_forward_batch(params_bf16, config, x)
             return cross_entropy_loss(logits.astype(jnp.float32), y)
         loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -108,6 +115,8 @@ def main():
     @jax.jit
     def eval_loss(params, x, y):
         params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
+        if use_fused_ce:
+            return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
         logits = transformer_forward_batch(params_bf16, config, x)
         return cross_entropy_loss(logits.astype(jnp.float32), y)
 
