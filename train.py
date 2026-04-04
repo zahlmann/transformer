@@ -5,7 +5,6 @@ Usage: uv run train.py --d-model 768 --n-heads 24 --n-kv-heads 6 --n-layers 12 \
 """
 
 import os
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), ".jax_cache")
 os.environ.setdefault("JAX_COMPILATION_CACHE_MAX_SIZE", str(2 * 1024**3))
 
@@ -114,17 +113,24 @@ def main():
     print(f"{args.dataset} {args.tokenizer} vocab={vocab_size}")
     print(f"{count_params(params):,} params, {n_batches} steps/epoch, {total_steps} total")
 
-    # train
+    # train with prefetch: overlap host→device transfer with compute
     t_start = time.perf_counter()
     for epoch in range(args.epochs):
         perm = np.random.default_rng(args.seed + epoch).permutation(len(train_x))
         sx, sy = train_x[perm], train_y[perm]
         eloss = 0.0
         t_epoch = time.perf_counter()
+        # prefetch first batch
+        s = 0
+        next_bx = jax.device_put(jnp.array(sx[s:s + args.batch_size]))
+        next_by = jax.device_put(jnp.array(sy[s:s + args.batch_size]))
         for bi in range(n_batches):
-            s = bi * args.batch_size
-            bx = jnp.array(sx[s:s + args.batch_size])
-            by = jnp.array(sy[s:s + args.batch_size])
+            bx, by = next_bx, next_by
+            # prefetch next batch while current step runs
+            if bi + 1 < n_batches:
+                s = (bi + 1) * args.batch_size
+                next_bx = jax.device_put(jnp.array(sx[s:s + args.batch_size]))
+                next_by = jax.device_put(jnp.array(sy[s:s + args.batch_size]))
             params, opt_state, loss = train_step(params, opt_state, bx, by)
             eloss += float(loss)
             if bi > 0 and bi % 1000 == 0:

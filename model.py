@@ -144,8 +144,12 @@ def causal_attention(x, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin):
 
 def _transformer_layer(h, ln1_s, wq, wk, wv, wo,
                        ln2_s, ffn_gate, ffn_up, ffn_down,
-                       n_heads, n_kv_heads, cos, sin):
-    """Single transformer layer: RMSNorm -> Attn -> RMSNorm -> SwiGLU FFN."""
+                       n_heads, n_kv_heads, context_len, d_head):
+    """Single transformer layer: RMSNorm -> Attn -> RMSNorm -> SwiGLU FFN.
+
+    RoPE tables are recomputed inside the layer (cheap, avoids saving through checkpoint).
+    """
+    cos, sin = precompute_rope_table(context_len, d_head)
     h_norm = rms_norm(h, ln1_s)
     attn_out = causal_attention(h_norm, wq, wk, wv, wo, n_heads, n_kv_heads, cos, sin)
     h = h + attn_out
@@ -163,19 +167,18 @@ def transformer_forward(params, config, x):
     n_heads = config["n_heads"]
     n_kv_heads = config.get("n_kv_heads", n_heads)
     d_head = config["d_head"]
-
-    cos, sin = precompute_rope_table(config["context_len"], d_head)
+    context_len = config["context_len"]
 
     for layer in range(config["n_layers"]):
         p = f"layer{layer}"
-        h = jax.checkpoint(_transformer_layer, static_argnums=(10, 11))(
+        h = jax.checkpoint(_transformer_layer, static_argnums=(10, 11, 12, 13))(
             h,
             params[f"{p}.ln1.scale"],
             params[f"{p}.attn.q"], params[f"{p}.attn.k"],
             params[f"{p}.attn.v"], params[f"{p}.attn.o"],
             params[f"{p}.ln2.scale"],
             params[f"{p}.ffn.gate"], params[f"{p}.ffn.up"], params[f"{p}.ffn.down"],
-            n_heads, n_kv_heads, cos, sin,
+            n_heads, n_kv_heads, context_len, d_head,
         )
 
     h = rms_norm(h, params["ln_final.scale"])

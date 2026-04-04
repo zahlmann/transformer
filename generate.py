@@ -15,7 +15,6 @@ Usage:
 """
 
 import os
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
 import jax
 import jax.numpy as jnp

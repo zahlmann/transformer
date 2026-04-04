@@ -90,7 +90,7 @@ def _fused_decode_nlayer(
     dh_hi = D_HALF + tl.arange(0, D_HALF)
     GQA_GROUP: tl.constexpr = N_HEADS // N_KV_HEADS
 
-    for layer in tl.static_range(N_LAYERS):
+    for layer in tl.range(N_LAYERS):
         w_base = layer * LAYER_W_SIZE
         kv_base = layer * LAYER_KV_SIZE
         kc_base = kv_base
