@@ -317,7 +317,8 @@ def _prepare_combined(context_len, epoch=1):
 def _prepare_combined_v2(context_len):
     """Load v2 tokenized data (with EOS tokens, better mix).
 
-    Uses memory-mapped flat binary for train data to handle large datasets.
+    Returns raw memmap token stream for train (no x/y split in RAM).
+    The training loop creates (x, y) batches on the fly from the stream.
     """
     from tokenizers import Tokenizer
 
@@ -340,18 +341,15 @@ def _prepare_combined_v2(context_len):
     print(f"  Sources: {', '.join(f'{k} ({v/1e9:.1f}B)' for k, v in meta['sources'].items())}")
     print(f"  EOS between docs: {meta.get('has_eos_between_docs', False)}")
 
-    # memory-map train data (doesn't load into RAM)
+    # memory-map train data (doesn't load into RAM — just maps the file)
     train_mmap = np.memmap(train_bin, dtype=np.int32, mode="r")
     val_data = np.load(val_npy)
 
     vocab_size = meta["vocab_size"]
+    n_train_seqs = (len(train_mmap) - 1) // context_len
 
-    # create sequences from memmaped data — this DOES copy to RAM
-    # but only the x,y arrays (each half the size of raw data)
-    train_x, train_y = _make_sequences(train_mmap, context_len)
     val_x, val_y = _make_sequences(val_data, context_len)
-
-    print(f"  {len(train_x):,} train seqs, {len(val_x):,} val seqs, vocab={vocab_size}")
+    print(f"  {n_train_seqs:,} train seqs (streamed), {len(val_x):,} val seqs, vocab={vocab_size}")
 
     tok = Tokenizer.from_file(meta["tokenizer_path"])
 
@@ -367,13 +365,15 @@ def _prepare_combined_v2(context_len):
         }, f)
 
     return {
-        "train_x": train_x,
-        "train_y": train_y,
+        "train_tokens": train_mmap,  # raw token stream (memmap)
+        "train_x": None,  # created on-the-fly in training loop
+        "train_y": None,
         "val_x": val_x,
         "val_y": val_y,
         "vocab_size": vocab_size,
         "decode_fn": decode_tokens,
         "tokenizer": "trained_bpe",
+        "streaming": True,
     }
 
 

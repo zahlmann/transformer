@@ -54,11 +54,21 @@ def main():
     data = prepare_data(context_len=args.context_len, tokenizer=args.tokenizer,
                         bpe_vocab_size=args.bpe_vocab, dataset=args.dataset)
     vocab_size = data["vocab_size"]
-    train_x = np.array(data["train_x"])  # keep on CPU, batch to GPU
-    train_y = np.array(data["train_y"])
+    streaming = data.get("streaming", False)
+
+    if streaming:
+        # v2 streaming mode: raw token memmap, create batches on the fly
+        train_tokens = data["train_tokens"]  # memmap, not in RAM
+        n_train_seqs = (len(train_tokens) - 1) // args.context_len
+        n_batches = n_train_seqs // args.batch_size
+        train_x = train_y = None  # created per-batch
+    else:
+        train_x = np.array(data["train_x"])  # keep on CPU, batch to GPU
+        train_y = np.array(data["train_y"])
+        n_batches = len(train_x) // args.batch_size
+
     val_x = jnp.array(data["val_x"][:args.batch_size])
     val_y = jnp.array(data["val_y"][:args.batch_size])
-    n_batches = len(train_x) // args.batch_size
     total_steps = n_batches * args.epochs
     assert args.warmup_steps < total_steps, \
         f"warmup {args.warmup_steps} >= total steps {total_steps}"
@@ -154,16 +164,27 @@ def main():
     print(f"{args.dataset} {args.tokenizer} vocab={vocab_size}")
     print(f"{count_params(params):,} params, {n_batches} steps/epoch, {total_steps} total")
 
+    def _get_batch_streaming(seq_indices, ctx, bs, offset):
+        """Create (x, y) batch from raw token stream on the fly."""
+        indices = seq_indices[offset:offset + bs]
+        # each sequence starts at idx * context_len in the token stream
+        batch = np.stack([train_tokens[i * args.context_len:i * args.context_len + ctx + 1]
+                          for i in indices])
+        return batch[:, :ctx], batch[:, 1:ctx + 1]
+
     # train with prefetch: overlap host→device transfer with compute
     t_start = time.perf_counter()
     global_step = 0
     for epoch in range(args.epochs):
-        perm = np.random.default_rng(args.seed + epoch).permutation(len(train_x))
-        sx, sy = train_x[perm], train_y[perm]
+        rng = np.random.default_rng(args.seed + epoch)
+        if streaming:
+            seq_perm = rng.permutation(n_train_seqs)
+        else:
+            perm = rng.permutation(len(train_x))
+            sx, sy = train_x[perm], train_y[perm]
         eloss = 0.0
         t_epoch = time.perf_counter()
 
-        # determine phase for each step based on global position
         bi = 0
         while bi < n_batches:
             # determine current phase
@@ -180,7 +201,6 @@ def main():
             bs = args.batch_size * cur_phase["bs_mult"]
             train_step = phase_steps[ctx]
 
-            # how many steps to run in this phase before checking again
             next_frac = 0.0
             for p in phases:
                 next_frac += p["frac"]
@@ -190,10 +210,13 @@ def main():
             steps_in_epoch = n_batches - bi
             chunk_steps = min(steps_until_phase_end, steps_in_epoch)
 
-            # prefetch first batch for this chunk
+            # prefetch first batch
             s = bi * args.batch_size
-            bx_np = sx[s:s + bs, :ctx]
-            by_np = sy[s:s + bs, :ctx]
+            if streaming:
+                bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
+            else:
+                bx_np = sx[s:s + bs, :ctx]
+                by_np = sy[s:s + bs, :ctx]
             next_bx = jax.device_put(jnp.array(bx_np))
             next_by = jax.device_put(jnp.array(by_np))
 
@@ -202,9 +225,15 @@ def main():
                 # prefetch next batch
                 if ci + 1 < chunk_steps:
                     s = (bi + ci + 1) * args.batch_size
-                    if s + bs <= len(sx):
-                        next_bx = jax.device_put(jnp.array(sx[s:s + bs, :ctx]))
-                        next_by = jax.device_put(jnp.array(sy[s:s + bs, :ctx]))
+                    if streaming:
+                        if s + bs <= n_train_seqs:
+                            bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
+                            next_bx = jax.device_put(jnp.array(bx_np))
+                            next_by = jax.device_put(jnp.array(by_np))
+                    else:
+                        if s + bs <= len(sx):
+                            next_bx = jax.device_put(jnp.array(sx[s:s + bs, :ctx]))
+                            next_by = jax.device_put(jnp.array(sy[s:s + bs, :ctx]))
 
                 params, opt_state, loss = train_step(params, opt_state, bx, by)
                 eloss += float(loss)
