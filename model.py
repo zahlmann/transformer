@@ -247,31 +247,34 @@ def deltanet_attention(x, wq, wk, wv, wo, a_proj, b_proj, A_log, dt_bias, g_proj
     # output gate
     gate = jax.nn.silu(x @ g_proj)  # (seq, d_model)
 
-    # recurrence via scan with checkpointing (recompute intermediates during backward
-    # instead of storing all 512 states — reduces memory from O(T*d²) to O(d²))
-    @jax.checkpoint
-    def step(state, inputs):
-        """state: (n_kv_heads, d_head, d_head). inputs: per-timestep values."""
-        q_t, k_t, v_t, beta_t, decay_t = inputs
-        # q_t: (n_heads, d_head), k_t: (n_kv_heads, d_head), v_t: (n_kv_heads, d_head)
-        # beta_t: (n_kv_heads,), decay_t: (n_kv_heads,)
+    # Chunked recurrence: split into chunks, checkpoint per chunk.
+    # Saves only chunk boundary states instead of all T states → O(T/C) memory.
+    gqa_idx = jnp.arange(n_heads) // gqa_group  # precompute GQA index mapping
 
-        # decay state
+    def step(state, inputs):
+        q_t, k_t, v_t, beta_t, decay_t = inputs
         state = state * decay_t[:, None, None]
-        # retrieve: S^T @ k per kv head
-        retrieved = jnp.einsum('hkv,hk->hv', state, k_t)  # (n_kv_heads, d_head)
-        # delta update
-        delta = (v_t - retrieved) * beta_t[:, None]  # (n_kv_heads, d_head)
+        retrieved = jnp.einsum('hkv,hk->hv', state, k_t)
+        delta = (v_t - retrieved) * beta_t[:, None]
         state = state + jnp.einsum('hk,hv->hkv', k_t, delta)
-        # output: S^T @ q per q head (GQA: map q head to kv head)
-        # For each q head h, use state[h // gqa_group]
-        o_t = jnp.einsum('hkv,hk->hv', state[jnp.arange(n_heads) // gqa_group], q_t)
+        o_t = jnp.einsum('hkv,hk->hv', state[gqa_idx], q_t)
         return state, o_t
 
+    CHUNK = 64
+    n_chunks = seq_len // CHUNK
+
+    @jax.checkpoint
+    def scan_chunk(state, chunk_inputs):
+        return jax.lax.scan(step, state, chunk_inputs)
+
     initial_state = jnp.zeros((n_kv_heads, d_head, d_head), dtype=jnp.float32)
-    inputs = (q, k, v, beta, decay)  # each (seq, ...)
-    _, outputs = jax.lax.scan(step, initial_state, inputs)
-    # outputs: (seq, n_heads, d_head)
+    # reshape inputs to (n_chunks, chunk_size, ...)
+    inputs_chunked = jax.tree.map(
+        lambda x: x.reshape(n_chunks, CHUNK, *x.shape[1:]),
+        (q, k, v, beta, decay))
+    _, outputs_chunked = jax.lax.scan(scan_chunk, initial_state, inputs_chunked)
+    # outputs_chunked: (n_chunks, chunk_size, n_heads, d_head)
+    outputs = outputs_chunked.reshape(seq_len, n_heads, d_head)
 
     # reshape to (seq, d_model)
     o = outputs.reshape(seq_len, d_model)
