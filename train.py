@@ -41,8 +41,8 @@ def main():
                         help="Path to weights.pkl checkpoint to resume from")
     parser.add_argument("--d-ff", type=int, default=None,
                         help="FFN hidden dim (default: auto from SwiGLU formula)")
-    parser.add_argument("--use-deltanet", action="store_true",
-                        help="Use hybrid DeltaNet/attention architecture (75%% DeltaNet + 25%% attn)")
+    parser.add_argument("--no-deltanet", action="store_true",
+                        help="Disable DeltaNet (use all standard attention layers)")
     args = parser.parse_args()
 
     # data
@@ -72,7 +72,7 @@ def main():
         params, config = init_transformer(
             init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
             n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads,
-            use_deltanet=args.use_deltanet)
+            use_deltanet=not args.no_deltanet)
         if args.d_ff is not None:
             # override auto-computed d_ff
             from model import _swiglu_d_ff

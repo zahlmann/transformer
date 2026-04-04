@@ -27,11 +27,12 @@ def _layer_types(n_layers):
 
 
 def init_transformer(key, vocab_size, d_model=64, n_heads=2, n_layers=1, context_len=128,
-                     n_kv_heads=None, use_deltanet=False):
+                     n_kv_heads=None, use_deltanet=True):
     """Initialize a decoder-only transformer. Returns a flat dict of params.
 
     Architecture: RMSNorm, RoPE, SwiGLU FFN, no biases, tied embeddings.
-    use_deltanet: if True, use hybrid DeltaNet/attention layers (75%/25%).
+    Hybrid: 75% Gated DeltaNet + 25% standard attention (Qwen 3.5 pattern).
+    use_deltanet: if False, use all standard attention layers (for comparison).
     n_kv_heads: number of KV heads for GQA. If None, defaults to n_heads.
     """
     assert d_model % n_heads == 0
