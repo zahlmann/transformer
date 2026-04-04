@@ -1,0 +1,145 @@
+DeltaNet vs Standard Attention: Training & Inference Speed Research
+===================================================================
+Date: 2026-04-04
+Context: 300M param model, 512 context, single RTX 4080 Super, want fastest training
+
+=== 1. TRAINING SPEED: DeltaNet is SLOWER than standard attention ===
+
+Hard numbers from the Gated DeltaNet paper (Yang et al., ICLR 2025):
+Figure 3: Training throughput of 1.3B models on a single H100 GPU
+
+At 2K context (closest to our 512):
+  Transformer++ (FlashAttention-2):  ~60 Kt/s   <-- FASTEST
+  Samba (hybrid Mamba+attn):         ~57 Kt/s
+  Gated DeltaNet-H1 (hybrid):       ~55 Kt/s
+  Gated DeltaNet-H2 (hybrid):       ~54 Kt/s
+  Mamba2:                            ~53 Kt/s
+  Gated DeltaNet (pure):            ~50 Kt/s
+  DeltaNet (pure):                   ~50 Kt/s
+
+Key quote from the paper:
+  "Transformer++ achieves the best performance in the 2K context window domain,
+   thanks to the highly optimized Flash-Attention-2 kernel."
+
+  "The training speed of DeltaNet+ is between that of Mamba and GLA.
+   All linear-time models outperform Transformer++ in longer-sequence
+   training settings."
+
+  "Although we propose a new hardware-efficient algorithm, the training speed
+   still lags behind that of GLA due to overhead caused by modeling
+   state-to-state dependencies."
+
+At longer sequences (8K-32K):
+  Transformer++ sustains ~50-60 Kt/s (uses sliding window attention)
+  Linear models (DeltaNet, Mamba2) maintain ~40-45 Kt/s
+  Transformer++ NEVER drops below linear models in the tested range
+
+CRITICAL FINDING: At short sequences (512-2048), Transformer++ with
+FlashAttention-2 is ~17-20% FASTER than Gated DeltaNet for training.
+
+Why DeltaNet training is slower:
+  1. WY representation overhead: the chunk-parallel form needs extra work
+     to marginalize over the d_head dimension (d_head x d_head state matrix)
+  2. State-to-state dependencies: unlike GLA's element-wise gating,
+     DeltaNet's matrix-valued update rule requires more complex computation
+  3. FlashAttention-2 is extremely well-optimized for short sequences
+     with minimal memory access overhead
+  4. The crossover where linear attention beats quadratic attention is
+     somewhere beyond 32K tokens for training throughput
+
+=== 2. INFERENCE SPEED: DeltaNet is MUCH FASTER ===
+
+This is where linear attention dominates:
+  - Standard attention: O(n) per new token (must attend to all previous tokens)
+  - DeltaNet: O(1) per new token (fixed-size state, no KV cache growth)
+
+Qwen3-Next (80B-A3B with DeltaNet hybrid) concrete numbers:
+  - At 128K input tokens: 3x faster than Qwen3-30B-A3B, 10x faster than Qwen3-32B
+  - At 32K+ context: >10x higher throughput
+  - At 4K context: ~7x faster prefill, ~4x faster decode
+
+Based (linear attention + local attention, 1.3B):
+  - Generation: 24x higher throughput than FlashAttention-2
+  - Prefill: 56% faster than FlashAttention-2 at 4K context
+
+Memory advantage:
+  Qwen3.5-9B (24 DeltaNet + 8 full attn layers):
+  - DeltaNet state: 12MB fixed (regardless of context length)
+  - Full attention KV cache: grows linearly with context
+
+=== 3. QUALITY: Hybrid 75/25 matches pure attention ===
+
+Qwen3.5 architecture:
+  - 3:1 ratio: 75% Gated DeltaNet layers, 25% full attention layers
+  - Every 4th block uses standard full attention
+  - This hybrid consistently matches or exceeds pure attention quality
+
+Gated DeltaNet 1.3B (trained on 100B tokens):
+  - Outperforms Mamba2 and original DeltaNet on perplexity
+  - Hybrid variants (DeltaNet + sliding window attn) outperform
+    pure Transformer++ on downstream tasks
+  - Wiki PPL: GDN 16.42 vs Mamba2 16.56
+
+At Qwen3.5 scale (up to 397B total / 17B active params):
+  - MMLU-Pro: 82.5 (Qwen3.5-9B) vs 80.9 (Qwen3-30B pure attn)
+  - AIME 2026: 91.3 (Qwen3.5 flagship)
+  - Quality matches or beats pure attention across all benchmarks
+
+=== 4. WHAT QWEN 3.5 ACTUALLY CLAIMED ===
+
+Qwen's claims are primarily about INFERENCE efficiency, not training speed:
+  - "Efficient Hybrid Architecture: Gated Delta Networks combined with sparse
+    MoE deliver high-throughput inference with minimal latency and cost overhead"
+  - "Near-100% multimodal training efficiency compared to text-only training"
+    (this refers to multimodal overhead, NOT DeltaNet vs attention)
+
+Qwen3-Next (predecessor) training cost claim:
+  - Used <10% of Qwen3-32B's training GPU hours
+  - BUT this is largely due to MoE (3B active of 80B total), not DeltaNet
+  - 90.7% less training cost than Qwen3-32B
+
+Qwen NEVER claimed DeltaNet trains faster than standard attention.
+They claimed it INFERS faster with similar quality.
+
+=== 5. VERDICT FOR OUR USE CASE ===
+
+Our setup: ~300M params, 512 context, single RTX 4080 Super, want fastest training
+
+TRAINING SPEED:
+  DeltaNet will be ~15-20% SLOWER to train than pure FlashAttention
+  at 512 context length. This is because:
+  - FlashAttention-2 is extremely optimized for short sequences
+  - The WY chunk-parallel representation has overhead for the d_head x d_head state
+  - The crossover point where linear attention beats quadratic is far beyond 512
+  - At 512 tokens, O(n^2) with n=512 is only 262K operations per head —
+    the constant factors of the WY representation dominate
+
+INFERENCE SPEED:
+  Not very relevant at 512 context. Standard attention KV cache at 512 tokens
+  is tiny. DeltaNet would win at 4K+ contexts but at 512 the difference
+  is negligible for our use case.
+
+QUALITY:
+  The hybrid 75/25 approach does work. But for a 300M model trained on
+  <4B tokens, we're in a regime where model capacity matters more than
+  architecture sophistication. The quality difference between pure attention
+  and hybrid DeltaNet at this scale is likely within noise.
+
+RECOMMENDATION:
+  For fastest possible training at 512 context on a single GPU,
+  standard attention with FlashAttention is the right choice.
+  DeltaNet's advantages (inference speed, long context) don't apply
+  to our use case. The WY overhead makes it strictly slower for training
+  at short context lengths.
+
+  If we later want to scale to longer contexts (4K+), the hybrid approach
+  becomes more attractive. But at 512, stick with what's fastest: pure attention.
+
+Sources:
+  - Gated Delta Networks paper (ICLR 2025): arxiv.org/abs/2412.06464
+  - DeltaNet parallel training paper (NeurIPS 2024): arxiv.org/abs/2406.06484
+  - Qwen3.5-9B model card: huggingface.co/Qwen/Qwen3.5-9B
+  - Qwen3-Next guide: colinmcnamara.com/blog/qwen3-next-ultimate-training-inference-efficiency-guide
+  - FLA library: github.com/fla-org/flash-linear-attention
+  - TFLA paper: arxiv.org/abs/2503.14376
+  - Gated DeltaNet analysis: gist.github.com/justinchuby/0213aa253664fb72e9adb0089816de15

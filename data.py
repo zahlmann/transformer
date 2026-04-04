@@ -56,6 +56,8 @@ def prepare_data(context_len=128, val_fraction=0.1, tokenizer="char",
         return _prepare_combined(context_len)
     if dataset == "combined_epoch2":
         return _prepare_combined(context_len, epoch=2)
+    if dataset == "combined_v2":
+        return _prepare_combined_v2(context_len)
 
     if dataset == "tinystories":
         train_text, val_text = load_tinystories()
@@ -293,6 +295,62 @@ def _prepare_combined(context_len, epoch=1):
         return tok.decode(list(int(i) for i in ids))
 
     # Save vocab mapping for inference
+    vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")
+    with open(vocab_path, "wb") as f:
+        pickle.dump({
+            "tokenizer_path": meta["tokenizer_path"],
+            "bpe_vocab_size": vocab_size,
+            "tokenizer_type": "trained_bpe",
+        }, f)
+
+    return {
+        "train_x": train_x,
+        "train_y": train_y,
+        "val_x": val_x,
+        "val_y": val_y,
+        "vocab_size": vocab_size,
+        "decode_fn": decode_tokens,
+        "tokenizer": "trained_bpe",
+    }
+
+
+def _prepare_combined_v2(context_len):
+    """Load v2 tokenized data (with EOS tokens, better mix)."""
+    from tokenizers import Tokenizer
+
+    token_dir = os.path.join(DATA_DIR, "tokens_v2")
+    combined_path = os.path.join(token_dir, "combined.npz")
+    meta_path = os.path.join(token_dir, "metadata.json")
+
+    if not os.path.exists(combined_path):
+        raise FileNotFoundError(
+            f"V2 dataset not found at {combined_path}. "
+            "Run: uv run prepare_data_v2.py"
+        )
+
+    import json as _json
+    with open(meta_path) as f:
+        meta = _json.load(f)
+
+    print(f"Loading v2 dataset ({meta['total_train_tokens']/1e9:.2f}B train tokens)...")
+    print(f"  Sources: {', '.join(f'{k} ({v/1e9:.1f}B)' for k, v in meta['sources'].items())}")
+    print(f"  EOS between docs: {meta.get('has_eos_between_docs', False)}")
+
+    data = np.load(combined_path)
+    train_data = data["train"]
+    val_data = data["val"]
+
+    vocab_size = meta["vocab_size"]
+    tok = Tokenizer.from_file(meta["tokenizer_path"])
+
+    train_x, train_y = _make_sequences(train_data, context_len)
+    val_x, val_y = _make_sequences(val_data, context_len)
+
+    print(f"  {len(train_x):,} train seqs, {len(val_x):,} val seqs, vocab={vocab_size}")
+
+    def decode_tokens(ids):
+        return tok.decode(list(int(i) for i in ids))
+
     vocab_path = os.path.join(DATA_DIR, "bpe_vocab.pkl")
     with open(vocab_path, "wb") as f:
         pickle.dump({
