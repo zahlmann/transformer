@@ -1146,7 +1146,7 @@ DeltaNet code kept in git history. Can be added back later for inference if need
 
 ---
 
-## Phase D: Maximum Training Efficiency (next task)
+## Phase D: Maximum Training Efficiency (in progress)
 
 Goal: maximize tokens/sec AND quality/token on RTX 4080 Super (16GB, 52 TFLOPS FP16).
 Pure attention architecture with all modern training tricks.
@@ -1364,6 +1364,39 @@ Vocab scaling (critical for D4 larger vocab):
 
 **Target throughput:** 20-30K tok/s effective (accounting for packing + curriculum).
 **Target training:** 10B tokens in 4-6 days.
+
+### COMPLETED: Phase D steps (2026-04-04)
+
+**D1 (revert DeltaNet):** Done. use_deltanet=False by default, --use-deltanet flag.
+24L pure attention, 274M params.
+
+**D7e (cuDNN FlashAttention):** Done. 38% training speedup via jax.nn.dot_product_attention
+with implementation='cudnn'. XLA default: 13.3K tok/s → cuDNN: 18.4K tok/s. Same VRAM.
+Uses bf16 for cuDNN, falls back to XLA for f32 inference.
+
+**D7a (fused cross-entropy):** Done. Custom_vjp with chunked forward+backward. Tiles over
+vocab in 4096-token chunks, never materializes full (bs×seq×vocab) logits tensor. Enables
+vocab=32K without OOM (would need 1.1GB for logits). At vocab=4K, ~same speed as standard.
+
+**D4 (vocab 32K):** Done. Tokenizer and data already existed at 32K. Updated default
+--bpe-vocab to 32000. vocab=32K training: 28.4K tok/s, 12.3GB VRAM, 303M params.
+
+**D2 (sequence packing):** Skipped. Current data already concatenates documents without
+padding (no waste). Proper doc-boundary masking would need re-tokenization with EOS markers.
+
+**D3 (sequence length curriculum):** Done. --curriculum flag gives 3 phases:
+- Phase 1 (10%): ctx=128, bs=64 (4x tokens/step, 16x cheaper attention)
+- Phase 2 (20%): ctx=256, bs=32 (2x tokens/step)
+- Phase 3 (70%): ctx=512, bs=16 (full context)
+Separate JIT compilation per phase.
+
+**Current training config (ready to run):**
+```
+uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 3 --dataset combined \
+  --curriculum --lr 3e-4
+```
+Expected: ~28K tok/s at vocab=32K with cuDNN FlashAttention + fused CE.
 
 ---
 
