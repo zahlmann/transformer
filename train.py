@@ -10,15 +10,15 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_MAX_SIZE", str(2 * 1024**3))
 
 import argparse
 import pickle
+import tempfile
 import time
 import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
 
-from data import prepare_data
-from model import (init_transformer, transformer_forward_batch, cross_entropy_loss,
-                   transformer_loss_fused, count_params)
+from data import load_data
+from model import init_transformer, transformer_loss_fused, count_params
 
 
 def main():
@@ -34,38 +34,24 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--dataset", default="tinystories",
-                        choices=["shakespeare", "tinystories", "combined", "combined_epoch2", "combined_v2"])
-    parser.add_argument("--tokenizer", default="trained_bpe", choices=["char", "bpe", "trained_bpe"])
-    parser.add_argument("--bpe-vocab", type=int, default=32000)
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to weights.pkl checkpoint to resume from")
-    parser.add_argument("--d-ff", type=int, default=None,
-                        help="FFN hidden dim (default: auto from SwiGLU formula)")
-    parser.add_argument("--use-deltanet", action="store_true",
-                        help="Enable DeltaNet hybrid layers (default: pure attention)")
+                        help="Path to checkpoint to resume from (checkpoint.pkl or weights.pkl)")
+    parser.add_argument("--checkpoint-interval", type=int, default=2000,
+                        help="Save checkpoint every N steps (0=disable, default 2000)")
     parser.add_argument("--curriculum", action="store_true",
                         help="Sequence length curriculum: start short (128), grow to full ctx")
-    parser.add_argument("--mtp-heads", type=int, default=0,
-                        help="Number of multi-token prediction heads (0=disabled, 3=standard)")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="Disable gradient checkpointing (faster but uses more VRAM)")
     args = parser.parse_args()
 
-    # data
-    data = prepare_data(context_len=args.context_len, tokenizer=args.tokenizer,
-                        bpe_vocab_size=args.bpe_vocab, dataset=args.dataset)
+    # data — v2 streaming only (combined_v2, trained_bpe 32K)
+    data = load_data(context_len=args.context_len)
     vocab_size = data["vocab_size"]
-    streaming = data.get("streaming", False)
+    assert data.get("streaming", False), "expected v2 streaming dataset"
 
-    if streaming:
-        # v2 streaming mode: raw token memmap, create batches on the fly
-        train_tokens = data["train_tokens"]  # memmap, not in RAM
-        n_train_seqs = (len(train_tokens) - 1) // args.context_len
-        n_batches = n_train_seqs // args.batch_size
-        train_x = train_y = None  # created per-batch
-    else:
-        train_x = np.array(data["train_x"])  # keep on CPU, batch to GPU
-        train_y = np.array(data["train_y"])
-        n_batches = len(train_x) // args.batch_size
+    train_tokens = data["train_tokens"]  # memmap, not in RAM
+    n_train_seqs = (len(train_tokens) - 1) // args.context_len
+    n_batches = n_train_seqs // args.batch_size
 
     val_x = jnp.array(data["val_x"][:args.batch_size])
     val_y = jnp.array(data["val_y"][:args.batch_size])
@@ -74,6 +60,10 @@ def main():
         f"warmup {args.warmup_steps} >= total steps {total_steps}"
 
     # model
+    resume_step = 0
+    resume_epoch = 0
+    resume_bi = 0
+    resumed_opt_state = None
     if args.resume:
         print(f"Resuming from {args.resume}")
         with open(args.resume, "rb") as f:
@@ -82,25 +72,20 @@ def main():
         config = ckpt["config"]
         assert config["d_model"] == args.d_model, \
             f"checkpoint d_model={config['d_model']} != --d-model={args.d_model}"
+        if "opt_state" in ckpt:
+            resumed_opt_state = jax.tree.map(jnp.array, ckpt["opt_state"])
+            resume_step = ckpt["global_step"]
+            resume_epoch = ckpt["epoch"]
+            resume_bi = ckpt["batch_index"]
+            print(f"  full checkpoint: step {resume_step}, epoch {resume_epoch}, batch {resume_bi}")
+        else:
+            print("  weights-only checkpoint (optimizer state will be reinitialized)")
     else:
         key, init_key = jax.random.split(jax.random.key(args.seed))
         params, config = init_transformer(
             init_key, vocab_size, d_model=args.d_model, n_heads=args.n_heads,
-            n_layers=args.n_layers, context_len=args.context_len, n_kv_heads=args.n_kv_heads,
-            use_deltanet=args.use_deltanet, n_mtp_heads=args.mtp_heads)
-        if args.d_ff is not None:
-            # override auto-computed d_ff
-            from model import _swiglu_d_ff
-            old_d_ff = config["d_ff"]
-            config["d_ff"] = args.d_ff
-            # reinit FFN weights with new d_ff if different
-            if args.d_ff != old_d_ff:
-                for layer in range(args.n_layers):
-                    p = f"layer{layer}"
-                    key, k1, k2, k3 = jax.random.split(key, 4)
-                    params[f"{p}.ffn.gate"] = jax.random.normal(k1, (args.d_model, args.d_ff)) * (args.d_model ** -0.5)
-                    params[f"{p}.ffn.up"] = jax.random.normal(k2, (args.d_model, args.d_ff)) * (args.d_model ** -0.5)
-                    params[f"{p}.ffn.down"] = jax.random.normal(k3, (args.d_ff, args.d_model)) * (args.d_ff ** -0.5)
+            n_layers=args.n_layers, context_len=args.context_len,
+            n_kv_heads=args.n_kv_heads)
 
     # optimizer: linear warmup + cosine decay
     schedule = optax.join_schedules(
@@ -108,10 +93,13 @@ def main():
          optax.cosine_decay_schedule(args.lr, total_steps - args.warmup_steps, alpha=args.lr * 0.01)],
         boundaries=[args.warmup_steps])
     optimizer = optax.adamw(schedule, weight_decay=args.weight_decay)
-    opt_state = optimizer.init(params)
+    opt_state = resumed_opt_state if resumed_opt_state is not None else optimizer.init(params)
 
-    # use fused CE for large vocab (avoids materializing full logits tensor)
-    use_fused_ce = config["vocab_size"] >= 8192
+    if args.no_checkpoint:
+        config["gradient_checkpoint"] = False
+
+    # fused CE always used (vocab=32K >> 8192 threshold)
+    assert config["vocab_size"] >= 8192
     ce_chunk = min(4096, config["vocab_size"])
 
     def make_train_step(phase_config):
@@ -121,10 +109,7 @@ def main():
         def step(params, opt_state, x, y):
             def loss_fn(params):
                 params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
-                if use_fused_ce:
-                    return transformer_loss_fused(params_bf16, pc, x, y, ce_chunk)
-                logits = transformer_forward_batch(params_bf16, pc, x)
-                return cross_entropy_loss(logits.astype(jnp.float32), y)
+                return transformer_loss_fused(params_bf16, pc, x, y, ce_chunk)
             loss, grads = jax.value_and_grad(loss_fn)(params)
             updates, opt_state = optimizer.update(grads, opt_state, params)
             return optax.apply_updates(params, updates), opt_state, loss
@@ -133,10 +118,7 @@ def main():
     @jax.jit
     def eval_loss(params, x, y):
         params_bf16 = jax.tree.map(lambda w: w.astype(jnp.bfloat16), params)
-        if use_fused_ce:
-            return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
-        logits = transformer_forward_batch(params_bf16, config, x)
-        return cross_entropy_loss(logits.astype(jnp.float32), y)
+        return transformer_loss_fused(params_bf16, config, x, y, ce_chunk)
 
     # curriculum schedule: phases with (fraction_of_training, ctx, bs_multiplier)
     if args.curriculum and args.context_len >= 256:
@@ -155,37 +137,56 @@ def main():
         if p["ctx"] not in phase_steps:
             phase_steps[p["ctx"]] = make_train_step(p)
 
-    layer_types = config.get("layer_types", ["attn"] * args.n_layers)
-    n_delta = sum(1 for t in layer_types if t == "delta")
-    n_attn = sum(1 for t in layer_types if t == "attn")
     print(f"d={args.d_model} h={args.n_heads} kv_h={args.n_kv_heads} l={args.n_layers} "
-          f"ctx={args.context_len} bs={args.batch_size}"
-          + (f" ({n_delta}D+{n_attn}A)" if n_delta > 0 else ""))
-    print(f"{args.dataset} {args.tokenizer} vocab={vocab_size}")
+          f"ctx={args.context_len} bs={args.batch_size}")
+    print(f"combined_v2 trained_bpe vocab={vocab_size}")
     print(f"{count_params(params):,} params, {n_batches} steps/epoch, {total_steps} total")
 
     def _get_batch_streaming(seq_indices, ctx, bs, offset):
         """Create (x, y) batch from raw token stream on the fly."""
         indices = seq_indices[offset:offset + bs]
-        # each sequence starts at idx * context_len in the token stream
         batch = np.stack([train_tokens[i * args.context_len:i * args.context_len + ctx + 1]
                           for i in indices])
         return batch[:, :ctx], batch[:, 1:ctx + 1]
 
-    # train with prefetch: overlap host→device transfer with compute
+    ckpt_dir = os.path.dirname(__file__)
+    ckpt_path = os.path.join(ckpt_dir, "checkpoint.pkl")
+
+    def save_checkpoint(params, opt_state, config, global_step, epoch, batch_index):
+        """Save full checkpoint atomically (write tmp, rename)."""
+        ckpt_data = {
+            "params": jax.tree.map(np.asarray, params),
+            "opt_state": jax.tree.map(np.asarray, opt_state),
+            "config": config,
+            "global_step": global_step,
+            "epoch": epoch,
+            "batch_index": batch_index,
+        }
+        fd, tmp = tempfile.mkstemp(dir=ckpt_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(ckpt_data, f)
+            os.replace(tmp, ckpt_path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+        print(f"    checkpoint saved: step {global_step}, epoch {epoch+1}, batch {batch_index}")
+
+    # train with prefetch: overlap host->device transfer with compute
     t_start = time.perf_counter()
-    global_step = 0
+    global_step = resume_step
     for epoch in range(args.epochs):
+        if epoch < resume_epoch:
+            continue
         rng = np.random.default_rng(args.seed + epoch)
-        if streaming:
-            seq_perm = rng.permutation(n_train_seqs)
-        else:
-            perm = rng.permutation(len(train_x))
-            sx, sy = train_x[perm], train_y[perm]
+        seq_perm = rng.permutation(n_train_seqs)
         eloss = 0.0
+        steps_this_epoch = 0
         t_epoch = time.perf_counter()
 
-        bi = 0
+        bi = resume_bi if epoch == resume_epoch else 0
+        if bi > 0:
+            print(f"  resuming epoch {epoch+1} from batch {bi}/{n_batches}")
         while bi < n_batches:
             # determine current phase
             progress = global_step / total_steps
@@ -212,11 +213,7 @@ def main():
 
             # prefetch first batch
             s = bi * args.batch_size
-            if streaming:
-                bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
-            else:
-                bx_np = sx[s:s + bs, :ctx]
-                by_np = sy[s:s + bs, :ctx]
+            bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
             next_bx = jax.device_put(jnp.array(bx_np))
             next_by = jax.device_put(jnp.array(by_np))
 
@@ -225,34 +222,35 @@ def main():
                 # prefetch next batch
                 if ci + 1 < chunk_steps:
                     s = (bi + ci + 1) * args.batch_size
-                    if streaming:
-                        if s + bs <= n_train_seqs:
-                            bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
-                            next_bx = jax.device_put(jnp.array(bx_np))
-                            next_by = jax.device_put(jnp.array(by_np))
-                    else:
-                        if s + bs <= len(sx):
-                            next_bx = jax.device_put(jnp.array(sx[s:s + bs, :ctx]))
-                            next_by = jax.device_put(jnp.array(sy[s:s + bs, :ctx]))
+                    if s + bs <= n_train_seqs:
+                        bx_np, by_np = _get_batch_streaming(seq_perm, ctx, bs, s)
+                        next_bx = jax.device_put(jnp.array(bx_np))
+                        next_by = jax.device_put(jnp.array(by_np))
 
                 params, opt_state, loss = train_step(params, opt_state, bx, by)
                 eloss += float(loss)
                 global_step += 1
+                steps_this_epoch += 1
 
                 step_in_epoch = bi + ci
-                if step_in_epoch > 0 and step_in_epoch % 1000 == 0:
-                    avg = eloss / (step_in_epoch + 1)
-                    sps = (step_in_epoch + 1) / (time.perf_counter() - t_epoch)
+                if steps_this_epoch > 0 and step_in_epoch % 1000 == 0:
+                    avg = eloss / steps_this_epoch
+                    sps = steps_this_epoch / (time.perf_counter() - t_epoch)
                     eta = (n_batches - step_in_epoch) / sps / 60
                     phase_info = f"ctx={ctx}" if len(phases) > 1 else ""
                     print(f"    step {step_in_epoch}/{n_batches}  loss={avg:.4f}  "
                           f"{sps:.1f} steps/s  eta={eta:.0f}min  {phase_info}")
 
+                if args.checkpoint_interval > 0 and global_step > 0 and global_step % args.checkpoint_interval == 0:
+                    save_checkpoint(params, opt_state, config, global_step, epoch, bi + ci + 1)
+
             bi += chunk_steps
 
         vl = float(eval_loss(params, val_x, val_y))
-        print(f"  epoch {epoch+1}/{args.epochs}  train={eloss/n_batches:.4f}  "
+        avg_train = eloss / steps_this_epoch if steps_this_epoch > 0 else 0
+        print(f"  epoch {epoch+1}/{args.epochs}  train={avg_train:.4f}  "
               f"val={vl:.4f}  ppl={np.exp(vl):.2f}")
+        save_checkpoint(params, opt_state, config, global_step, epoch + 1, 0)
 
     elapsed = time.perf_counter() - t_start
     mem = jax.local_devices()[0].memory_stats()
