@@ -9,17 +9,21 @@ See [`repo_explained_from_zero.md`](repo_explained_from_zero.md) for a ground-up
 ## Current Model
 
 ```
-d=1024, h=16, l=16, ctx=512, GQA 4 KV heads, 242M params
-  Trained on 1.77B tokens (FineWeb-Edu 60%, Cosmopedia 18%, Wikipedia 17%, Code 6%)
-  1 epoch, 13.7 hours, 36K tok/s training throughput
-  val_loss=3.04, ppl=20.91
-  Vocab: 32K BPE trained on combined corpus
+306M params (d=1024, h=16, kv=4, l=24, ctx=512)
+  RMSNorm, RoPE, SwiGLU (d_ff=2816), GQA, no biases, tied embeddings
+  Vocab: 32K BPE trained on corpus
+  Training data: 7.85B tokens (5 sources)
+    34% FineWeb-Edu    — quality-filtered web (score >= 3)
+    30% StarCoder      — code (13 languages)
+    19% OpenWebMath    — math with LaTeX
+     9% Wikipedia
+     8% Cosmopedia     — synthetic textbooks
 ```
 
 ## Inference Performance
 
 ```
-RTX 4080 Super | 242M param model (d=1024)
+RTX 4080 Super | 306M param model (d=1024, l=24)
 
   Multi-SM sync:       501 tok/s  (2.0 ms/tok, 30% BW util)
   Pipelined:           618 tok/s  (1.6 ms/tok, 1.23x)
@@ -29,7 +33,17 @@ RTX 4080 Super | 242M param model (d=1024)
   Weight buffer:       485 MB (7.6x L2 — HBM-bound)
 ```
 
-The entire decode step — embedding, attention, FFN, output projection — runs in a single GPU kernel call across all 16 layers.
+The entire decode step — embedding, attention, FFN, output projection — runs in a single GPU kernel call across all 24 layers.
+
+## Training Performance
+
+```
+RTX 4080 Super, bs=16, --no-checkpoint: 28.4K tok/s
+RTX 4090, bs=32, --no-checkpoint:       ~31K tok/s
+
+3 epochs × 7.85B tokens = 23.5B total
+Expected: ~8.7h on 4090, ~13-14h on 4080 Super
+```
 
 ## Quick Start
 
@@ -46,17 +60,19 @@ uv run serve.py --continuous --batch-size 2 --prompts "A" "B" "C" "D"
 # profile decode kernels
 uv run profile_kernels.py
 
-# prepare training data (download + tokenize)
-uv run prepare_data.py
+# prepare training data (download + tokenize 7.85B tokens from 5 sources)
+uv run prepare_data_v2.py
 
-# train (d=1024, ~14 hours on RTX 4080 Super)
-uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
-  --context-len 512 --epochs 1 --batch-size 16 --lr 3e-4 --dataset combined
+# train (d=1024, 24 layers, ~31K tok/s on RTX 4090)
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 3 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint
 ```
 
 ## What's In Here
 
-**Training**: JAX model with bf16 forward pass for tensor core utilization, AdamW with cosine LR schedule. Multi-source data pipeline (FineWeb-Edu, Wikipedia, Cosmopedia, Code) with 32K BPE tokenizer.
+**Training**: JAX model with cuDNN FlashAttention, AdamW with cosine LR schedule, curriculum training (ctx warmup 128→256→512). Fused cross-entropy for 32K vocab without OOM. Multi-source data pipeline with 32K BPE tokenizer.
 
 **Inference kernels**: 7 Triton kernel files covering single-sequence, batched, persistent, and pipelined decode. Multi-SM parallelism with atomic barriers, KV-split attention (FlashDecoding-style), weight-amortized FFN. Projection tiling for D_HEAD=64 shared memory constraints.
 
@@ -66,10 +82,11 @@ uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 16 \
 
 ```
 Training:
-  model.py                          JAX transformer (no FFN biases, GQA)
-  data.py                           dataset loading (TinyStories, Shakespeare, combined)
-  train.py                          AdamW training with bf16 forward + LR schedule
-  prepare_data.py                   multi-source data download + tokenization
+  model.py                          JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
+  train.py                          AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
+  data.py                           streaming data loading (v2 memmap for 8B tokens, legacy datasets)
+  prepare_data_v2.py                v2 data pipeline: 5-source download, tokenize, shuffle, combine
+  prepare_data.py                   legacy data download + tokenization (v1)
 
 Inference kernels:
   kernels/multi_sm_decode.py        multi-SM decode with atomic barriers + KV-split

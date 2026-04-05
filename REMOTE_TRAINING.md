@@ -72,20 +72,27 @@ HF_HUB_ENABLE_HF_TRANSFER=1 uv run python -u prepare_data_v2.py
 ## Training command
 
 ```bash
-# RECOMMENDED: No MTP, maximize batch size for 24GB
+# RECOMMENDED: No MTP, no gradient checkpointing, maximize batch size for 24GB
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 32 --epochs 3 \
-  --dataset combined_v2 --curriculum --lr 3e-4 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
   2>&1 | tee training.log
 ```
 
 ## Tuning for maximum speed
 
+### --no-checkpoint (gradient checkpointing)
+`--no-checkpoint` disables gradient checkpointing. +12% speed, but more VRAM.
+On 4080 Super (16GB): 6.0GB with checkpoint → 11.2GB without. Safe.
+On 4090 (24GB): easily fits. Always use `--no-checkpoint`.
+
 ### Batch size
-On 4080 Super (16GB): bs=16 used 12.3GB VRAM.
+On 4080 Super (16GB): bs=16 used 11.2GB VRAM (with --no-checkpoint).
 On 4090 (24GB): **start with bs=32** (should use ~20GB). If it fits, try bs=48.
 If OOM, fall back to bs=24.
+NOTE: larger batch doesn't increase tok/s (GPU is compute-saturated), but
+fewer optimizer steps may slightly affect convergence.
 
 The curriculum flag multiplies batch size in early phases:
 - Phase 1 (10%): ctx=128, bs=bs×4 (e.g., 128 at bs=32)
@@ -157,13 +164,18 @@ The model saves to `weights.pkl` (~1.2GB). Push it or make it available for down
 
 ## Checkpointing
 
-Currently the script only saves at the end. For a multi-day run, you may want to
-add periodic checkpoint saves. The save code (from train.py end):
-```python
-import pickle
-save_path = "weights.pkl"
-with open(save_path, "wb") as f:
-    pickle.dump({"params": jax.tree.map(np.asarray, params), "config": config}, f)
+Checkpoints are saved automatically every 2000 steps (configurable via `--checkpoint-interval`)
+and at the end of each epoch. Saves to `checkpoint.pkl` (~3.6GB: params + optimizer state).
+
+To resume from a checkpoint:
+```bash
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 32 --epochs 3 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  --resume checkpoint.pkl \
+  2>&1 | tee -a training.log
 ```
 
-Add this inside the epoch loop after the `eval_loss` line for per-epoch checkpoints.
+This restores params, optimizer state (Adam moments), LR schedule position, and
+exact epoch/batch position. Training continues exactly where it left off.
