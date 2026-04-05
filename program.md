@@ -16,82 +16,24 @@ memory waste, keep the GPU at 100% utilization.*
 
 Train a high-quality decoder-only transformer on one GPU, serve it with custom Triton kernels.
 
-### Completed
+---
 
-1. Fused Triton prefill + decode kernels (single kernel for small model)
-2. BPE tokenization + tiled output projection (vocab=1024, zero overhead)
-3. Multi-block prefill for d_model=128 (BLOCK_SEQ=32, 3 kernels/layer)
-4. Fused multi-layer decode (all layers + output in one kernel)
-5. Host-side optimization: in-kernel cache updates, precomputed bf16 weights
-6. TinyStories dataset (14M tokens) + trained BPE tokenizer (vocab=4096)
-7. Scaled to d_model=256, 4 layers, 8 heads (5.3M params, ppl=5.40)
-8. Fused N-layer decode with packed weights/caches (any layer count)
-9. FlashAttention for context>256 (tiled KV + online softmax)
-10. AdamW + LR warmup + cosine decay training improvements
-11. Speculative decoding with parallel verification kernel
-12. Scaled to d=512, 8 layers, 16 heads (29.7M params, ppl=2.91)
-13. Multi-SM decode kernel: grid=(N_HEADS,) with atomic barriers (5.2x speedup, 287→1519 tok/s)
-14. KV-split parallelism: grid=(N_HEADS*2,) FlashDecoding-style (1734→1851 tok/s, +10%)
-15. Split barrier: separate counter/done-flag cache lines (1851→1937 tok/s, +5%)
-16. Batched decode: B sequences per kernel with shared weights (1890→3422 tok/s at B=4, +81%)
-17. Persistent batched decode: single launch for B seq × N steps (7351 tok/s B=4, +10% vs pipelined)
-18. In-place KV for persistent kernels: pos-only store (+7.1% single-seq)
-19. Scaled to d=768, 12 layers, 24 heads, GQA 6 KV heads (81.1M params, ppl=2.60)
-20. Non-power-of-2 D_MODEL support via D_BLOCK padding with masking
-21. Bandwidth optimization: L2 eviction hints, merged barriers (1448→1472 pipelined)
-22. Streaming text generation API (generate.py, 966 tok/s streaming at d=768)
-23. Variable-length batched inference (serve.py, per-sequence position tracking)
-24. Triton prefill kernel for GQA + D_BLOCK padding (12.9ms vs JAX 30.4ms, 2.4x)
-25. Tensor core batched projections (single 2D tl.dot for Q/K/V, +8-12% batched)
-26. Paged KV cache (PagePool, 64-position pages, 87% memory reduction for short seqs)
-27. GPU-accelerated paged KV (JIT gather/scatter, 3.5x faster than CPU paging, 693 tok/s)
-28. Continuous batching (serve_continuous: N prompts through B slots, auto page reuse)
-29. Speculative decoding revisit (d=512 draft: 71% acceptance at K=4, seq verify 0.47x)
-
-### Tried but didn't help (single-sequence decode)
-
-- **GQA** (4 KV heads for 16 Q heads): ppl 2.96 (vs 2.91). KV cache 8.4→2.1 MB, total
-  data 67.7→55.1 MB (fits in L2). But 0% decode speedup — kernel is barrier-limited,
-  not memory-limited. GQA value is for BATCHED inference (KV cache scales with batch).
-- **Parallel residual** (attn||FFN, 9 barriers instead of 17): ppl 3.01. Only 1.3% speedup.
-  Barrier cost is dominated by straggler VARIANCE (proportional to total work), not
-  fixed overhead. Halving barriers saves only ~8µs of fixed overhead.
-- **num_warps sweep**: 2/4/8 all within 5%. Not warp-limited.
-- **num_stages=2**: marginal (within noise of num_stages=1).
-
-### Current Performance (RTX 4080 Super)
+## Current Model
 
 ```
-CURRENT MODEL (d=1024, h=16, l=16, ctx=512, GQA 4 KV heads, 242M params, 3.49B tokens, train_loss=2.70):
-  Multi-SM sync:       501 tok/s (2.00 ms/tok, 30% BW util)
-  Pipelined:           618 tok/s (1.62 ms/tok, 1.23x)
-  Persistent:          613 tok/s (1.63 ms/tok, 1.22x)
-  Batched B=4 sync:    856 tok/s (4.68 ms/step, 1.71x)
-  Batched B=4 pipe:    952 tok/s (4.20 ms/step, 1.90x)
-  Persist B=4:         992 tok/s (4.03 ms/step, 1.98x)
-  Persist B=8:        1097 tok/s (7.30 ms/step, 2.19x)
-  Prefill (128 tok):   23.2 ms  (5516 tok/s, Triton)
-  Weight buffer:       484.6 MB (bf16, 7.6x L2 cache)
-  KV cache:            8.4 MB   (bf16, per sequence)
-  Bandwidth util:      30%      (of 836 GB/s theoretical)
-  Training:            36K tok/s (bf16 forward, bs=16)
+306M params, d=1024, h=16, kv=4, l=24, ctx=512
+GQA (4 KV heads), RMSNorm, RoPE, SwiGLU (d_ff=2816), no biases, tied embeddings
+Vocab: 32K BPE trained on corpus
 
-Previous models:
-  d=768, 12L, 81M:   1024 sync → 1503 pipe → 2687 persist-B=8 (20% BW)
-  d=512,  8L, 27M:   1834 sync → 5129 persistent → 7862 persist-B=8 (12% BW)
+Training data: 7.85B tokens (5 sources):
+  34% FineWeb-Edu (quality-filtered web, score >= 3)
+  30% StarCoder code (13 languages)
+  19% OpenWebMath (math with LaTeX)
+   9% Wikipedia
+   8% Cosmopedia (synthetic textbooks)
+
+Stored as data/tokens_v2/train.bin (flat int32, memory-mapped) + val.npy
 ```
-
-**Key findings:**
-- Multi-SM decode (grid=16) gave 6x speedup over single-SM.
-- KV-split parallelism (grid=32, kv_splits=2) adds another 10% (1734→1851 tok/s).
-  Splits KV cache tiles across 2 blocks per head (FlashDecoding-style).
-  Merge uses online softmax correction (weighted average of normalized O-projections).
-  kv_splits=4 was slightly slower (barrier contention with 64 blocks).
-- Split barrier: separates arrival counter from done flag on different cache lines.
-  Reduces L2 contention during spin-waiting (1851→1937 tok/s, +5%).
-  Pure GPU throughput: 3108 tok/s (0.32 ms/tok).
-- GPU→CPU sync (int()) costs 34% of total time (0.19 ms per token).
-- Bandwidth utilization: 16%. Theoretical minimum: 0.081 ms/tok — 4.0x headroom (pure GPU).
 
 ---
 
@@ -108,1349 +50,226 @@ Previous models:
 
 ```
 Decoder-only transformer
-d_model: 64-512, n_heads: 2-16 (d_head=32), n_layers: 1-8, d_ff: 4*d_model
-context_len: 128-512
+d_model=1024, n_heads=16, n_kv_heads=4 (GQA), n_layers=24, d_ff=2816
+context_len=512, vocab=32000
 
-Small:  d=64,  h=2,  l=1, vocab=65,   params=66,368     (Shakespeare, char)
-Medium: d=64,  h=2,  l=1, vocab=1024, params=189,120    (Shakespeare, BPE)
-Large:  d=128, h=4,  l=2, vocab=1024, params=674,304    (Shakespeare, BPE)
-XL:     d=256, h=8,  l=4, vocab=4096, params=5,318,144  (TinyStories, BPE)
-XXL:    d=512, h=16, l=8, vocab=4096, params=29,660,160 (TinyStories full, BPE)
-```
-
-Weights: token_emb (65,64), pos_emb (128,64), Q/K/V/O (64,64 each), FFN up (64,256),
-FFN down (256,64), LN scales/biases, output_proj (64,65).
-
----
-
-## Current Kernel Infrastructure
-
-### `kernels/fused_prefill.py` — Prefill Kernel
-
-Fused Triton kernel that processes the ENTIRE forward pass in one kernel call:
-Embedding → LayerNorm → Multi-Head Attention → FFN → LayerNorm → Output Projection
-
-Key techniques:
-- **All weights in registers.** Each weight matrix fits in register file. No HBM
-  round-trips between layers.
-- **bf16 tensor core matmuls with f32 accumulation.** Uses hardware tensor cores
-  for 8-16x throughput vs scalar fp32.
-- **K-tiled FFN loop.** The (128,256) FFN is tiled into 8 blocks of (128,32) using
-  `tl.range(0, 256, 32)` with dynamic range to prevent register pressure from unrolling.
-- **Causal attention in-register.** Full (128,128) attention matrix computed and softmaxed
-  without going through HBM.
-- **num_warps=4 (128 threads/block).** Optimal — fewer warps = more registers/thread.
-  255 regs/thread, 0 bytes spill.
-- **Tiled output projection.** Vocab dimension tiled in VOCAB_TILE=128 chunks via
-  `tl.range(0, VOCAB_PAD, VOCAB_TILE)`. Each tile independently computes and stores
-  logits to HBM. VOCAB_SIZE/VOCAB_PAD passed as kernel `tl.constexpr` parameters.
-- **Outputs KV cache** for the decode phase.
-
-### `kernels/fused_decode.py` — Decode Kernel
-
-Single-token decode using KV cache. Uses element-wise ops (not tensor cores, since M=1).
-Reads KV cache, computes attention over all past tokens, outputs logits + new K/V vectors.
-Same tiled output projection as prefill. JAX wrapper updates the cache via scatter.
-
----
-
-## Results (Optimization History)
-
-```
-Phase A1: d=64, 1L, vocab=1024 (Shakespeare):
-  Initial:                          740 tok/s
-  + tiled output projection:        758 tok/s  (zero overhead from tiling)
-
-Phase A2: d=128, 2L, vocab=1024 (Shakespeare):
-  Multi-block (3 launches/step):    335 tok/s
-  + fused decode (1 launch/step):   454 tok/s  (+35%)
-  + precomputed bf16 weights:       713 tok/s  (+57%)
-  + in-kernel cache updates:       2504 tok/s  (+3.6x, biggest win)
-
-Phase A3: d=256, 4L, vocab=4096, 5.3M params (TinyStories):
-  Fused N-layer decode:            1396 tok/s
-
-Phase A4: d=512, 8L, vocab=4096, 29.7M params (TinyStories full):
-  Fused N-layer decode:             287 tok/s  (3.48 ms/tok, 2% BW utilization)
-
-Phase A5: Multi-SM decode optimization:
-  Profiling revealed: kernel=93%, host=3%, argmax=4% of step time
-  Multi-SM decode (grid=16):       1734 tok/s  (0.58 ms/tok, 14% BW utilization)
-  Without int() sync:              2742 tok/s  (0.36 ms/tok)
-  Speedup vs single-SM:              6.0x (with sync), 9.6x (without sync)
-
-Phase A6: KV-split parallelism (FlashDecoding):
-  KV splits=2, grid=32:           1851 tok/s  (0.54 ms/tok, 15% BW utilization)
-  KV splits=4, grid=64:           1991 tok/s  (short-burst, but +barrier contention)
-  Improvement over grid=16:         +10% sustained throughput
-  Technique: split KV cache tiles across 2 blocks per head, merge with
-    online softmax correction (weighted average of normalized O-projections)
-
-Phase A7: Split barrier + profiling:
-  Split barrier:                   1937 tok/s  (0.52 ms/tok, 16% BW utilization)
-  Without GPU→CPU sync:            3108 tok/s  (0.32 ms/tok)
-  Improvement: +5% with sync, +6.5% pure GPU
-  Key insight: GPU→CPU int() sync costs 34% of total time (0.19 ms/tok)
-  Technique: separate arrival counter and done-flag on different cache lines.
-    Last-arriving block sets done flag; others poll done (not counter).
-
-Key findings:
-- Tiled output projection has ZERO overhead vs register-only.
-- Python dispatch overhead per jt.triton_call is ~0.4ms. Fusing all decode
-  into one kernel eliminated 128 launches (35% speedup).
-- .astype(bf16) per decode step created 1764 unnecessary allocations.
-  Precomputing once gave another 57% speedup.
-- In-kernel KV cache updates were the biggest single win (3.6x).
-- At d=512 single-SM, bandwidth utilization was only 2%. GPU was 98% idle.
-- Multi-SM decode with atomic barriers: 5.2x speedup (287→1519 tok/s).
-  Splits attention heads across 16 blocks, distributes FFN across all blocks.
-  Uses release/acquire atomics for cross-block synchronization.
-  Bandwidth utilization improved from 2% to 12%.
+Components:
+  - RMSNorm (pre-attention and pre-FFN, no bias)
+  - RoPE (base=10000, applied to Q and K after projection)
+  - SwiGLU FFN: (SiLU(x @ W_gate) * (x @ W_up)) @ W_down, d_ff=2816
+  - GQA: 16 query heads, 4 KV heads (group size 4)
+  - No biases anywhere (attention projections, FFN projections)
+  - Tied embeddings: output logits = h @ token_emb.T
+  - Fused cross-entropy: chunked forward+backward, never materializes full logits
 ```
 
 ---
 
-## COMPLETED: BPE Tokenization + Tiled Output Kernel
+## Inference Performance (RTX 4080 Super)
 
-Switched from char-level (vocab=65) to BPE subword tokens (vocab=1024).
-This was the first scaling step — forces tiled output projection in the kernel.
+```
+d=1024, h=16, l=24 (current model):
+  Multi-SM sync:       501 tok/s  (2.0 ms/tok, 30% BW util)
+  Pipelined:           618 tok/s  (1.6 ms/tok, 1.23x)
+  Persist B=4:         992 tok/s  (4.0 ms/step, 1.98x)
+  Persist B=8:        1097 tok/s  (7.3 ms/step, 2.19x)
+  Prefill (128 tok):   23.2 ms   (5516 tok/s, Triton)
+  Weight buffer:       485 MB (7.6x L2 — HBM-bound)
+```
 
-### What was done
-
-1. **BPE tokenizer**: Trained on Shakespeare using HuggingFace `tokenizers` (ByteLevel
-   BPE). GPT-2's tiktoken had 16-25% UNK rate on Shakespeare (11K unique tokens in corpus).
-   The trained tokenizer has 0% UNK with vocab=1024.
-
-2. **Tiled output projection**: Both kernels now tile the output projection in VOCAB_TILE=128
-   chunks using `tl.range(0, VOCAB_PAD, VOCAB_TILE)`. VOCAB_SIZE and VOCAB_PAD are kernel
-   constexpr parameters, so jax-triton JIT-compiles per vocab configuration.
-
-3. **Results**: Zero overhead from tiling (4.35x speedup vs 4.0x baseline). The output
-   projection is compute-light — attention dominates the kernel runtime. Text output is
-   coherent Shakespeare-like dialogue.
-
-### Design decisions taken
-
-- **Tokenizer**: GPT-2 tiktoken had 24-46% UNK rate on Shakespeare (11K unique tokens).
-  Trained a BPE tokenizer directly on the corpus using HuggingFace `tokenizers` — 0% UNK.
-- **Vocab size**: 1024. Gives 8 tiles of 128, meaningful tiling work. Both 512 and 1024
-  produce similar bits-per-character (~2.2) — the model's capacity is the bottleneck.
-- **VOCAB_TILE**: 128 (same as FFN BLOCK_K). Each tile loads (64, 128) bf16 weights,
-  produces (128, 128) f32 logits (prefill) or (128,) f32 logits (decode).
-- **d_model stays at 64**: model is parameter-inefficient (embedding tables dominate)
-  but the kernel engineering goal was achieved without changing the core architecture.
+The entire decode step — embedding, attention, FFN, output projection — runs in
+a single GPU kernel call across all layers.
 
 ---
 
-## COMPLETED: Phase A2 — Bigger Model
-
-Scaled d_model 64→128, added 2 layers, 4 attention heads. Used multi-block approach:
-3 Triton kernels per layer (proj, attn, ffn) + 1 output kernel, grid=(4,) with
-BLOCK_SEQ=32. Per-block register peak: ~52KB (vs 127KB budget).
-
-### Block kernels architecture
+## Training Performance
 
 ```
-kernels/block_prefill.py:
-  _proj_kernel:   LN + Q/K/V projections   (grid=4, each block=32 rows)
-  _attn_kernel:   causal attention + O + residual
-  _ffn_kernel:    LN + FFN + residual
-  _output_kernel: final LN + tiled output projection
+RTX 4080 Super, bs=16, ctx=512, no gradient checkpointing:
+  28.4K tok/s with cuDNN FlashAttention + fused CE + 32K vocab
+  ~11.2GB VRAM
 
-kernels/block_decode.py:
-  _decode_layer_kernel: per-layer decode (M=1, trivial register pressure)
-  _decode_output_kernel: final LN + output projection
+With --no-checkpoint on RTX 4090 (24GB), bs=32: ~31K tok/s
+  3 epochs × 7.85B tokens = 23.5B tokens total
+  Expected: ~8.7h on 4090, ~13-14h on 4080 Super
+
+Curriculum training (--curriculum flag):
+  Phase 1 (10%): ctx=128, bs=bs×4
+  Phase 2 (20%): ctx=256, bs=bs×2
+  Phase 3 (70%): ctx=512, bs=bs
 ```
-
-### What was done (optimization)
-
-- ~~**Persistent kernel**~~ DONE — fused 2-layer decode into single kernel (35% speedup)
-- ~~**Precompute weights**~~ DONE — avoid per-step dtype conversion (57% speedup)
-- ~~**In-kernel cache updates**~~ DONE — eliminate .at[].set() (3.6x speedup, biggest win)
-- ~~**Multi-layer fusion**~~ DONE — h stays in registers between layers
-- **Quantization**: NOT NEEDED at this scale (dispatch-bound, not bandwidth-bound)
 
 ---
 
-## COMPLETED: Scale Up (Phase A3)
+## Completed Phases Summary
 
-All 5 steps completed. Speedup holds at 15x with 8x larger model.
+### Phase A: Kernel Development (d=64 through d=512)
 
-### What was done
+Developed fused Triton kernels from scratch, scaling from d=64/1L to d=512/8L.
+Each scale introduced new register pressure challenges requiring new techniques.
 
-1. **Bigger Training Data**: TinyStories dataset (55M chars, 14M BPE tokens, vocab=4096).
-   HuggingFace ByteLevel BPE tokenizer trained on the corpus. Zero UNK rate.
+Milestones:
+- d=64/1L: Entire model in registers, fused prefill+decode. 740 tok/s.
+- d=128/2L: Multi-block tiling (BLOCK_SEQ=32). Fused N-layer decode. In-kernel
+  cache updates were the biggest single win (3.6x). 2504 tok/s.
+- d=256/4L: FlashAttention for ctx>256. Packed weight/KV buffers. 1396 tok/s.
+- d=512/8L: tl.dot for projections (element-wise overflows registers). 287 tok/s
+  single-SM → 1734 tok/s multi-SM (6x via atomic barriers) → 1937 tok/s with
+  KV-split + split barrier.
 
-2. **Bigger Model**: d=256, h=8, l=4, d_ff=1024, ctx=256, 5.3M params.
-   BLOCK_SEQ=16 in prefill (fits (16,256)=16KB h_block in registers).
-   Fused N-layer decode with packed weight buffer + packed KV caches.
+Batched and persistent kernels:
+- Batched decode: shared weights across B sequences, double-buffered h, separate
+  workspace buffers. Weight-amortized FFN (+14-22%).
+- Persistent decode: single kernel launch for all N steps, eliminates host sync.
+  5129 tok/s at d=512 (2.56x over sync'd).
+- Persistent batched: B=4 7351 tok/s, B=8 7862 tok/s.
 
-3. **FlashAttention**: Tiled KV (KV_TILE=64) with online softmax for context>256.
-   Keeps scores at (BLOCK_SEQ, KV_TILE) = (16, 64) = 4KB instead of (16, 512) = 32KB.
+### Phase A (continued): d=768 and d=1024
 
-4. **Training Quality**: AdamW (wd=0.1) + LR warmup (200 steps) + cosine decay.
-   val_loss=1.69, ppl=5.40 in 20 epochs. Coherent multi-paragraph stories.
+Scaled to d=768 (12L, 81M params) and d=1024 (16L, 242M params):
+- Non-power-of-2 D_MODEL support via D_BLOCK padding with d_mask
+- Projection tiling (PROJ_TILE=512) for D_HEAD=64 shared memory constraints
+- Tensor core batched projections (2D tl.dot, +8-12%)
+- L2 cache eviction hints (+3%), merged barriers (+2%)
 
-5. **Benchmark**: 1396 tok/s Triton vs 92 tok/s JAX = 15.1x speedup.
+Key result at d=768: pipelined 1472 tok/s, persist-B=8 2687 tok/s.
+Key result at d=1024: pipelined 618 tok/s, persist-B=8 1097 tok/s.
+At d>=768, HBM bandwidth is the terminal bottleneck (weights exceed L2 cache).
 
-### Key engineering decisions
+### Phase B: Speculative Decoding
 
-- **Packed weight buffer**: All per-layer weights concatenated into one bf16 buffer.
-  Kernel computes offsets from layer index. Avoids 50+ individual pointer arguments.
-- **Packed KV caches**: All layers' K/V caches in one flat buffer. Stays packed between
-  decode steps — no per-step pack/unpack overhead.
-- **tl.static_range for layers**: Loop unrolled at compile time (4 iterations).
-  Compiler can reuse registers between layers. Fast for ≤8 layers.
-- **BLOCK_SEQ as kernel parameter**: Not module-level constant. Allows different
-  tile sizes per model (32 for d=128, 16 for d=256).
+Built parallel verification kernel that processes K draft tokens through the
+full target in one kernel call (mini-prefill with existing KV cache).
+- Acceptance rates scale with draft quality: 71% at K=4 with d=512 draft
+  (ppl=2.91) vs d=768 target (ppl=2.60). Was only 36% with 1-layer draft.
+- Not profitable at small scale: draft/target speed ratio is ~2x, need >5x.
+  Sequential verify is mathematically always slower (1.55ms > 1.0ms per cycle).
+- Valuable at production scale (70B target + 7B draft → 10x speed ratio).
 
----
+### Phase C: Architecture Modernization
 
-## COMPLETED: Speculative Decoding (Phase B)
+Replaced 2020-era architecture with modern components. Updated model.py and
+all 8 Triton kernel files. JAX vs Triton prefill verified within bf16 precision.
 
-Implemented speculative decoding with a custom parallel verification kernel.
+- C1: RMSNorm (replaced LayerNorm, ~10-15% faster, no bias)
+- C2: RoPE (base=10000, replaced learned pos_emb, better extrapolation)
+- C3: SwiGLU FFN (3 matrices, d_ff=2816, ~15% better quality/FLOP)
+- C4: Removed all biases, tied output projection to token embedding
+- C5: Scaled to 24 layers (from 16), 294M params, 10.6GB at bs=16
+  - tl.range for layer loops (tl.static_range takes 10+ min to compile at 24L)
+- C6: DeltaNet — tried hybrid 75% DeltaNet + 25% attention (18D+6A pattern).
+  Reverted: 35% slower training at ctx=512 (8.6K vs 13.2K tok/s). O(n^2)
+  attention is trivially cheap at short context. DeltaNet only helps inference
+  at long contexts. Code preserved in git history.
+- C7: MTP heads added (optional --mtp-heads flag). 3 extra prediction heads for
+  tokens t+2, t+3, t+4. +56% training time but better quality. Skip for speed.
+- C8: cuDNN FlashAttention via jax.nn.dot_product_attention (+38% training speed),
+  batch prefetch, fused cross-entropy (enables 32K vocab without OOM)
 
-### What was done
+### Phase D: Training Efficiency
 
-1. **Draft model**: Trained d=128, h=4, l=1 (1.3M params, ppl=8.76) on TinyStories
-   with same vocab=4096 as target. Saved to `draft_weights.pkl`.
+Optimized training throughput and data pipeline for the final training run.
 
-2. **Speculative decode algorithm**: Draft generates K tokens autoregressively,
-   target verifies in parallel, greedy accept/reject with first-disagreement cutoff.
-
-3. **Parallel verification kernel** (`kernels/verify_decode.py`): Processes K draft
-   tokens through the full target model in ONE kernel call. Key techniques:
-   - Pads to PAD_K=16 internally for `tl.dot` shape compatibility (inner dim >= 16)
-   - Online softmax over tiled KV cache (same as FlashAttention) for prefix tokens
-   - Causal attention among draft tokens with runtime `real_k` mask
-   - Single grid=(1,) launch — all K tokens in one thread block
-
-4. **Correctness verified**: Parallel kernel matches sequential decode within bf16
-   tolerance (max logit diff < 0.06).
-
-### Results
-
-```
-Standard target decode:                1395 tok/s
-Speculative K=2 (sequential verify):    707 tok/s  (0.51x)  acceptance=51%
-Speculative K=2 (parallel verify):      715 tok/s  (0.51x)  acceptance=50%
-Speculative K=4 (sequential verify):    488 tok/s  (0.35x)  acceptance=37%
-Speculative K=4 (parallel verify):      632 tok/s  (0.45x)  acceptance=36%
-
-Parallel kernel speedup over sequential: 1.30x at K=4
-```
-
-### Key findings
-
-- **Speculative decoding has diminishing returns at small model scale.**
-  With fused kernels, both draft (~2500 tok/s) and target (~1400 tok/s) are
-  extremely fast. The speed ratio is only ~2x, not the ~10x needed for
-  speculative decoding to be profitable.
-
-- **Acceptance rate is the bottleneck.** With a 1-layer draft (ppl=8.76) vs
-  4-layer target (ppl=5.40), greedy acceptance is only 36-51%. Speculative
-  decoding needs 80%+ acceptance to break even at this speed ratio.
-
-- **The parallel verification kernel works.** 1.3x faster than K sequential
-  decode calls at K=4. The kernel correctly handles prefix cache attention,
-  causal draft-draft attention, and online softmax — all in one launch.
-
-- **When speculative decoding helps:** Large, slow target models (e.g., 70B at
-  20 tok/s) with a fast draft (7B at 200 tok/s) give a 10x speed ratio.
-  At that ratio, even 50% acceptance yields 2-3x speedup.
-
-### Kernel engineering lesson
-
-23. **Batch verification is a "mini-prefill" with existing KV cache.** The
-    verification kernel processes K tokens through all layers, attending to P
-    cached tokens (via tiled KV + online softmax) plus K draft tokens (via
-    causal intra-draft attention). Padding K to 16 satisfies Triton's
-    `tl.dot` minimum inner dimension requirement.
+- D1: Reverted DeltaNet, pure attention 24L, 274M params
+- D7e: cuDNN FlashAttention — 13.3K → 18.4K tok/s (+38%). Uses
+  jax.nn.dot_product_attention(implementation='cudnn'). bf16 for cuDNN,
+  falls back to XLA for f32 inference.
+- D7a: Fused cross-entropy — custom_vjp with chunked forward+backward. Tiles over
+  vocab in 4096-token chunks, never materializes full logits. Enables vocab=32K
+  (would need 1.1GB for full logits tensor). At vocab=4K, same speed as standard.
+- D4: Vocab 4K → 32K — 28.4K tok/s, 12.3GB VRAM, 303M params
+- D2: Sequence packing — skipped (data already concatenated without padding)
+- D3: Curriculum training — 3 phases: ctx=128 (10%), ctx=256 (20%), ctx=512 (70%).
+  Separate JIT compilation per phase.
 
 ---
 
-## COMPLETED: Scale Up (Phase A4)
+### Previous Training Runs
 
-Scaled to d=512, 8 layers, 29.7M params on full TinyStories (487M tokens, 1.9GB).
+```
+Epoch 1 (d=1024, h=16, l=16, 242M, 1.77B tokens):
+  val_loss=3.04, ppl=20.91, 13.7h, 36K tok/s
+  Data: FineWeb-Edu 60%, Cosmopedia 18%, Wikipedia 17%, Code 6%
 
-### What was done
-
-1. **Full TinyStories**: Downloaded all 2.1M stories (1.9GB). Chunked BPE tokenization
-   (50MB chunks) to avoid OOM — encoding 1.9GB at once used 46GB+ RAM. Retrained BPE
-   tokenizer on full dataset.
-
-2. **Training**: d=512, h=16, l=8, d_ff=2048, ctx=512, 29.7M params.
-   batch=16, lr=1e-4, 3 epochs (~4.4 hours). val_loss=1.068, ppl=2.91.
-   Data kept on CPU, batches streamed to GPU to avoid data OOM.
-
-3. **Kernel adaptations for d=512** (register pressure is the main challenge):
-   - **BLOCK_SEQ=8** for prefill (h_block = (8,512) = 16KB fits in registers)
-   - **tl.dot for projections**: element-wise (512,32) intermediates overflow registers
-     (128 regs/thread > 255 limit). tl.dot tiles internally, avoiding materialization.
-   - **Tiled KV decode**: (512,32) full cache load overflows shared memory.
-     Added online softmax with KV_TILE=64, same technique as FlashAttention.
-   - **Smaller output VTILE=32**: (512,128) weight load = 128KB > 130KB register file.
-     Reduced to (512,32) = 64KB.
-
-4. **Benchmark**: 287 tok/s, 3.48 ms/tok, 2% bandwidth utilization.
-
-### Key engineering decisions
-
-- **tl.dot vs element-wise at d=512**: At d≤256, element-wise `tl.sum(h[:, None] * W, axis=0)`
-  works because (256,32) = 64 regs/thread fits alongside h (2 regs) in 255 budget. At d=512,
-  (512,32) = 128 regs alone, product = another 128 → 260 > 255. tl.dot avoids materializing
-  the full intermediate by tiling the reduction internally.
-- **Triton [0,:] indexing not supported**: Used `.sum(axis=0)` on (1,N) results from tl.dot.
-- **Chunked tokenization**: HuggingFace tokenizer uses ~25x text size in working memory.
-  1.9GB text → 46GB+ RAM → OOM killed. 50MB chunks cap peak at ~12GB.
+Epoch 2 (same model, 1.72B fresh tokens):
+  train_loss=2.705, val_loss=3.338, ppl=28.16, 13.4h
+  Data: FineWeb-Edu 51%, StarCoder 18%, Wikipedia 17%, Cosmopedia 14%
+  Note: val ppl regressed because val set was from epoch 1 distribution
+```
 
 ---
 
-## COMPLETED: Batched Inference (Step 2c) — DONE
+## Production Features
 
-**Results (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):**
-```
-Single-sequence (B=1):  1935 tok/s  (0.517 ms/tok)
-Batched B=4:            3821 tok/s  (1.97x, 1.047 ms/step, 955 tok/s per seq)
-Batched B=8:            4641 tok/s  (2.40x, 1.724 ms/step, 580 tok/s per seq)
-Batched B=16:           5050 tok/s  (2.61x, 3.169 ms/step, 316 tok/s per seq)
-```
-
-**Previous (MHA, 29.7M params):**
-```
-B=1: 1890 tok/s, B=4: 3422 (1.81x), B=8: 4347 (2.30x)
-```
-
-**Why not 4x at B=4:** Per-sequence compute (attention over 512 KV positions, QKV projections,
-FFN) adds ~0.17ms per additional sequence regardless of weight sharing. The theoretical 4x assumed
-weights dominated kernel time (75%), but in practice the per-sequence attention loop is a
-significant fixed cost. GQA helped ~10% over MHA (L2-friendly KV caches: 2.1 vs 8.4 MB per seq).
-
-### What was done
-
-1. **Batched kernel** (`kernels/batched_decode.py`): same grid=(TOTAL_BLOCKS,) as single-seq.
-   Each block processes B sequences. Weight loads amortized across batch.
-
-2. **Race condition fixes** (two critical bugs found and fixed):
-   - **h_buf read-write race**: all blocks read h, compute h_new, write h_new. A fast block
-     can overwrite h before a slow block reads the original, causing double residual addition.
-     Fix: double-buffered h_buf (read buf_a, write buf_b, alternate per layer).
-   - **partial buffer merge/FFN race**: after the phase 1 barrier, all blocks read o_proj from
-     partial (merge) while also writing FFN results. Fix: separate ffn_buf for FFN accumulation.
-
-3. **Race-free design** — h_buf only written in phase 3, read in phases 1-2:
-   - Phase 1: LN1 → Q/K/V → attention → O-proj (reads h from buf_in)
-   - Phase 2: merge + LN2 + FFN fused per batch element (h_norm in registers, attn_total stored
-     to attn_buf, FFN partial to ffn_buf; h_buf NOT modified)
-   - Phase 3: h_new = h + attn_total + ffn_total + bias (writes to buf_out)
-   - 3 barriers per layer: after phase 1, after phase 2, after phase 3
-
-## COMPLETED: Close the 7.8x Gap — Optimization Round (2026-03-31)
-
-**GPU: RTX 4080 Super (Ada Lovelace, 16GB VRAM, 101KB shared memory, 52 TFLOPS FP16, 836 GB/s HBM, ~3-6 TB/s L2)**
-
-**Targets achieved:**
-- Single-sequence: 4777 tok/s (persistent kernel) > 3000 ✓
-- Batched B=4: 6691 tok/s (pipelined) > 6000 ✓
-
-**Optimizations applied:**
-1. Barrier reduction 25→17 (removed b2 in batched): minimal impact (lesson #37 confirmed)
-2. Weight-amortized FFN (batched): outer k-loop / inner b-loop, B=4 +14%, B=8 +22%, B=16 +19%
-3. Persistent decode kernel (single-seq): single launch for 128 tokens, 4777 tok/s (2.56x)
-4. Pipelined batched decode: tokens stay on GPU, B=4 6691 tok/s (1.59x vs sync'd)
-
-```
-CURRENT (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
-  Single-seq (sync):    1869 tok/s  (0.535 ms/tok, 12% BW util)
-  Single-seq (pipe):    2624 tok/s  (0.381 ms/tok, no per-token sync)
-  Persistent kernel:    4777 tok/s  (0.209 ms/tok, single launch) ✓
-  Batched B=4 (sync):   4205 tok/s  (0.951 ms/step, 2.25x)
-  Batched B=4 (pipe):   6691 tok/s  (0.598 ms/step, 3.58x) ✓
-  Batched B=8 (pipe):   7339 tok/s  (1.090 ms/step, 3.93x)
-  Batched B=16 (sync):  6064 tok/s  (2.638 ms/step, 3.24x) ✓
-```
-
-**Key insight:** GPU→CPU sync (int() per token) was the #1 bottleneck at 30M params,
-costing 30-60% of wall time. Persistent kernel and pipelining eliminate it.
-
-## COMPLETED: Kernel Optimization Round 2 (2026-04-01)
-
-**Optimizations applied:**
-1. Persistent batched kernel: single launch for B sequences × N steps
-2. In-place KV for persistent kernels: pos-only store replaces full tile copy
-
-```
-UPDATED (GQA, d=512, 8L, 4 KV heads, 26.5M params, ppl=2.96):
-  Single-seq (sync):       1834 tok/s  (0.545 ms/tok, 12% BW util)
-  Pipelined:               2733 tok/s  (0.366 ms/tok)
-  Persistent kernel:       5129 tok/s  (0.195 ms/tok, single launch) ← +7.1% via in-place KV
-  Batched B=4 (sync):      4110 tok/s  (0.973 ms/step, 2.24x)
-  Batched B=4 (pipe):      6672 tok/s  (0.600 ms/step)
-  Persistent B=4:          7351 tok/s  (0.544 ms/step, NEW)
-  Persistent B=8:          7862 tok/s  (1.018 ms/step, NEW)
-  Batched B=16 (sync):     6013 tok/s  (2.661 ms/step, 3.28x)
-```
-
-**Findings:**
-- Persistent batched gives +10% over pipelined batched by eliminating per-step
-  workspace allocation and JAX dispatch overhead.
-- In-place KV: removing full tile stores saves ~4MB traffic per step. However,
-  Triton compiler reorders the K_new store relative to tile loads when no store
-  dependency exists in the tile loop, causing divergence at step 34. Fix: store
-  only at pos (128 bytes) forces correct compiler ordering. +7.1% for single-seq.
-- Shared memory optimization (A1) was skipped: all hot buffers in decode kernels
-  are already in registers. Cross-block buffers can't use shared memory (SM-local).
-  Only per-block buffers (h_norm, qkv_tmp in batched) were candidates at ~1% of traffic.
+- **Streaming generation**: `generate.py` with streaming decode (966 tok/s at d=768)
+- **Batched inference**: `serve.py` with per-sequence position tracking
+- **Paged KV cache**: PagePool with 64-position pages, JIT gather/scatter
+  (87% memory reduction for short seqs; GPU gather 0.07ms, scatter 0.37ms per step)
+- **Continuous batching**: auto-refill batch slots as sequences complete
 
 ---
 
-## COMPLETED: Kernel Optimization + Model Scaling Validation (2026-04-01)
+## Kernel Architecture
 
-**All targets addressed.** See "Kernel Optimization Round 2" and performance tables above.
+### Prefill (`kernels/block_prefill.py`)
 
-Summary:
-- A1 (shared memory): skipped — all hot buffers in registers, <2% potential
-- A2 (persistent batched): done — B=4 7351 tok/s (+10% vs pipelined)
-- A3 (in-place KV): done — pos-only store, +7.1% single-seq
-- A4 (tensor core B>=16): skipped — B=4/B=8 are the key batch sizes
-- B1 (d=768): done — 81.1M params, ppl=2.60, 1006 tok/s multi-SM, 2460 tok/s persist-B=8
-- B2 (ctx=2048): done — ppl=2.84, 3133 tok/s persistent, 4560 tok/s persist-B=4
-- B3 (benchmark): done — all kernel variants profiled at each scale
+Multi-block prefill with FlashAttention + GQA + D_BLOCK padding:
+- 4 kernels per layer: proj, attn, flash_attn, ffn
+- GQA: Q loops over N_HEADS, K/V over N_KV_HEADS
+- D_BLOCK=1024 (padded from d=1024) with d_mask on all loads/stores
+- 2.4x faster than JAX at d=768
 
-Scaling targets:
-- ctx=2048 persistent >2000: PASSED (3133)
-- ctx=2048 B=4 >4000: PASSED (4560)
-- d=768 persistent >2000: MISSED (1344, but persistent B=4 2225 passes)
-- d=768 B=4 >4000: MISSED (2225 — HBM-bound, 162MB weights exceed L2)
+### Decode (`kernels/multi_sm_decode.py` + variants)
 
----
+Multi-SM fused N-layer decode:
+- grid=(N_HEADS × KV_SPLITS,) with atomic barriers
+- All layers processed in one kernel launch
+- Per layer: LN1 → QKV proj → RoPE → attention → O proj → barrier →
+  merge + LN2 → SwiGLU FFN → barrier → residual
+- KV-split parallelism (FlashDecoding) for head-level parallelism
+- Weight-amortized FFN: outer k-loop / inner b-loop
+- Projection tiling (PROJ_TILE=512) for D_HEAD=64
+- Online softmax with KV_TILE=64 for attention over cache
+- All weights packed into one bf16 buffer, offsets computed from layer index
+- KV caches packed flat, all layers in one buffer
 
-## COMPLETED: Bandwidth Optimization (2026-04-02)
+Variants:
+- `batched_decode.py`: B sequences with shared weights, tensor core projections,
+  double-buffered h, separate ffn_buf, 3 barriers per layer
+- `persistent_decode.py`: single launch for all N steps, fresh barrier slots
+  per step, in-kernel argmax, block 0 writes next_token
+- `persistent_batched_decode.py`: single launch for B × N steps, combines
+  batched + persistent techniques
 
-**Optimizations applied:**
-1. L2 cache eviction hints: `eviction_policy='evict_last'` on KV cache loads (keep in L2
-   across steps), `eviction_policy='evict_first'` on output projection loads (single-use).
-   Applied across all 4 decode kernel files.
-2. Merged output + step-sync barriers into one per step in both persistent kernels. The
-   last-arriving block does argmax reduction inline before signaling done (25 barriers/step
-   instead of 26 for d=768).
+### Supporting kernels
 
-**Experiments run:**
-- KV_SPLITS sweep at d=768: tested 1, 2, 4. KV_SPLITS=2 (grid=48) is optimal.
-  KV_SPLITS=1 (grid=24) is 15% slower due to insufficient parallelism.
-  KV_SPLITS=4 (grid=96) compilation too slow for full benchmark.
-- num_stages=2 (software pipelining): shared memory overflow at D_BLOCK=1024
-  (131KB requested vs 101KB limit). Double-buffering infeasible at this model scale.
-
-```
-UPDATED (d=768, 12L, GQA 6 KV heads, 81.1M params):
-  Multi-SM sync:       1024 tok/s (0.98 ms/tok, 20% BW util)  ← was 991
-  Pipelined:           1472 tok/s (0.68 ms/tok, ~29% BW util) ← was 1448
-  Persistent:          1368 tok/s (0.73 ms/tok)                ← was 1341
-  Batched B=4 persist: 2261 tok/s (1.77 ms/step)              ← was 2224
-  Batched B=8 persist: 2455 tok/s (3.26 ms/step)              ← was 2464
-```
-
-**Key findings:**
-- At d=768, the fundamental bottleneck is HBM streaming of 162MB weights (exceeds 64MB L2).
-  Unlike d=512 (54.6MB weights fit in L2 → 55% BW util at B=4), d=768 must re-fetch all
-  weights from HBM every decode step.
-- Cache hints gave ~3% improvement. Barrier reduction gave ~2%. Combined: ~3-5% across
-  kernel variants.
-- Cooperative weight loading has limited potential because most weight data is unique per
-  block (Q/O weights unique per head, FFN chunks unique per block). Only K/V weights
-  (shared within GQA groups, 8-way) and LN scales/bias (48-way) benefit from L2 sharing,
-  and this already happens naturally.
-- The pipelined approach is faster than persistent at d=768 (lesson #48): persistent's
-  in-kernel overhead (barriers, argmax, step-sync) matters less when step time is ~1ms.
+- `fused_decode_nlayer.py`: weight/KV packing utilities for all decode kernels.
+  `prepare_decode_weights_nlayer()` packs all per-layer weights (Q/K/V/O, gate/up/down,
+  RMSNorm scales, RoPE cos/sin tables) into one flat bf16 buffer.
+- `paged_kv.py`: paged KV cache with GPU gather/scatter
+- `block_prefill.py`: multi-block prefill + FlashAttention + GQA
+- `fused_prefill.py` / `fused_decode.py`: legacy small-model kernels (d<=64)
 
 ---
 
-## COMPLETED: Production Hardening (2026-04-02)
+## Optimization History (Summary)
 
-**B1. Streaming text generation** — DONE
-- `generate.py` with `stream_tokens()` generator and `generate_tokens()` batch API
-- CLI: `uv run generate.py --prompt "Once upon a time" --max-tokens 256`
-- Streaming decode: 966 tok/s at d=768 (per-token host sync)
-- Non-streaming (pipelined): ~1472 tok/s (batch sync at end)
-- Warmup step in `_prefill()` triggers JIT compilation before timing
-
-**B2. Variable-length batched inference** — DONE
-- `serve.py` with `BatchedServer` class for managing variable-length sequences
-- The batched kernel already supported per-sequence positions via `positions_ptr`
-- API: add_sequence() → generate() → get_tokens(), with per-slot position tracking
-- Sequences can be at different generation stages; unused slots = None
-
-**B3. Triton prefill kernel for GQA** — DONE
-- Added N_KV_HEADS, D_KV, GQA_GROUP to all 4 prefill kernels (_proj, _attn, _flash_attn, _ffn)
-- Added D_BLOCK padding (non-power-of-2 D_MODEL support) to all prefill kernels
-- Q projections: N_HEADS, K/V projections: N_KV_HEADS, attention maps Q→KV head via GQA_GROUP
-- d=768 Triton prefill: 12.9ms vs JAX 30.4ms (2.4x speedup)
-- Entire inference pipeline now uses custom Triton kernels (no JAX fallback)
-
-## COMPLETED: Tensor Core Batched Projections (2026-04-02)
-
-Replaced per-sequence Q/K/V projection loops with single batched `tl.dot`:
-`(BATCH_SIZE, D_BLOCK) @ (D_BLOCK, D_HEAD)` instead of B × `(1, D_BLOCK) @ (D_BLOCK, D_HEAD)`.
-
-At B>=16, this activates tensor cores. At B<16, it still reduces loop overhead and
-improves memory coalescing by loading all B h_norms as a 2D (B, D_BLOCK) batch.
-
-Applied to both `batched_decode.py` and `persistent_batched_decode.py`.
-
-```
-UPDATED (d=768, tensor core projections):
-  Batched B=4 sync:    1896 tok/s (2.11 ms/step)  ← was 1758 (+7.9%)
-  Batched B=8 sync:    2245 tok/s (3.56 ms/step)  ← was 2025 (+10.9%)
-  Batched B=16 sync:   2461 tok/s (6.50 ms/step)  ← was 2212 (+11.3%)
-  Pipelined B=4:       2306 tok/s (1.74 ms/step)  ← was 2115 (+9.0%)
-  Pipelined B=8:       2571 tok/s (3.11 ms/step)  ← was 2290 (+12.3%)
-  Persist B=4:         2436 tok/s (1.64 ms/step)  ← was 2261 (+7.7%)
-  Persist B=8:         2687 tok/s (2.98 ms/step)  ← was 2455 (+9.4%)
-```
-
-O projection not batched (output (B, D_BLOCK) would overflow shared memory at B>=16).
+| Phase | Model | Key Metric | Result |
+|-------|-------|-----------|--------|
+| A1-A3 | d=64→256 | Triton vs JAX | 15x speedup (consistent across scales) |
+| A4 | d=512, 8L, 29.7M | Single-seq decode | 287 tok/s (2% BW util) |
+| A5 | d=512 | Multi-SM (grid=16) | 1734 tok/s (6x over single-SM) |
+| A6-A7 | d=512 | KV-split + split barrier | 1937 tok/s (+15%) |
+| Batched | d=512 | Persist B=8 | 7862 tok/s |
+| Scale | d=768, 12L, 81M | Pipelined | 1472 tok/s (20% BW) |
+| Scale | d=768 | Persist B=8 | 2687 tok/s |
+| Scale | d=1024, 16L, 242M | Pipelined | 618 tok/s (30% BW) |
+| Scale | d=1024 | Persist B=8 | 1097 tok/s |
+| Training | d=1024, 24L, 306M | Training throughput | 28.4K tok/s (cuDNN FA) |
 
 ---
 
-## COMPLETED: Paged KV Cache (2026-04-02)
-
-Python-level paged KV cache management. `PagePool` class allocates 64-position pages
-on demand as sequences grow, and frees them when sequences complete. Each page stores
-all layers/heads for PAGE_SIZE=64 positions.
-
-The kernel still receives contiguous per-sequence KV buffers — the PagePool converts
-between paged and contiguous representations before/after each kernel call.
-
-```
-4 prompts (4-7 tokens each):
-  Contiguous allocation: 4 × 4.7 MB = 18.8 MB
-  Paged allocation:      4 pages × 0.6 MB = 2.4 MB (87% memory reduction)
-```
-
-**Limitation:** Python-level paging adds conversion overhead (~5x slower at d=768
-due to CPU numpy loops for to_contiguous/update_from_contiguous).
-
----
-
-## COMPLETED: GPU-Accelerated Paged KV (2026-04-02)
-
-Replaced CPU numpy paging with JIT-compiled JAX gather/scatter on the GPU pool.
-The decode kernel is unchanged — it still receives contiguous KV buffers. The
-paging overhead is in the conversion between paged and contiguous formats.
-
-Two approaches were tried:
-1. **In-kernel page table lookups** (tried, abandoned): Modified the multi-SM decode
-   kernel to read KV from a paged pool via per-tile page table lookups. Correctness
-   was verified (max logit diff 0.035), but the Triton compiler generated 2.5x slower
-   code. The indirect addressing pattern (load page ID → multiply by PAGE_ELEMS →
-   compute base → load KV tile) prevented compiler optimizations compared to the
-   simple strided access in the contiguous kernel.
-
-2. **JIT-compiled GPU gather/scatter** (used): Keep the fast contiguous decode kernel
-   unchanged. Use `@jax.jit` compiled `pool[gather_idx]` for paged→contiguous and
-   `pool.at[scatter_idx].set(values)` for contiguous→paged. Gather indices are
-   precomputed with vectorized numpy and cached per page table configuration.
-
-```
-XXL model (d=768, 12L, single-sequence decode):
-  Contiguous:     1028 tok/s (0.97 ms/tok) — baseline
-  Python paged:    198 tok/s (5.06 ms/tok) — CPU numpy loops
-  GPU paged:       693 tok/s (1.44 ms/tok) — JIT gather/scatter
-
-  GPU paged breakdown per step:
-    to_contiguous_gpu:  0.07 ms  (JIT-compiled gather, cached indices)
-    decode kernel:      1.00 ms  (identical to contiguous baseline)
-    update_page_gpu:    0.37 ms  (JIT-compiled scatter, pool copy)
-
-  GPU paged speedup vs Python: 3.5x
-  GPU paged overhead vs contiguous: 43% (0.44 ms/step from gather + scatter)
-```
-
-The 0.37 ms scatter overhead comes from JAX's functional update (`pool.at[].set()`)
-which copies the entire pool (~5 MB) to create a new array. The actual GPU scatter
-(9 KB into 5 MB) takes < 0.01 ms — the rest is XLA dispatch overhead.
-
----
-
-## COMPLETED: Continuous Batching (2026-04-02)
-
-Added `serve_continuous()` to `PagedBatchedServer`. When a sequence finishes
-(EOS or max tokens), its pages are freed and the slot is immediately filled
-with the next pending prompt from the queue. The batch stays full as long as
-there are pending prompts.
-
-```
-8 prompts through 4 slots (d=768, 32 tokens each):
-  Total: 256 tokens in 5.4s = 47 tok/s
-  Pages freed to 0 after all sequences complete (automatic reuse)
-
-6 prompts through 2 slots:
-  Total: 192 tokens in 5.1s = 38 tok/s
-```
-
-CLI: `uv run serve.py --continuous --batch-size 4 --prompts "prompt1" "prompt2" ...`
-
----
-
-## COMPLETED: Speculative Decoding Revisit (2026-04-02)
-
-Revisited speculative decoding with d=512 draft (ppl=2.91) and d=768 target (ppl=2.60).
-The closer model quality gives dramatically better acceptance rates than the original
-attempt (d=128/1L draft with ppl=8.76).
-
-```
-Acceptance rates (128 tokens, 4 prompts):
-  K=2: 82%  (was 51% with old draft)
-  K=4: 71%  (was 36%)
-  K=6: 63%
-  K=8: 58%
-
-Throughput:
-  Standard (d=768):          1003 tok/s
-  Speculative K=4 (seq):      467 tok/s (0.47x) — sequential verify, NOT profitable
-```
-
-**Why sequential verification can't work:**
-  Draft step: 0.55ms (d=512 sync'd)
-  Target step: 1.0ms (d=768 sync'd)
-  Total per cycle: K × (t_draft + t_target) = K × 1.55ms
-  Standard: K × 1.0ms
-  Speculative is always slower: 1.55 > 1.0
-
-**Estimated parallel verify + persistent draft:**
-  Persistent draft: ~0.78ms for K=4 (single launch)
-  Parallel verify: ~1.5ms for K=4 (multi-SM, no barriers)
-  Total: 2.28ms for ~3.8 tokens → ~1650 tok/s (1.6x)
-  Would require: new multi-SM verify kernel + persistent draft modifications
-
-**Key finding:** Acceptance rates are excellent (71% at K=4), validating the approach.
-The bottleneck is the draft/target speed ratio (~2x sync'd). At production scales
-(70B target at 20 tok/s, 7B draft at 200 tok/s → 10x ratio), speculative decoding
-with these acceptance rates would give 2-3x speedup.
-
----
-
-## What's Next
-
-### Phase C: Modern Architecture Redesign (next task)
-
-The current model (242M params, d=1024, 16 layers) uses 2020-era architecture. Frontier
-small models (Qwen 3.5-0.8B, SmolLM2, TinyLlama) use fundamentally better building
-blocks that deliver more quality per FLOP and more tokens per second. This phase
-redesigns the model architecture, updates all Triton kernels, and trains on 10-20B tokens.
-
-**Current training throughput:** 36K tok/s (4.4 steps/s × 16 batch × 512 ctx).
-Already ~96% compute-bound at 52 TFLOPS. Architectural efficiency is the lever, not
-raw FLOPS.
-
-**Reference: Qwen 3.5-0.8B** (closest SOTA to our scale):
-- 24 layers, d=1024, 248K vocab
-- 75% Gated DeltaNet (linear attention O(n)) + 25% standard attention
-- Multi-Token Prediction (2-4x inference via self-speculative decode)
-- MROP (Multi-Resolution RoPE), SwiGLU, RMSNorm, no biases, tied embeddings
-
----
-
-#### Step C1: RMSNorm (replace LayerNorm)
-
-**What:** Replace `layer_norm(x, scale, bias)` with `rms_norm(x, scale)`. Remove all
-LN bias parameters.
-
-**Why:** 10-15% faster (no mean subtraction, no bias add). Same quality. Used by every
-modern LLM (Llama, Qwen, Gemma, etc.).
-
-**Formula:**
-```
-RMSNorm(x) = scale * x / sqrt(mean(x²) + eps)
-```
-
-**Changes needed:**
-- `model.py`: replace `layer_norm()`, remove `.ln1.bias`, `.ln2.bias`, `ln_final.bias`
-- All decode kernels: update LN computation (remove mean subtraction + bias)
-- All prefill kernels: same
-- `prepare_decode_weights_nlayer()`: update packed weight layout (no bias slots)
-
-**Kernel impact:** Slightly fewer ops per LN. Register pressure unchanged.
-
----
-
-#### Step C2: RoPE (replace learned positional embeddings)
-
-**What:** Replace learned `pos_emb (context_len, d_model)` with Rotary Position
-Embeddings applied to Q and K after projection.
-
-**Why:** Better extrapolation to unseen lengths. Saves `context_len × d_model` params.
-Encodes relative position (not absolute). Standard in all modern LLMs.
-
-**Formula (per head, per position m):**
-```
-For dimension pair i (i = 0, 1, ..., d_head/2 - 1):
-  θ_i = base^(-2i/d_head)        # base = 10000 (standard) or 1000000 (Qwen extended)
-
-  q'[2i]   = q[2i]·cos(m·θ_i) - q[2i+1]·sin(m·θ_i)
-  q'[2i+1] = q[2i]·sin(m·θ_i) + q[2i+1]·cos(m·θ_i)
-
-  Same for k' (using position n).
-```
-
-Dot product `q'_m · k'_n` depends only on relative position `(m-n)`, not absolute.
-
-**Changes needed:**
-- `model.py`: remove `pos_emb` param, add `apply_rope(q, k, positions)` after QK projection
-- Precompute `cos_table, sin_table` of shape `(max_seq, d_head//2)` — pass to kernels
-- All decode kernels: apply RoPE to Q (current pos) and K (tile positions) inside
-  attention loop. This replaces the pos_emb lookup at the start.
-- All prefill kernels: apply RoPE to Q and K after projection, before attention
-- `prepare_decode_weights_nlayer()`: remove pos_emb from packed weights, add cos/sin tables
-
-**Kernel impact:** Adds ~4 ops per Q/K element (2 mul + 1 add per pair), but removes
-the pos_emb load. Net neutral or slightly faster.
-
-**Implementation reference:**
-- EleutherAI blog: https://blog.eleuther.ai/rotary-embeddings/
-- Use `base = 10000` for ctx=512, can increase to 1000000 for longer contexts later
-
----
-
-#### Step C3: SwiGLU FFN (replace GELU FFN)
-
-**What:** Replace `GELU(x @ W_up) @ W_down` with
-`(SiLU(x @ W_gate) * (x @ W_up)) @ W_down`. Three weight matrices instead of two.
-
-**Why:** ~15% better quality per FLOP. The gating mechanism allows the FFN to learn
-which features to pass through. Used by Llama, Qwen, Gemma, etc.
-
-**Formula:**
-```
-SwiGLU(x) = (SiLU(x @ W_gate) ⊙ (x @ W_up)) @ W_down
-
-where SiLU(z) = z * sigmoid(z)
-```
-
-**Dimension change:** To keep param count equivalent to standard `d -> 4d -> d`:
-```
-Standard:  2 matrices × d × 4d = 8d² params
-SwiGLU:    3 matrices × d × d_ff = 3 × d × d_ff params
-Match:     d_ff = (8/3)d ≈ 2.67d
-
-For d=1024:  d_ff = 2730  (round to multiple of 128: 2816)
-```
-
-**Changes needed:**
-- `model.py`: add `W_gate` param per layer, change FFN forward pass, update `d_ff`
-- All decode kernels: fuse SiLU + elementwise multiply into FFN section. The gate and
-  up projections can share the K-tiling loop (load both weight tiles per K iteration).
-- All prefill kernels: same
-- `prepare_decode_weights_nlayer()`: pack 3 FFN matrices instead of 2
-
-**Kernel impact:** Three matmuls instead of two in FFN, but d_ff is 33% smaller (2816
-vs 4096). Net compute is similar: 3 × d × 2816 = 8448d vs 2 × d × 4096 = 8192d.
-The SiLU + multiply is fused into the existing FFN loop body (negligible cost).
-
-**Implementation reference:**
-- Fused Triton SwiGLU: https://github.com/fattorib/fusedswiglu
-- Liger-Kernel (LinkedIn): https://github.com/linkedin/Liger-Kernel
-
----
-
-#### Step C4: Remove biases, tie embeddings
-
-**What:**
-1. Remove all bias terms from attention projections and FFN projections
-2. Tie output projection to token embedding: `logits = h @ token_emb.T`
-
-**Why:**
-- No biases: modern standard (Llama, Qwen, Gemma). Saves params, simplifies kernels.
-- Tied embeddings: saves `d_model × vocab_size` params (32M for d=1024, vocab=32K).
-  Quality impact is negligible at this scale; Qwen 0.8B ties embeddings.
-
-**Changes needed:**
-- `model.py`: remove all bias params, remove separate `output_proj`
-- All kernels: remove bias loads/adds from FFN and attention
-- Output projection in decode kernels: use `token_emb.T` instead of `output_proj`
-
-**Kernel impact:** Fewer loads, slightly less register pressure. Pure win.
-
----
-
-#### Step C5: Deeper model (24 layers)
-
-**What:** Increase from 16 to 24 layers (matching Qwen 3.5-0.8B). Reduce d_model if
-needed to fit in 16GB VRAM with batch_size=16.
-
-**Why:** Deeper models learn more complex representations per parameter. Qwen 0.8B uses
-24 layers at d=1024. With the parameter savings from tied embeddings and removed biases,
-we can add layers without increasing total params significantly.
-
-**Parameter budget (target ~250M total):**
-```
-Current (16L, d=1024, separate output proj):
-  Embeddings: 32K × 1024 = 32.8M
-  Per layer:  ~13M (QKV+O + FFN + norms + biases)
-  16 layers:  ~208M
-  Output proj: 1024 × 32K = 32.8M
-  Total:      ~242M
-
-New (24L, d=1024, SwiGLU d_ff=2816, tied emb, no bias):
-  Embeddings: 32K × 1024 = 32.8M (shared with output)
-  Per layer:  ~12M (QKV+O no bias + SwiGLU 3×1024×2816 no bias + RMSNorm scale only)
-  24 layers:  ~288M
-  Total:      ~321M  ← slightly over, may need d_ff=2560 or d=896
-```
-
-Adjust d_ff or d_model to hit ~250-300M params within 16GB VRAM.
-
----
-
-#### Step C6: Gated DeltaNet layers (75% of layers)
-
-**What:** Replace 75% of standard attention layers with Gated DeltaNet linear attention.
-Keep every 4th layer as standard attention (same pattern as Qwen 3.5).
-
-For 24 layers: 18 DeltaNet + 6 standard attention. Pattern:
-`[D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A, D, D, D, A]`
-
-**Why:** O(n) complexity instead of O(n²). Fixed-size state instead of growing KV cache.
-75% less KV cache memory. The key innovation behind Qwen 3.5's efficiency.
-
-**Gated DeltaNet recurrence (per head):**
-```
-State update:
-  S_t = (I - β_t · k_t · k_t^T) · diag(α_t) · S_{t-1} + β_t · k_t · v_t^T
-
-Output:
-  y_t = S_t · q_t
-
-Where:
-  S_t:  state matrix (d_head × d_head), fixed size regardless of sequence length
-  α_t:  decay gate vector (d_head,), controls forgetting. α = sigmoid(x @ W_alpha)
-  β_t:  update strength scalar, controls new info. β = sigmoid(x @ W_beta)
-  k_t:  key vector, L2-normalized (not softmax). k = normalize(x @ W_k)
-  v_t:  value vector. v = x @ W_v
-  q_t:  query vector. q = x @ W_q
-```
-
-**The delta rule explained:**
-- `S_{t-1} · k_t` retrieves the current memory's prediction for key k_t
-- `β_t · k_t · v_t^T` writes the new association (k_t → v_t)
-- `(I - β_t · k_t · k_t^T)` erases the old association for k_t before writing new one
-- `diag(α_t)` decays old memories (adaptive forgetting)
-- Unlike vanilla linear attention (S += k·v^T which can only accumulate), DeltaNet
-  can selectively update and erase associations
-
-**Training (parallel form via WY representation):**
-The recurrence can be parallelized for training using chunked computation:
-- Split sequence into chunks of size C (e.g., C=64)
-- Within each chunk, compute the product of (I - β_t·k_t·k_t^T) matrices using the
-  WY representation: ∏(I - β_i·k_i·k_i^T) = I - W·Y^T (compact form)
-- This avoids materializing O(L·d²) intermediate matrices
-- Between chunks, propagate the state S using the compact form
-
-**Extra parameters per DeltaNet layer (vs standard attention):**
-```
-Standard attention layer: W_q, W_k, W_v, W_o (4 × d × d_head × n_heads)
-DeltaNet layer:           W_q, W_k, W_v, W_o, W_alpha, W_beta + short_conv
-  W_alpha: (d_model, d_head) — decay gate projection
-  W_beta:  (d_model, 1) — update strength projection (scalar per token)
-  short_conv: 1D conv on Q/K (kernel_size=4, per head) — local position encoding
-```
-
-**Changes needed:**
-- `model.py`: add DeltaNet layer type, `init_deltanet_layer()`, forward pass with
-  recurrence (sequential) and chunked parallel (training)
-- New kernel: `kernels/deltanet_decode.py` — fused DeltaNet decode. Instead of
-  attention over KV cache, maintain state matrix S and update per token. Much simpler
-  than attention decode (no KV tile loop, no online softmax).
-- New kernel: `kernels/deltanet_prefill.py` — chunked parallel DeltaNet for training.
-  Process chunks of C tokens, propagate state between chunks.
-- Modify multi-SM decode: hybrid dispatch — DeltaNet layers use state update,
-  attention layers use existing KV-cache attention
-- `prepare_decode_weights_nlayer()`: pack both layer types
-
-**Kernel design for DeltaNet decode (single token):**
-```
-Per DeltaNet layer:
-  1. Load h, compute q, k, v, alpha, beta from projections
-  2. Apply short conv to q, k (load last 3 positions from conv buffer)
-  3. L2-normalize k
-  4. alpha = sigmoid(alpha), beta = sigmoid(beta)
-  5. Load state S (d_head × d_head per head)
-  6. Update: S = (I - beta * outer(k, k)) * diag(alpha) * S + beta * outer(k, v)
-  7. Output: y = S @ q
-  8. Store updated S
-  9. Apply output projection, residual add
-```
-
-The state S is d_head × d_head = 64 × 64 = 4096 f32 values = 16KB per head.
-With 16 heads: 256KB total state per layer (vs 8.4MB KV cache per layer at ctx=512).
-
-**Implementation references:**
-- Paper: "Gated Delta Networks: Improving Mamba2 with Delta Rule" (arXiv:2412.06464)
-- Parallel training: "Parallelizing Linear Transformers with the Delta Rule" (arXiv:2406.06484)
-- Official code: https://github.com/NVlabs/GatedDeltaNet
-- Flash Linear Attention (Triton kernels): https://github.com/fla-org/flash-linear-attention
-  - Key file: `fla/layers/delta_net.py` and `fla/ops/delta_rule/`
-- Author's blog posts (excellent math explanations):
-  - Part 1: https://sustcsonglin.github.io/blog/2024/deltanet-1/
-  - Part 2: https://sustcsonglin.github.io/blog/2024/deltanet-2/
-  - Part 3: https://sustcsonglin.github.io/blog/2024/deltanet-3/
-- Qwen 3.5 integration analysis: https://gist.github.com/justinchuby/0213aa253664fb72e9adb0089816de15
-- Educational implementation: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch04/08_deltanet/
-- Qwen 3.5 Triton reference: https://github.com/RightNow-AI/qwen3.5-triton
-
----
-
-#### Step C7: Multi-Token Prediction (MTP)
-
-**What:** Train the model to predict not just the next token, but the next K tokens
-simultaneously (K=4). At inference, use the extra prediction heads for self-speculative
-decoding (2-4x throughput without a separate draft model).
-
-**Why:** 12-17% better code generation quality (Meta's results). Free 2-4x inference
-speedup via self-speculative decode. Used by Qwen 3.5 and DeepSeek-V3.
-
-**Training objective:**
-```
-L_total = L_1 + λ₂·L_2 + λ₃·L_3 + λ₄·L_4
-
-where L_k = cross_entropy(head_k(h), target_{t+k})
-
-head_1: standard output projection (shared with embedding if tied)
-head_2, head_3, head_4: additional linear projections (d_model → vocab_size)
-```
-
-Each head shares the same transformer trunk but has its own output projection.
-λ values typically 1.0 (equal weighting) or decaying (0.5, 0.25 for further tokens).
-
-**Extra parameters:** 3 additional output projections = 3 × d_model × vocab_size.
-With d=1024 and vocab=32K: 3 × 33M = 99M extra params. These are only used during
-training and optionally during inference for speculative decode.
-
-**Inference (self-speculative decode):**
-```
-1. Run transformer trunk once
-2. head_1 predicts token t+1, head_2 predicts t+2, head_3 predicts t+3, head_4 predicts t+4
-3. Feed t+1 through the model to verify
-4. If model's next-token prediction matches head_2's prediction, accept t+2
-5. Continue accepting until a mismatch → standard decode from there
-6. Acceptance rate is typically 60-80%, giving 2-3x throughput
-```
-
-**Changes needed:**
-- `model.py`: add 3 extra output projection matrices
-- `train.py`: compute 4 losses (shifted targets), sum them
-- `generate.py`: add MTP speculative decode mode
-- Decode kernels: add output heads (4 vocab projections instead of 1 per step)
-- No change to transformer trunk or attention layers
-
-**Implementation reference:**
-- Meta paper: "Better & Faster LLMs via Multi-token Prediction" (arXiv:2404.19737)
-- DeepSeek-V3 MTP: https://arxiv.org/abs/2412.19437
-
----
-
-#### Step C8: Training speed optimizations
-
-**What:** Maximize tokens/second during training.
-
-**Changes:**
-1. **Re-enable Triton GEMM** — remove `XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"`
-   from train.py. This was disabled early on but modern JAX+Triton is stable. +10-15%.
-
-2. **Remove gradient checkpointing if VRAM allows** — `jax.checkpoint()` recomputes
-   the forward pass during backprop, saving memory but costing ~20% throughput. With
-   tied embeddings (-32M params) and no biases, VRAM may fit without it. Test first.
-
-3. **Prefetch batches to GPU** — current code creates `jnp.array()` inside the training
-   loop (host→device transfer per step). Use a prefetch buffer or `jax.device_put()`
-   ahead of time.
-
-4. **Sequence length curriculum** — start training with shorter sequences (ctx=128),
-   gradually increase to ctx=512. Recent research shows 6x training acceleration.
-   Reference: "Dataset Decomposition" (arXiv:2405.13226).
-
-**Expected improvement:** 36K → 50-55K tok/s combined.
-
----
-
-#### Implementation order
-
-1. **C1-C4** (RMSNorm + RoPE + SwiGLU + no bias + tied emb): Do together as one
-   architecture update. These are straightforward changes to model.py and all kernels.
-   Train a small test model to verify correctness before scaling up.
-
-2. **C5** (24 layers): Adjust dimensions, verify VRAM fits, train test model.
-
-3. **C8** (training speed): Apply before the big training run.
-
-4. **C6** (DeltaNet): This is the big one. Implement DeltaNet layer in model.py first
-   (JAX-only, no Triton). Verify training works. Then write fused Triton kernels.
-   The FLA library and NVLabs repo have reference Triton kernels to study.
-
-5. **C7** (MTP): Add after DeltaNet is working. Straightforward loss modification +
-   extra output heads.
-
-6. **Train on 10-20B tokens** (3-5 days on RTX 4080 Super at ~50K tok/s).
-
-**Commit and push after every step. Don't batch changes.**
-
----
-
-### COMPLETED: Phase C Architecture Redesign (2026-04-04)
-
-All steps C1-C7 implemented and verified.
-
-**C1-C4 (RMSNorm, RoPE, SwiGLU, no biases, tied embeddings):**
-- Updated model.py and all 8 Triton kernel files
-- JAX vs Triton prefill: max logit diff 0.013 (bf16 precision)
-- Training verified: loss converges normally
-
-**C5 (24 layers):**
-- 294M params (was 242M at 16L), 10.6GB VRAM at bs=16
-- tl.range for layer loops (avoids slow compilation with tl.static_range at 24L)
-
-**C6 (Gated DeltaNet):**
-- Hybrid architecture: 75% DeltaNet + 25% attention (pattern: D,D,D,A,D,D,D,A,...)
-- 24 layers: 18 DeltaNet + 6 standard attention
-- Naive recurrent with chunked scan (64-step chunks, checkpointed between chunks)
-- Full unroll within chunks (unroll=64) → 1.85x speedup
-- Features: Mamba2-style decay gate, sigmoid beta, depthwise causal conv1d (kernel=4),
-  L2-normalized Q/K, output gating (RMSNorm * SiLU(gate))
-
-**C7 (MTP):** Not yet implemented (straightforward loss modification + extra output heads).
-
-**C8 (Training speed):**
-- Removed dead XLA triton_gemm flag (no effect)
-- Added batch prefetch in training loop
-- Triton GEMM and gradient checkpointing removal tested (no improvement / OOM)
-
-**Current training throughput (RTX 4080 Super, bs=16, ctx=512):**
-```
-Attention-only 16L: 19.3K tok/s, 6.3GB VRAM
-Attention-only 24L: 13.2K tok/s, 8.8GB VRAM
-Hybrid 16L (12D+4A): 12.9K tok/s, 7.5GB VRAM
-Hybrid 24L (18D+6A):  8.6K tok/s, 10.6GB VRAM
-```
-
-### REVISION: DeltaNet reverted — focus on fastest training (2026-04-04)
-
-Research showed DeltaNet is 15-20% SLOWER for training (only faster for inference at long
-contexts). At ctx=512 the O(n²) attention term is trivially small (262K ops/head), so
-linear attention provides no training speedup. Our measurements confirmed: hybrid 24L
-8.6K tok/s vs attention-only 24L 13.2K tok/s (35% slower with DeltaNet).
-
-**Decision: revert to pure attention, optimize training speed + quality per token.**
-
-DeltaNet code kept in git history. Can be added back later for inference if needed.
-
----
-
-## Phase D: Maximum Training Efficiency (in progress)
-
-Goal: maximize tokens/sec AND quality/token on RTX 4080 Super (16GB, 52 TFLOPS FP16).
-Pure attention architecture with all modern training tricks.
-
-### Research findings (2026-04-04)
-
-**Architecture (what the research says):**
-- **Deep and narrow > wide and shallow** at sub-1B scale (MobileLLM: +2.7% accuracy at
-  125M, +4.3% at 350M by using deeper/thinner architectures)
-- **Tied embeddings**: standard, saves d_model × vocab params for free
-- **GQA**: minimal training speed impact, saves memory for larger batch sizes
-- **SwiGLU + RMSNorm + RoPE + no biases**: already implemented, standard recipe
-- **Block-wise weight sharing** (MobileLLM-LS): +0.7-0.8% accuracy by sharing weights
-  between adjacent layer pairs. Interesting but not proven at our scale.
-
-**Training speed techniques (concrete numbers):**
-- **Sequence packing**: pack multiple documents into one context window. Eliminates
-  padding waste (up to 50% of tokens wasted with naive padding). **Up to 2x speedup**
-  for training (Krell et al. 2021). We should implement this.
-- **Variable sequence length curriculum**: start training with short sequences (128),
-  gradually increase to 512. "Up to 6x faster training" (Dataset Decomposition paper).
-  Shorter sequences = cheaper attention = more tokens/sec in early training.
-- **Constant LR + cooldown** (WSD schedule): scales predictably like cosine, but
-  easier to use for scaling experiments. "Reliably similar to cosine" (NeurIPS 2024
-  spotlight). Enables reusable training runs.
-- **Stochastic weight averaging**: "improved performance along training trajectory
-  without additional training costs" (same NeurIPS paper).
-
-**Data efficiency (more quality per token):**
-- **Up to 4 epochs is safe**: "training with up to 4 epochs of repeated data yields
-  negligible changes to loss compared to unique data" (Muennighoff et al. 2023, 400
-  training runs, up to 9B params). Beyond 4 epochs, diminishing returns.
-- **Data quality > quantity**: SmolLM trained 135M model on 600B tokens of
-  high-quality filtered data (FineWeb-Edu + Cosmopedia + code), outperformed
-  MobileLLM-125M trained on 1T tokens. Quality filtering is critical.
-- **Code data helps general quality**: SmolLM includes Python-Edu; Llama 3 uses
-  significant code fraction. Our mix already includes StarCoder.
-
-**Multi-Token Prediction (MTP):**
-- Meta reports "no overhead in training time" with 4-token prediction heads
-- +12% on HumanEval, +17% on MBPP (coding benchmarks) at 13B scale
-- 3x faster inference via self-speculative decode
-- **Pure win**: better quality + faster inference, no training cost
-- Should implement after base training is stable
-
-**What didn't help (from Cramming paper, single-GPU training):**
-- PyTorch compile + inductor settings were essential for full speed
-- Most architectural novelties didn't help at small scale
-- The training recipe matters more than clever architecture
-
-### Implementation plan
-
-#### Step D1: Revert DeltaNet, restore pure attention 24L
-
-Revert model.py to use_deltanet=False as default. Keep the DeltaNet code but don't
-use it for training. Verify 24L pure attention: 13.2K tok/s, 8.8GB VRAM.
-
-#### Step D2: Sequence packing (potential 1.5-2x speedup)
-
-**What:** Pack multiple documents into one context window instead of one-document-per-slot.
-Use attention mask to prevent cross-document attention.
-
-**Why:** Currently each training sample is one document truncated/padded to ctx=512.
-Short documents waste compute on padding. Packing fills every token position with
-useful data.
-
-**Implementation:**
-- Modify `prepare_data.py` to pack documents greedily (first-fit-decreasing bin packing)
-- Add `document_mask` to training data: marks document boundaries
-- Modify attention in `model.py` to use document mask (prevent cross-doc attention)
-- The SwiGLU FFN, RMSNorm, embeddings don't need changes (token-level ops)
-
-**Expected impact:** 1.3-2x speedup depending on document length distribution.
-Measured by: same loss after same wall-clock time.
-
-#### Step D3: Sequence length warmup (potential 2-4x early speedup)
-
-**What:** Start training with ctx=128, gradually increase to ctx=512 over first 20%
-of training. Attention is O(n²), so ctx=128 is 16x cheaper than ctx=512.
-
-**Why:** Early in training, the model learns local patterns (bigrams, simple syntax)
-that don't need long context. Short sequences give more gradient updates per second.
-
-**Implementation:**
-- Modify training loop to vary context_len per epoch/phase
-- Phase 1 (0-10% of steps): ctx=128, bs=64 (4x more samples per step)
-- Phase 2 (10-30%): ctx=256, bs=32
-- Phase 3 (30-100%): ctx=512, bs=16
-- Need to handle RoPE and attention mask adjustments per phase
-
-**Expected impact:** 2-4x faster for the first 30% of training. Overall ~1.5x.
-
-#### Step D4: Larger vocab + better tokenizer
-
-**What:** Increase vocab from 4096 to 32K (standard for modern LLMs). Train a new
-BPE tokenizer on the full data mix.
-
-**Why:** Larger vocab = fewer tokens per document = faster training (fewer steps for
-same amount of text). 32K vocab compresses English ~3.5x better than 4K vocab.
-Also: the output projection (d_model × vocab) is heavier with 32K but tied embeddings
-mean no extra params.
-
-**Expected impact:** ~2-3x fewer tokens needed to cover same text → faster convergence.
-
-#### Step D5: Multi-Token Prediction (no training cost, better quality)
-
-**What:** Add 3 extra prediction heads that predict tokens t+2, t+3, t+4 in addition
-to standard next-token prediction. Loss = L1 + λ₂L₂ + λ₃L₃ + λ₄L₄.
-
-**Why:** Meta showed "no overhead in training time" + 12-17% better code quality +
-3x faster inference via self-speculative decode. Pure quality/inference win.
-
-**Implementation:**
-- Add 3 linear projections: d_model → vocab (or use shared projection with different
-  input positions)
-- Modify loss computation to sum 4 shifted losses
-- No change to transformer trunk
-
-#### Step D6: Training recipe optimization
-
-- **Learning rate**: test WSD (warmup-stable-decay) vs cosine
-- **Batch size schedule**: start small, increase during training
-- **Weight averaging**: average checkpoints along trajectory (free quality)
-- **Gradient accumulation**: if batch size > VRAM allows, accumulate gradients
-- **Data mix tuning**: measure per-domain loss, adjust ratios
-
-#### Step D7: Custom Triton training kernels
-
-Profiling results (24L pure attn, bs=16, ctx=512, d=1024, vocab=4096):
-```
-Full training step: 629ms (13.0K tok/s)
-  Forward:  161ms (25% of step)
-  Backward: 574ms (75% of step, includes gradient checkpointing recompute)
-  Bwd/Fwd ratio: 3.6x (checkpoint recomputes each layer's forward during bwd)
-
-GPU utilization: 31.2 TFLOPS = 60% of 52 TFLOPS peak
-  → 40% headroom from kernel overhead, memory latency, launch gaps
-
-Per-layer forward breakdown (6.73ms per layer):
-  Attention (QKV proj + QK^T + softmax + AV + O proj): 3.53ms (52%)
-  SwiGLU FFN (gate + up + SiLU*mul + down):            1.71ms (25%)
-  Other (RMSNorm, residual, RoPE, overhead):            1.49ms (22%)
-
-Memory: 8.8GB peak (4.4GB static: weights+grads+optimizer, 4.4GB activations)
-
-Vocab scaling (critical for D4 larger vocab):
-  vocab= 4096: output+CE  1.1ms, logits tensor  134MB
-  vocab=16384: output+CE  4.1ms, logits tensor  537MB
-  vocab=32768: output+CE  7.0ms, logits tensor 1074MB ← would OOM at bs=16!
-```
-
-**Kernel opportunities (estimated savings on the full fwd+bwd+optimizer step):**
-
-**D7a. Fused cross-entropy (CRITICAL for vocab=32K)**
-- Currently materializes full (bs, seq, vocab) logits tensor in float32
-- At vocab=32K: 1.1GB tensor → OOM. At vocab=16K: 537MB → tight.
-- Fused kernel: compute log_softmax + CE loss + backward WITHOUT materializing logits.
-  Stream through vocab dimension in tiles, accumulate loss and gradients online.
-- **Must implement before increasing vocab size.** Without this, vocab stays at 4096.
-- Reference: Liger-Kernel fused CE (PyTorch), or Triton online softmax pattern.
-- Saves: ~1GB memory, enables vocab=32K, also ~5ms/step at vocab=4K.
-
-**D7b. FlashAttention for training (fwd + bwd kernel)**
-- Attention is 52% of per-layer forward time (3.53ms) and dominates backward too.
-- XLA generates decent attention but not FlashAttention-level tiling.
-- Custom FlashAttention fwd+bwd Triton kernel with O(n) memory instead of O(n²).
-- At ctx=512 with 16 Q-heads: the attention scores matrix is 16×512×512×4 = 16MB per
-  sample. FlashAttention avoids materializing this (tiles along seq dimension).
-- Expected savings: ~23% of step time (144ms) from better attention + memory savings.
-  Memory savings could enable bs=32 (double throughput if compute-bound).
-- Reference: our existing prefill FlashAttention kernel (block_prefill.py _flash_attn_kernel)
-  already does forward. Need to add backward pass.
-- Complexity: HIGH. FlashAttention backward is the hardest Triton kernel to write correctly.
-  Alternative: use `jax.nn.dot_product_attention` which may use cuDNN FlashAttention.
-
-**D7c. Fused RMSNorm + linear projection**
-- Currently: RMSNorm writes h_norm to HBM, linear projection reads it back.
-  Two separate XLA kernels with a full HBM round-trip between them.
-- Fused: compute RMSNorm and the following matmul (Q/K/V proj or FFN) in one kernel.
-  h_norm stays in registers/shared memory, never touches HBM.
-- 2 fusions per layer (pre-attn norm+QKV, pre-FFN norm+gate/up) × 24 layers = 48 fusions.
-- Saves: ~9% of step time (58ms). Each fusion saves ~1MB HBM traffic.
-- Complexity: MEDIUM. The matmul part is a standard GEMM, just with fused normalization
-  as a prologue. Can use Triton's tl.dot for the matmul.
-
-**D7d. Fused SwiGLU**
-- Currently: gate = h@Wg, up = h@Wu, act = silu(gate)*up → 3 separate XLA kernels,
-  materializing gate and up (each bs×seq×d_ff = 16×512×2816×2 = 46MB bf16) to HBM.
-- Fused: compute gate and up in one kernel, apply SiLU*mul inline, feed to down proj.
-  Or at minimum: fuse the SiLU*mul element-wise op to avoid one materialization.
-- Saves: ~8% of step time (48ms), ~92MB activation memory per layer.
-- Complexity: LOW for the element-wise fusion (just fuse silu*mul). HIGH for fusing
-  with the matmuls (requires tiled GEMM + inline activation).
-
-**D7e. Test jax.nn.dot_product_attention (free FlashAttention?)**
-- JAX 0.4.31+ has `jax.nn.dot_product_attention` which may dispatch to cuDNN
-  FlashAttention automatically. This could give FlashAttention-level performance
-  without writing a custom kernel.
-- Test: replace our manual attention with this API, measure throughput and memory.
-- Complexity: TRIVIAL to test. If it works, skip D7b entirely.
-
-#### Implementation order
-
-1. **D1** (revert DeltaNet): immediate, verify throughput
-2. **D7e** (test jax FlashAttention): trivial, potentially huge win
-3. **D7a** (fused cross-entropy): MUST do before vocab increase
-4. **D4** (larger vocab): do before training starts (changes tokenization)
-5. **D2** (sequence packing): implement before training
-6. **D3** (sequence length warmup): implement in training loop
-7. **D7c** (fused RMSNorm+linear): nice-to-have, 9% speedup
-8. **D7d** (fused SwiGLU): nice-to-have, 8% speedup
-9. **D5** (MTP): add after base training is stable
-10. **D6** (recipe tuning): ongoing during training
-11. **D7b** (FlashAttention training bwd): complex, do if D7e doesn't work
-
-**Target throughput:** 20-30K tok/s effective (accounting for packing + curriculum).
-**Target training:** 10B tokens in 4-6 days.
-
-### COMPLETED: Phase D steps (2026-04-04)
-
-**D1 (revert DeltaNet):** Done. use_deltanet=False by default, --use-deltanet flag.
-24L pure attention, 274M params.
-
-**D7e (cuDNN FlashAttention):** Done. 38% training speedup via jax.nn.dot_product_attention
-with implementation='cudnn'. XLA default: 13.3K tok/s → cuDNN: 18.4K tok/s. Same VRAM.
-Uses bf16 for cuDNN, falls back to XLA for f32 inference.
-
-**D7a (fused cross-entropy):** Done. Custom_vjp with chunked forward+backward. Tiles over
-vocab in 4096-token chunks, never materializes full (bs×seq×vocab) logits tensor. Enables
-vocab=32K without OOM (would need 1.1GB for logits). At vocab=4K, ~same speed as standard.
-
-**D4 (vocab 32K):** Done. Tokenizer and data already existed at 32K. Updated default
---bpe-vocab to 32000. vocab=32K training: 28.4K tok/s, 12.3GB VRAM, 303M params.
-
-**D2 (sequence packing):** Skipped. Current data already concatenates documents without
-padding (no waste). Proper doc-boundary masking would need re-tokenization with EOS markers.
-
-**D3 (sequence length curriculum):** Done. --curriculum flag gives 3 phases:
-- Phase 1 (10%): ctx=128, bs=64 (4x tokens/step, 16x cheaper attention)
-- Phase 2 (20%): ctx=256, bs=32 (2x tokens/step)
-- Phase 3 (70%): ctx=512, bs=16 (full context)
-Separate JIT compilation per phase.
-
-**Current training config (ready to run):**
-```
-uv run train.py --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
-  --context-len 512 --batch-size 16 --epochs 3 --dataset combined \
-  --curriculum --lr 3e-4
-```
-Expected: ~28K tok/s at vocab=32K with cuDNN FlashAttention + fused CE.
-
----
-
-### COMPLETED: Epoch 2 — Fresh data with more code (2026-04-04)
-
-Epoch 1: d=1024/l=16 (242M params) on 1.77B tokens, val_loss=3.04, ppl=20.91.
-Epoch 2: resumed from epoch 1 weights on 1.72B fresh tokens, 13.4h on RTX 4080 Super.
-
-**Data mix (1.72B fresh tokens, no repetition):**
-- 51% FineWeb-Edu (883M tokens) — new docs from `sample-10BT`, skipped 981K epoch 1 docs
-- 18% StarCoder code (315M tokens) — `bigcode/starcoderdata` (Python, JS, TS, Java, C, C++, Rust, Go)
-- 17% Wikipedia (295M tokens) — fresh articles after epoch 1 docs
-- 14% Cosmopedia v2 (236M tokens) — fresh docs from `smollm-corpus/cosmopedia-v2`
-
-**Results:**
-```
-Epoch 2 (d=1024, h=16, kv_h=4, l=16, ctx=512, 242M params):
-  Train loss: 2.705 (was 3.04 after epoch 1)
-  Val loss:   3.338, ppl=28.16 (epoch 1 val: 3.04, ppl=20.91)
-  Time:       13.4h (48,067s), 7.9GB peak VRAM
-  Speed:      4.4 steps/s, 210K steps
-  Total tokens seen: 3.49B unique (1.77B epoch 1 + 1.72B epoch 2)
-```
-
-**Key finding:** Val ppl regressed (20.91 → 28.16) despite much lower train loss
-(3.04 → 2.70). The validation set was drawn from epoch 1's data mix (60% FineWeb,
-5% code_search_net), but epoch 2's mix has 20% StarCoder code and different source
-proportions. The model improved on the training distribution but the val set doesn't
-reflect the new mix. A fairer evaluation would use a val set from epoch 2's distribution.
-
-### Kernel architecture (done)
-
-The core kernel architecture is complete. All major optimizations explored:
-- Fused multi-layer decode with multi-SM parallelism
-- Persistent and pipelined decode (eliminate host sync)
-- Batched decode with weight amortization
-- GPU-accelerated paged KV cache
-- Continuous batching
-- Speculative decoding (acceptance rates validated)
-- Kernels will need minor updates when architecture changes (remove biases, etc.)
-
-### How to measure progress
-
-Run `uv run profile_kernels.py` after any kernel change. Switch models by copying
-weights: `cp weights_d768.pkl weights.pkl` or `cp weights_ctx2048.pkl weights.pkl`.
-
-```
-CURRENT BASELINES (after bandwidth optimization):
-  d=512, ctx=512:   Persistent 5129 tok/s, Persist-B=4 7351 tok/s (12% BW)
-  d=768, ctx=512:   Pipelined 1472 tok/s, Persist-B=4 2261 tok/s (20% BW)
-  ctx=2048:         Persistent 3133 tok/s, Persist-B=4 4560 tok/s (12% BW)
-```
-
-### What NOT to change
+## What NOT to change
 
 - Keep the same technology stack (Triton + JAX + jax-triton)
 - Keep BPE tokenization (trained on corpus)
@@ -1463,455 +282,253 @@ CURRENT BASELINES (after bandwidth optimization):
 
 ---
 
-## Profiling Commands
+## Tried but didn't help (decode)
 
-```bash
-uv run profile_kernels.py                   # primary benchmark (run after every change)
-uv run profile_kernels.py --detailed        # per-component breakdown
-uv run inference_benchmark.py               # quick throughput check
-
-# Nsight Compute for detailed GPU metrics
-/usr/local/cuda/bin/ncu --set full uv run profile_kernels.py
-
-# Nsight Systems for timeline view
-/usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
-
-# Training
-uv run train.py --d-model 512 --n-heads 16 --n-layers 8 \
-  --context-len 512 --epochs 3 --lr 1e-4 --batch-size 16
-```
+- **GQA for single-seq**: 0% speedup (barrier-limited, not memory-limited). Value is for batched inference.
+- **Parallel residual** (attn||FFN, 9 barriers vs 17): +1.3%. Straggler variance dominates, not barrier count.
+- **num_warps sweep**: 2/4/8 all within 5%.
+- **num_stages=2**: shared memory overflow at D_BLOCK=1024.
+- **In-kernel page table lookups**: 2.5x slower Triton code (indirect addressing defeats compiler).
 
 ---
 
 ## Files
 
 ```
-program.md                           — this file (read first)
-repo_explained_from_zero.md          — ground-up explanation of GPU kernels + this project
-README.md                            — project overview
-model.py                             — JAX transformer model (inference baseline)
-train.py                    — AdamW training with LR schedule
-data.py                              — Shakespeare + TinyStories (char, GPT-2 BPE, trained BPE)
-kernels/fused_prefill.py             — fused Triton prefill kernel (d_model≤64)
-kernels/fused_decode.py              — fused Triton decode kernel (d_model≤64)
-kernels/block_prefill.py             — multi-block prefill + FlashAttention + GQA (d_model≥128)
-kernels/block_decode.py              — per-layer decode + orchestrator (d_model≥128)
-kernels/fused_decode_nlayer.py       — fully fused N-layer decode (packed weights/caches)
-kernels/multi_sm_decode.py           — multi-SM decode: grid=(N_HEADS×KV_SPLITS,) with atomic barriers
-kernels/batched_decode.py            — batched multi-SM decode: B sequences, tensor core projections
-kernels/persistent_decode.py         — persistent decode: single launch for all steps
-kernels/persistent_batched_decode.py — persistent batched: single launch for B seq × N steps
-kernels/paged_kv.py                  — paged KV cache memory management (PagePool)
-generate.py                          — streaming text generation API + CLI
-serve.py                             — variable-length batched inference server (BatchedServer)
-profile_kernels.py                   — primary profiling tool (run after every change)
-profile_vram.py                      — VRAM profiling for model scaling decisions
-prepare_data.py                      — multi-source training data download + tokenization
-baseline_metrics.txt                 — current numbers to beat
-training_log_d1024.txt               — epoch 1 training log
-training_log_d1024_epoch2.txt        — epoch 2 training log
+Training:
+  model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
+  train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
+  data.py                              streaming data loading (v2 memmap for 8B tokens, legacy datasets)
+  prepare_data.py                      legacy data download + tokenization (v1)
+  prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
+
+Inference kernels:
+  kernels/multi_sm_decode.py           multi-SM decode with atomic barriers + KV-split
+  kernels/batched_decode.py            batched multi-SM decode (B sequences, tensor core projections)
+  kernels/persistent_decode.py         persistent decode (single launch, all steps)
+  kernels/persistent_batched_decode.py persistent batched (B x N steps)
+  kernels/block_prefill.py             multi-block prefill + FlashAttention + GQA
+  kernels/fused_decode_nlayer.py       weight/KV packing for all decode kernels
+  kernels/paged_kv.py                  paged KV cache (GPU gather/scatter)
+  kernels/fused_prefill.py             legacy fused prefill (d<=64)
+  kernels/fused_decode.py              legacy fused decode (d<=64)
+
+Serving:
+  generate.py                          streaming text generation CLI
+  serve.py                             batched server + continuous batching
+
+Benchmarking:
+  profile_kernels.py                   primary profiling tool
+  profile_vram.py                      VRAM profiling for model scaling
+
+Documentation:
+  program.md                           this file (read first)
+  repo_explained_from_zero.md          ground-up GPU kernel explanation
+  README.md                            project overview
+  REMOTE_TRAINING.md                   instructions for training on rented GPU
 ```
+
+---
+
+## GPU Specs (RTX 4080 Super)
+
+```
+Ada Lovelace architecture
+16 GB VRAM (GDDR6X)
+836 GB/s memory bandwidth
+52 TFLOPS FP16 (tensor cores)
+80 SMs
+64 MB L2 cache (~3-6 TB/s L2 bandwidth)
+101 KB shared memory per SM
+255 registers per thread
+```
+
+## Profiling Commands
+
+```bash
+uv run profile_kernels.py                   # primary benchmark (run after every change)
+uv run profile_kernels.py --detailed        # per-component breakdown
+
+# Nsight Compute for detailed GPU metrics
+/usr/local/cuda/bin/ncu --set full uv run profile_kernels.py
+
+# Nsight Systems for timeline view
+/usr/local/bin/nsys profile -t cuda uv run profile_kernels.py
+```
+
+Run `uv run profile_kernels.py` after any kernel change. Switch models by copying
+weights: `cp weights_dXXX.pkl weights.pkl`.
 
 ---
 
 ## Kernel Engineering Lessons
 
-1. **num_warps=4 is optimal for this model.** Fewer warps = more registers per thread.
-   num_warps=2 is slower (poor occupancy), num_warps=8 is slower (thread overhead).
+### Register pressure and tiling
 
-2. **Dynamic loops (`tl.range`) prevent register-pressure blowup from unrolling.**
-   The FFN K-tiling loop MUST use `tl.range`, not `tl.static_range`. Static unrolling
-   of 8 iterations causes 340 bytes of register spilling.
-
-3. **bf16 matmuls with f32 accumulation are the sweet spot.** FP8 was tried and was slower
-   (register pressure from casts outweighed tensor core gains). fp16 out_dtype didn't help.
-
-4. **The entire model fits in registers.** Total weight storage: ~66K params × 2 bytes =
-   132KB. With 128 threads/block and 255 regs/thread, we have 128 × 255 × 4 = 131KB of
-   register file. Tight but fits (weights are loaded on-demand, not all live simultaneously).
-
-5. **Attention scores (128×128) in registers are the bottleneck.** This is 16K f32 values
-   = 64KB. It works at num_warps=4 but is the largest live tensor.
-
-6. **Decode can't use tensor cores.** With M=1, tensor cores need at least 16×16 tiles.
-   Element-wise ops are faster for single-token decode.
-
-7. **maxnreg doesn't help.** The kernel is compute-bound, not occupancy-bound. Forcing
-   fewer registers just causes spilling.
-
+1. **num_warps=4 is optimal.** Fewer warps = more registers per thread. 2 is slower
+   (poor occupancy), 8 is slower (thread overhead). 128 threads/block × 255 regs
+   × 4 bytes = 131KB register file budget.
+2. **Dynamic loops (`tl.range`) prevent register blowup from unrolling.** FFN K-tiling
+   and layer loops MUST use `tl.range`, not `tl.static_range`. Static unrolling of
+   8+ iterations causes 340+ bytes of register spilling. tl.range compiles the loop
+   body once — identical runtime performance, 10x faster compilation at 24 layers.
+3. **bf16 matmuls with f32 accumulation are the sweet spot.** FP8 was slower (cast
+   overhead). fp16 out_dtype didn't help.
+4. **BLOCK_SEQ must scale inversely with d_model** to keep h_block at ~16KB. d=128:
+   BLOCK_SEQ=32, d=256: BLOCK_SEQ=16, d=512: BLOCK_SEQ=8.
+5. **At d>=512, use `tl.dot` instead of element-wise projections.** Element-wise
+   `h[:, None] * W` for (512,32) needs 128+128=256 regs > 255 limit. `tl.dot((1,512)
+   @ (512,32))` tiles the reduction internally, avoiding full materialization.
+6. **At D_HEAD=64, projection weights (1024,64) overflow shared memory (128KB > 101KB).**
+   Fix: tile with PROJ_TILE=512, each tile loads (512,64)=64KB. Adds ~10% overhead
+   from extra h_norm loads.
+7. **tl.arange requires power-of-2 ranges.** Pad D_MODEL to D_BLOCK=next_pow2 with
+   d_mask on every load/store. RMSNorm needs explicit masking: `hc = tl.where(d_mask,
+   h - mean, 0.0)` to prevent padded elements from corrupting variance. tl.dot with
+   zero-padded operands produces correct results (0 × anything = 0).
 8. **Tiled output projection has zero overhead.** Going from register-only (vocab=65)
-   to tiled (vocab=1024, 8 tiles of 128) maintained or improved speedup (4.0x → 4.35x).
-   The output projection is not the bottleneck — attention is. Tiling is free.
+   to tiled (vocab=1024+, VOCAB_TILE=128 chunks) maintained speedup. The output
+   projection is not the bottleneck — attention is.
 
-9. **VOCAB_SIZE/VOCAB_PAD as kernel constexpr parameters.** Using `tl.constexpr` function
-   parameters (not module-level) lets jax-triton JIT-compile a kernel variant per vocab
-   size. Clean separation between kernel logic and model configuration.
+### Multi-SM and synchronization
 
-10. **Multi-block tiling is the key to scaling d_model.** With d_model=128, h is (128,128) =
-    64KB — can't fit with attention scores (also 64KB) in 127KB register file. Tiling
-    the sequence into BLOCK_SEQ=32 row blocks reduces h to (32,128) = 16KB, scores to
-    (32,128) = 16KB. Peak per block: ~52KB. Scales to any d_model.
+9. **Multi-SM decode with atomic barriers: 6x speedup.** grid=(N_HEADS,), each block
+   handles one attention head, all blocks split FFN. Uses `tl.atomic_add` with
+   `sem='release'/'acquire', scope='gpu'` for cross-block barriers. Two barriers
+   per layer: after attention, after FFN.
+10. **Redundant computation is cheaper than synchronization.** All blocks independently
+    compute LayerNorm (~1us from L2 cache) vs one-block-broadcast + barrier (~5us).
+11. **KV-split (FlashDecoding): +10% at grid=32.** Two blocks per head split KV tiles,
+    merge with log-sum-exp correction: `h = sum(o_s * l_s * exp(m_s - m_max)) /
+    sum(l_s * exp(m_s - m_max))`. Edge case: blocks with no valid positions produce
+    l=0, m=-inf — clamp l to avoid NaN. grid=64 has diminishing returns (barrier
+    contention, less FFN work per block).
+12. **Split barrier: separate counter and done-flag cache lines.** Arrivals write to
+    counter[], last-arriving block sets done[], all blocks poll done[]. Eliminates
+    L2 thrashing during spin-wait. +5-6.5%.
+13. **Barrier count reduction gives minimal speedup** because straggler variance
+    dominates fixed barrier overhead. Halving barriers saves ~8us fixed but ~80us
+    straggler time stays constant. To reduce barrier overhead: balance work across
+    blocks or reduce total work.
+14. **GPU→CPU sync (`int()`) costs 30-60% of decode time at small models.** Persistent
+    and pipelined kernels eliminate this. At d=1024 (~2ms/step), sync overhead is only
+    ~10% so persistent and pipelined are nearly identical.
 
-11. **Projections and attention need separate kernel launches.** Within a single Triton
-    kernel, blocks execute in parallel with no ordering guarantee. Block 3's attention
-    can't read K/V written by block 0 in the same launch. Split into proj_kernel (writes
-    K/V to HBM) → attn_kernel (reads K/V from HBM).
+### Batched decode
 
-12. **Decode kernel scales trivially with d_model.** M=1 means all tensors are 1D (d_model,).
-    With d_model=128, h is only 512 bytes. A single fused kernel per layer works for any
-    d_model. The bottleneck is attention over the KV cache: (max_seq, d_head) per head.
+15. **Double-buffer h to prevent read-write races.** Fast blocks overwriting h before
+    slow blocks read it causes double-residual. Even/odd layers alternate buf_a/buf_b.
+16. **Separate workspace buffers for read-phase vs write-phase data.** If a buffer is
+    read and written within the same barrier phase, use separate buffers. The partial
+    buffer had this bug: merge reads o_proj while FFN writes partials in same phase.
+17. **Weight-amortized FFN (outer k-loop / inner b-loop): +14-22%.** Load FFN weights
+    once per tile, process all B elements. Saves (B-1)x weight loads. ffn_buf
+    accumulation uses conditional store (k==0: store, else: load+add+store).
+18. **Batched FFN at D_BLOCK=1024: reduce BLOCK_K from 32 to 16** to fit both up_w and
+    down_w in shared memory (64KB each at BLOCK_K=32 > 101KB limit).
+19. **Batched projections via 2D tl.dot: +8-12%.** (B, D_BLOCK) @ (D_BLOCK, D_HEAD)
+    eliminates B-1 loop iterations. At B>=16, tensor cores activate. O projection
+    can't be batched: output (B, D_BLOCK) overflows shared memory.
 
-13. **HBM traffic between kernels costs ~2x speedup** initially. Went from 4.3x to 1.9x.
-    But fusing decode back into one kernel + precomputing weights recovered most of it
-    (1.9x → 3.9x). The real cost was Python dispatch, not HBM.
+### Persistent kernels
 
-14. **Python dispatch dominates small-model latency.** Each jt.triton_call has ~0.4ms of
-    Python/JAX overhead. With 3 calls per decode step × 63 steps = 189 calls → 75ms of
-    pure overhead. Fusing into 1 call/step saved 35%.
+20. **Persistent kernel eliminates ALL per-step host overhead.** Single launch for N
+    steps, fresh barrier slots per step (step * BARRIERS_PER_STEP + idx). Block 0
+    writes next_token; step-sync barrier ensures all blocks see it. 2.56x at d=512,
+    negligible gain at d=1024 (host dispatch overlaps with long kernel execution).
+21. **In-place KV: pos-only store (128 bytes) forces correct compiler ordering.**
+    Without a store in the tile loop, Triton reorders K_new store relative to tile
+    loads, reading stale data. Causes divergence at step 34. The pos-only store
+    forces the dependency chain without significant traffic (+7.1%).
 
-15. **Never convert dtypes inside the decode loop.** `.astype(bf16)` creates a new JAX
-    array every call. With 28 weight tensors × 63 steps = 1764 allocations → 57% slowdown.
-    Precompute bf16 weights once before the loop.
+### Scaling observations
 
-16. **Fold KV cache updates into the kernel.** `.at[:, pos, :].set()` creates a new array
-    copy every call. 4 caches × 0.27ms = 1.09ms per step — 73% of decode time!
-    Having the kernel write full updated caches directly gave 3.6x speedup.
+22. **HBM bandwidth is the terminal bottleneck at d>=768.** 162MB+ weights exceed
+    64MB L2; every step re-fetches from HBM. d=512 (55MB) fits in L2 for much
+    better scaling (55% BW util at B=4 vs ~30% at d=768).
+23. **ctx=2048 scales gracefully: 4x context costs ~1.6x decode time.** Weight loads
+    dominate; attention tiles add incrementally (~0.1ms/tok vs ~0.2ms/tok for weights).
+24. **Batched decode scaling is sublinear at d=1024.** B=4: ~2x, B=8: 2.2x, B=16: 2.1x
+    (regression). KV overhead (8.4MB × B) grows linearly while 485MB weights dominate.
+25. **L2 cache eviction hints give ~3%.** evict_last on KV (reuse across steps),
+    evict_first on output projection (single-use).
 
-17. **For small models, host overhead > GPU compute.** The GPU kernel takes 0.4ms per
-    decode step, but Python/JAX dispatch, dtype conversions, and array scatters added
-    1.1ms. Eliminating all host-side overhead gave 7.5x improvement (335→2504 tok/s).
+### Paging and speculative decode
 
-18. **Packed weight buffers scale to any layer count.** With 4+ layers, passing individual
-    weight pointers becomes unwieldy (50+ arguments). Concatenating all per-layer weights
-    into one bf16 buffer and computing offsets from layer index is cleaner and equally fast.
+26. **Paged KV saves 87% memory for short sequences** (PAGE_SIZE=64). In-kernel page
+    table lookups are 2.5x slower — use JIT gather/scatter instead. Gather indices
+    cached per page table config, only rebuild every 64 steps.
+27. **JAX `.at[].set()` copies the entire array.** 9KB update in 5MB pool costs 0.37ms
+    due to functional immutability. Mutable CUDA buffers would fix this.
+28. **Speculative acceptance scales with draft quality, not size.** ppl gap is the
+    predictor. Need >5x speed ratio for profitability.
 
-19. **Packed KV caches eliminate per-step allocation.** Keep all layers' K/V caches in one
-    flat buffer between decode steps. The kernel reads from kv_in and writes to kv_out
-    directly. No Python-side pack/unpack between steps.
+### Miscellaneous
 
-20. **15x speedup holds across model scales.** d=64/1L: 16.9x, d=128/2L: 14.0x,
-    d=256/4L: 15.1x. The kernel fusion advantage is consistent — it's not just a
-    small-model artifact. As models grow, compute increases but so does the benefit
-    of eliminating host overhead.
+29. **Triton if/else on atomic return values is unreliable.** Replace `if/else` with
+    `if + while` pattern to avoid subtle correctness bugs (tokens diverge after ~10 steps).
+30. **Never convert dtypes inside the decode loop.** `.astype(bf16)` creates 1764
+    unnecessary allocations per decode sequence. Precompute bf16 weights once (57% win).
+31. **Python dispatch dominates small-model latency.** Each jt.triton_call has ~0.4ms
+    overhead. Fuse everything into one kernel. 35% speedup from eliminating 128
+    launches per decode sequence.
+32. **Fold KV cache updates into the kernel.** `.at[:, pos, :].set()` creates array
+    copies — 73% of decode time at d=128. In-kernel cache writes gave 3.6x speedup.
+33. **num_stages=2 infeasible at D_BLOCK=1024.** Double-buffering tiles needs 128KB >
+    101KB shared memory.
+34. **tl.dot Q/K/V projections must be in separate loops** (not one unrolled loop)
+    to avoid 3×64KB=192KB simultaneous shared memory.
 
-21. **BLOCK_SEQ must scale inversely with d_model.** Register file is fixed at ~127KB.
-    With d=128: BLOCK_SEQ=32 → h=(32,128)=16KB. With d=256: BLOCK_SEQ=16 → h=(16,256)=16KB.
-    The h_block size stays at 16KB by halving BLOCK_SEQ when doubling d_model.
+---
 
-22. **FlashAttention is only needed for context>256.** At context=256 with BLOCK_SEQ=16,
-    scores are (16,256)=16KB per head — fits alongside K(32KB)+V(32KB)+accumulators.
-    At context=512+, the full scores matrix overflows. Tiled KV with online softmax
-    (KV_TILE=64) keeps peak at ~20KB per tile regardless of context length.
+## Training the model
 
-24. **At d=512, element-wise projections overflow registers.** Each (D_MODEL, D_HEAD) =
-    (512, 32) intermediate uses 128 registers per thread (out of 255 max). The product
-    `h[:, None] * W` needs another 128 → 260 > 255, causing spills to shared memory.
-    Fix: use `tl.dot` which tiles the reduction internally. With `tl.dot((1, 512) @ (512, 32))`,
-    Triton never materializes the full (512, 32) intermediate.
+### Full training run
 
-25. **Output projection needs smaller VTILE at d=512.** Loading (D_MODEL, VOCAB_TILE) =
-    (512, 128) bf16 = 128KB ≈ entire register file. Reduced to VTILE=32 → (512, 32) = 32KB.
-    4x more loop iterations but avoids register spilling.
+```bash
+# On RTX 4080 Super (16GB), bs=16:
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 3 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  2>&1 | tee training.log
 
-26. **Tiled KV attention in decode is essential for MAX_SEQ=512.** Loading the full
-    (MAX_SEQ, D_HEAD) = (512, 32) cache at once overflows shared memory (139KB > 101KB).
-    Online softmax with KV_TILE=64 tiles the cache: each tile loads (64, 32) = 4KB.
-    Same algorithm as FlashAttention but for the M=1 single-token case.
+# On RTX 4090 (24GB), bs=32:
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 32 --epochs 3 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  2>&1 | tee training.log
+```
 
-27. **At d=512, the GPU kernel is 93% of step time, not host overhead.** Profiling
-    showed: kernel=3.35ms (93%), argmax+sync=0.13ms (4%), host=0.11ms (3%). The
-    original hypothesis that Python dispatch was the bottleneck was wrong at this
-    model scale. Host overhead matters for small models (d≤128) but is negligible
-    at d=512 where the kernel dominates.
+Expected performance on RTX 4090 with bs=32: ~31K tok/s, ~8.7h for 3 epochs (23.5B tokens).
+On RTX 4080 Super with bs=16: ~28.4K tok/s, ~13-14h.
 
-28. **Multi-SM decode with atomic barriers gives 5.2x speedup.** grid=(N_HEADS=16,)
-    instead of grid=(1,) — each block handles one attention head, and all blocks
-    split the FFN. Uses `tl.atomic_add` with `sem='release'/'acquire', scope='gpu'`
-    for cross-block barriers. Two barriers per layer: one after attention (before
-    FFN), one after FFN (before next layer). All blocks redundantly compute LN and
-    reductions (32KB from L2, negligible cost). 287→1519 tok/s, 2%→12% BW utilization.
+`--no-checkpoint` disables gradient checkpointing (+12% speed, more VRAM).
+`--curriculum` enables sequence length warmup (ctx=128→256→512).
 
-29. **Redundant computation is cheaper than synchronization.** In the multi-SM kernel,
-    all 16 blocks independently compute LayerNorm and reduce the 16 partial results
-    (16×512 f32 = 32KB reads). This is redundant but costs only ~1µs per block from
-    L2 cache. The alternative — having one block compute and broadcast — would need
-    an additional barrier (~5µs) plus the serial bottleneck.
+### Resuming from checkpoint
 
-30. **Use tl.range (not static_range) for the layer loop in large kernels.** With 8
-    layers and the full multi-SM kernel body (attention + FFN + barriers + reductions),
-    `tl.static_range` unrolls the loop at compile time, creating enormous IR that takes
-    10+ minutes to compile. `tl.range` compiles the loop body once and executes it
-    dynamically — identical runtime performance, 10x faster compilation.
+Checkpoints are saved every 2000 steps and at end of each epoch to `checkpoint.pkl`.
 
-31. **KV-split parallelism (FlashDecoding) gives 10% improvement at grid=32.** With
-    N_HEADS=16 blocks, only 16/80 SMs were utilized. Splitting KV cache attention
-    across 2 blocks per head (KV_SPLITS=2) doubles the grid to 32 blocks. Each block
-    handles half the KV tiles and computes a partial online softmax. After the barrier,
-    all blocks merge the partials using the log-sum-exp trick: `h_head = Σ(o_proj_s *
-    l_s * exp(m_s - m_max)) / Σ(l_s * exp(m_s - m_max))`. The normalized O-projection
-    avoids large-value bf16 overflow. Edge case: blocks whose KV range has no valid
-    positions (pos < range_start) produce l=0, m=-inf — clamp l before normalization
-    to avoid NaN, then the merge naturally weights them to zero.
+```bash
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 3 \
+  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  --resume checkpoint.pkl \
+  2>&1 | tee -a training.log
+```
 
-32. **grid=32 is the sweet spot; grid=64 has diminishing returns.** KV_SPLITS=4
-    (grid=64) was slightly slower than KV_SPLITS=2 (grid=32) due to increased barrier
-    contention. With 64 blocks, each barrier has more atomic operations and longer
-    worst-case spin time. Also, each block has less FFN work (D_FF/64=32 elements,
-    only 1 iteration), reducing per-block compute efficiency. The FFN reduction also
-    reads from more blocks (64×D_MODEL vs 32×D_MODEL from L2).
+Restores params, optimizer state (Adam moments), LR schedule position, and exact
+epoch/batch position. Training continues exactly where it left off.
 
-33. **Split barrier: separate counter and done-flag on different cache lines.**
-    The standard all-spin barrier has all N blocks polling the same counter address
-    with atomic_add(0, acquire) while other blocks are still arriving with atomic_add(1,
-    release). This causes L2 cache line thrashing (arrivals invalidate the line that
-    pollers are reading). Fix: arrivals go to counter[], last-arriving block sets a
-    done-flag[] on a different cache line, all blocks poll done[]. The counter line
-    sees only 32 writes (no reads during arrival), the done line sees only reads until
-    the single write. 6.5% kernel speedup (2918→3108 tok/s pure GPU).
+### Data preparation
 
-34. **Triton if/else on atomic return values is unreliable.** When branching on the
-    return value of `tl.atomic_add`, using `if/else` caused subtle correctness bugs:
-    tokens diverged after 10 steps. Replacing `if (...): ... else: ...` with
-    `if (...): ...\n while ...:` (no else, all blocks execute the while) fixed it.
-    The issue is likely that Triton's compiler generates incorrect predicated code
-    when the else branch contains a while loop with atomics.
+```bash
+uv run python -u prepare_data_v2.py
+```
 
-35. **GPU→CPU sync costs 34% of total decode time.** `int(next_token)` forces a
-    GPU→CPU transfer per token (0.19 ms). The in-kernel argmax avoids the argmax
-    compute cost, but int() still triggers sync. The pipelined approach (tokens stay
-    on device, JAX dispatches next call while current runs) achieves 3108 tok/s vs
-    1937 tok/s with sync. For real applications, collect tokens on device and batch-
-    transfer to CPU periodically.
-
-36. **GQA doesn't help single-sequence decode when barrier-limited.** With 17
-    barriers taking ~50% of kernel time, reducing data from 67.7 MB to 55.1 MB
-    (via GQA's 4x smaller KV cache + fewer K/V weights) gives 0% speedup. The
-    memory access is already served from L2 at high bandwidth; the bottleneck is
-    the barrier spin-wait. GQA's value is for batched inference (batch=8 KV cache:
-    16.8 MB GQA vs 67.2 MB MHA) and long-context scenarios. Lesson: always profile
-    to identify the actual bottleneck before optimizing.
-
-37. **Barrier count reduction gives minimal speedup because straggler variance
-    dominates.** Parallel residual reduces barriers from 17 to 9 (-47%) but only
-    gives +1.3% speedup. Each barrier has ~1µs fixed overhead + variable straggler
-    wait. The straggler wait is proportional to the TOTAL WORK per step, not the
-    number of barriers. With fewer barriers, each remaining barrier has MORE work
-    between them → MORE straggler variance → HIGHER per-barrier cost. Net: saving
-    8 × 1µs = 8µs of fixed overhead, but the ~80µs of straggler time stays constant.
-    To reduce barrier overhead, must either: (a) balance work across blocks better,
-    (b) reduce total work, or (c) use hardware cooperative group barriers.
-
-38. **Batched decode with shared buffers requires double-buffering for h.** When all
-    blocks read h, compute h_new = h + residual, and write h_new to the SAME buffer,
-    a fast block can write h_new before a slow block reads the original h. The slow
-    block then computes h_new + residual = h + 2×residual (double residual). Fix:
-    double-buffer h — even layers read buf_a/write buf_b, odd layers read buf_b/write
-    buf_a. The buffers never overlap because all reads are from one, all writes to
-    the other. Cost: 2× h_buf memory (negligible: 2 × B × D_MODEL f32).
-
-39. **Shared workspace buffers must separate read-phase from write-phase data.** In
-    the multi-SM batched kernel, the partial buffer stored both attention o_proj
-    (written phase 1, read in phase 2 merge) and FFN partial (written phase 2,
-    read in phase 3). After the phase 1 barrier, a fast block could finish the merge
-    and start writing FFN partials while a slow block was still reading o_proj values.
-    Fix: use separate partial and ffn_buf buffers. General rule: if a buffer is read
-    by all blocks and also written by all blocks within the same barrier-delimited
-    phase, it needs double-buffering or a separate buffer.
-
-40. **Batched decode throughput is L2-limited with MHA.** With MHA (8.4 MB KV per seq),
-    B=4 total data = 88.6 MB exceeds 64 MB L2 cache, forcing HBM traffic. Result:
-    1.81x throughput (not 4x). GQA (2.1 MB KV per seq) keeps B=4 data at 63.4 MB,
-    fitting in L2. Expected: 3-4x throughput with GQA.
-
-41. **Weight-amortized FFN: outer k-loop / inner b-loop saves (B-1)× weight loads.**
-    The fused merge+LN2+FFN loaded FFN weights B times per k-tile (once per batch
-    element). De-fusing: compute merge+LN2 for all B (store h_norm to buffer), then
-    FFN with outer k-loop / inner b-loop loads weights once per tile. Result: B=4
-    +14%, B=8 +22%, B=16 +19%. The extra h_norm buffer traffic is negligible vs the
-    weight savings. The ffn_buf accumulation uses conditional store (k==0: store,
-    else: load+add+store) to avoid a separate initialization pass.
-
-42. **Persistent kernel eliminates ALL per-step host overhead.** The single-launch
-    persistent decode kernel runs all N decode steps in one kernel call, using fresh
-    barrier slots per step (step * BARRIERS_PER_STEP + barrier_idx). Initial KV copy
-    (kv_ptr → kv_out_ptr) is done cooperatively by all blocks before the step loop,
-    protected by a barrier. Block 0 writes next_token to workspace; a step-sync
-    barrier ensures all blocks see it before the next step's embedding. Result:
-    4777 tok/s vs 1869 tok/s sync'd (2.56x). The KV tile copy during attention
-    (matching original read-modify-write pattern) is essential for correctness —
-    writing K_new BEFORE attention and reading it back introduces a bf16 round-trip
-    that causes divergence after ~34 tokens.
-
-43. **GPU→CPU sync (int() per token) is the dominant bottleneck at 30M params.**
-    With the kernel itself running at 0.32-0.35 ms/tok and int() adding 0.15-0.20 ms,
-    sync accounts for 30-60% of wall time. Pipelining (JAX overlaps dispatch with
-    execution) and persistent kernels (tokens stay on GPU) both eliminate this.
-    For batched B=4: sync'd 4205 tok/s → pipelined 6691 tok/s (+59%). The lesson:
-    benchmark both sync'd and pipelined, and report the number that matches your
-    deployment scenario (streaming vs batch generation).
-
-44. **Persistent batched kernel: apply persistent technique to batched inference.**
-    Same design as persistent single-seq but with B sequences: double-buffered h_buf
-    across layers, fresh barrier slots per step, in-kernel argmax per batch element,
-    block 0 writes B next_tokens. Eliminates per-step workspace allocation AND JAX
-    dispatch. Result: B=4 7351 tok/s (+10% vs pipelined 6672), B=8 7862 tok/s (+10%
-    vs pipelined 7351). The gain is smaller than single-seq persistent (2.5x) because
-    the batched kernel is already compute-heavy (B×attention + B×FFN per step), so
-    the per-step host overhead is a smaller fraction of total time.
-
-45. **In-place KV: pos-only store fixes Triton compiler reordering.** Removing tile
-    stores from the persistent kernel saves ~4MB traffic per step (full tile copies
-    were writing back data already in kv_out). But this causes divergence at step 34:
-    without a store in the tile loop, the Triton compiler reorders the K_new store
-    (before the loop) relative to tile loads (inside the loop), reading stale data.
-    The tl.where masks it for the current step, but kv_out never gets K_new for
-    subsequent steps. Fix: store ONLY at pos in the tile loop (`mask=pos_mask`, 128
-    bytes instead of 4MB). This forces the compiler to maintain the dependency chain
-    without significant traffic. +7.1% for single-seq persistent (4797→5129 tok/s).
-
-46. **tl.arange requires power-of-2 ranges — pad D_MODEL to D_BLOCK.** Triton's
-    `tl.arange(start, end)` requires `end - start` to be a power of 2. D_MODEL=768
-    is not a power of 2, so all kernels need `D_BLOCK = next_power_of_2(D_MODEL) = 1024`
-    with `d_mask = d < D_MODEL` on every load/store. LayerNorm needs explicit masking:
-    `hc = tl.where(d_mask, h - mean, 0.0)` to prevent padded elements from corrupting
-    the variance. The padding adds 33% overhead (1024 vs 768), but tl.dot with zero-
-    padded operands produces correct results since 0 × anything = 0.
-
-47. **Batched FFN at D_BLOCK=1024 overflows shared memory with BLOCK_K=32.** The
-    weight-amortized FFN loads both up_w (D_BLOCK × BLOCK_K bf16 = 64KB) and down_w
-    (BLOCK_K × D_BLOCK bf16 = 64KB) before the batch loop, totaling 128KB > 101KB
-    shared memory. Fix: reduce BLOCK_K from 32 to 16, halving weight matrices to
-    32KB each (64KB total). The multi-SM kernel doesn't have this issue because it
-    loads up_w and down_w sequentially (not both alive during the batch inner loop).
-
-48. **At d=768, persistent decode is SLOWER than pipelined.** Persistent single-seq:
-    1344 tok/s vs pipelined: 1463 tok/s. With ~1ms per decode step (3× slower than
-    d=512's 0.35ms), the persistent kernel's overhead (barrier management, in-kernel
-    argmax, step-sync) becomes a significant fraction. The persistent technique's
-    advantage (eliminating 0.15-0.20ms host sync per step) matters less when the
-    kernel step itself takes 1ms. Lesson: persistent kernels help most when host
-    overhead is a large fraction of step time (d=512: 30-60%, d=768: ~15%).
-
-49. **ctx=2048 scales gracefully: 4x context costs ~1.2x decode time per token.**
-    Persistent single-seq: 5129 tok/s at ctx=512 → 3133 tok/s at ctx=2048 (1.64x
-    slower, not 4x). Weight loads still dominate — attention over 32 KV tiles
-    (vs 8 at ctx=512) adds ~0.1ms/tok but weight loads cost ~0.2ms/tok. At B=4,
-    persistent gives 4560 tok/s (was 7351 at ctx=512, 1.61x slower). The scaling
-    is better than expected because: (a) KV cache per seq grows 4x but is still
-    small vs weights (8.4 vs 55 MB), (b) attention is O(n) tiled, not O(n²).
-
-50. **All scaling targets met.** d=768 persistent: 1344>2000 (missed but pipelined
-    B=4 2225>2000 passes). ctx=2048 persistent: 3133>2000 (passed). ctx=2048 B=4
-    pipe: 4560>4000 (passed). The kernel architecture (multi-SM, weight amortization,
-    persistent, pipelining) generalizes across model size and context length.
-
-51. **L2 cache eviction hints give ~3% at d=768.** `eviction_policy='evict_last'` on
-    KV cache loads keeps 4.7MB KV data in L2 across decode steps (fits easily in 64MB
-    L2). `eviction_policy='evict_first'` on output projection prevents single-use
-    6.3MB output weights from evicting KV data. Combined with merging output+step-sync
-    barriers (25→1 fewer per step): pipelined 1448→1472, persistent 1341→1368 tok/s.
-
-52. **KV_SPLITS=2 is optimal at d=768.** Tested 1,2,4. KV_SPLITS=1 (grid=24): 15%
-    slower — only 24/80 SMs active, insufficient parallelism outweighs barrier savings.
-    KV_SPLITS=4 (grid=96): compilation extremely slow (~30min), likely worse from
-    barrier contention with 96 blocks. The sweet spot is enough blocks to utilize
-    most SMs (48/80=60%) without excessive barrier arrivals.
-
-53. **num_stages=2 infeasible at D_BLOCK=1024.** Software pipelining requires double-
-    buffering tiles in shared memory. At d=768, weight tiles are (1024, 32) bf16 = 64KB.
-    Double-buffered: 128KB > 101KB shared memory limit. Warp specialization would need
-    CUDA, not Triton. The 1024-wide D_BLOCK (padding for d=768) is the fundamental
-    constraint — it makes every 2D tile large.
-
-57. **Paged KV cache saves 87% memory for short sequences.** With PAGE_SIZE=64,
-    short prompts (4-7 tokens) use 1 page × 0.6MB instead of 4.7MB contiguous.
-    Python-level paging adds conversion overhead (~2x slower) but demonstrates the
-    memory management pattern. Kernel-level paging (page table in attention loop)
-    would eliminate the copy overhead by doing per-tile page lookups.
-
-56. **Batched projections via 2D tl.dot give 8-12% across all batch sizes.** Replacing
-    `for b in range(B): Q[b] = dot(h[b], wq)` with `Q = dot(h_batch, wq)` where
-    h_batch is (B, D_BLOCK) eliminates B-1 loop iterations and improves memory access
-    patterns. At B>=16, tensor cores activate for the (16, 1024)@(1024, 32) matmul.
-    At B=4, tensor cores don't activate (M=4 < 16) but the 2D load/store pattern still
-    helps. O projection can't be batched: output (B, D_BLOCK) overflows shared memory.
-
-55. **GQA prefill: separate Q/K/V loops give 2.4x over JAX.** The Triton prefill
-    kernel loops Q projections over N_HEADS (24) and K/V over N_KV_HEADS (6). Each
-    KV head is computed once and shared by 4 Q heads in attention via head//GQA_GROUP.
-    Adding D_BLOCK padding (1024 for d=768) required d_mask on all loads/stores,
-    identical to the decode kernel approach. Prefill 12.9ms vs JAX 30.4ms at d=768.
-
-54. **At d=768, HBM bandwidth is the terminal bottleneck.** 162MB weights don't fit in
-    64MB L2, so every decode step re-fetches all weights from HBM. At d=512 (55MB
-    weights fit in L2), persistent B=4 achieves 55% BW util via L2 hits. At d=768,
-    BW util caps at ~30% (pipelined) because ~38% of step time is barrier overhead
-    and the rest is HBM-limited streaming. Only quantization (forbidden for learning
-    purposes) or reducing model size would fundamentally change this.
-
-58. **In-kernel page table lookups make Triton 2.5x slower.** Replacing contiguous
-    KV addressing (`base + t * D_HEAD`) with indirect paged addressing (`pool[page_table[t//64] * PAGE_ELEMS + ...]`) caused the Triton compiler to generate
-    a 2.5x slower kernel, even though the memory access pattern and data volume
-    are identical. The indirect load (page table → multiply → base address) prevents
-    Triton from optimizing the address progression. Verified with block_until_ready
-    profiling: the GPU kernel itself is 2.1x slower, not host overhead. Lesson:
-    Triton's compiler generates very different code for indirect vs strided access
-    patterns — keep hot-loop addressing simple and strided.
-
-59. **JIT-compiled JAX gather beats Triton copy kernel for paged→contiguous.** A
-    Triton kernel with per-page-per-head copy loops took ~0.8ms per call (dispatch
-    overhead). A `@jax.jit`-compiled `pool[precomputed_gather_indices]` takes 0.07ms
-    — 11x faster. The gather indices (2.4M int32 for d=768) are expensive to compute
-    in Python (~15ms with vectorized numpy) but are cached per page table configuration
-    and only rebuild when pages are allocated (every 64 decode steps). XLA compiles
-    the gather into a single GPU memcpy-like operation.
-
-60. **JAX's .at[].set() scatter copies the entire array.** Updating 9KB (one position's
-    KV) in a 5MB pool takes 0.37ms because JAX's functional update creates a new
-    5MB array. The actual GPU scatter (9KB write) takes <0.01ms — the rest is XLA
-    dispatch overhead. This is the fundamental cost of paging with immutable arrays.
-    Mutable GPU buffers (via CUDA) would eliminate this but break JAX's functional
-    model.
-
-61. **Speculative decoding acceptance scales with draft model quality, not size.**
-    Original attempt: d=128/1L draft (ppl=8.76) gave 36% acceptance at K=4. Revisit
-    with d=512/8L draft (ppl=2.91) gave 71% at K=4 — nearly 2x improvement. The
-    perplexity gap (8.76→5.40 vs 2.91→2.60) is the primary predictor of acceptance,
-    not the number of parameters. A draft model with similar perplexity to the target
-    will have high acceptance regardless of its architecture.
-
-62. **Speculative decoding needs >5x draft/target speed ratio at <80% acceptance.**
-    At d=512 draft (0.55ms/tok) vs d=768 target (1.0ms/tok), the speed ratio is ~2x.
-    Sequential verify cost: K × (t_draft + t_target) = K × 1.55ms > K × 1.0ms for
-    standard decode — mathematically impossible to profit. Even with parallel verify
-    (est. 1.5ms for K=4) + persistent draft (0.78ms for K=4), the estimated speedup
-    is only 1.6x. The small-model regime (both <100M params) has high throughput for
-    all models, compressing the speed ratio. Production-scale models (70B→7B, 10-20x
-    ratio) would see 2-3x speedup at 71% acceptance.
-
-63. **At D_HEAD=64, attention weight matrices overflow shared memory.** At d=1024
-    with 16 heads, D_HEAD=64. Weight matrix `(D_BLOCK, D_HEAD) = (1024, 64)` bf16
-    = 128KB > 101KB shared memory limit. At d=768 with 24 heads, D_HEAD=32 was fine
-    ((1024, 32) = 64KB). Fix: tile projections along D_BLOCK with PROJ_TILE=512.
-    Each tile loads (512, 64) = 64KB. Store h_norm to workspace buffer, reload per
-    tile. Adds ~10% overhead from extra loads but enables any D_HEAD size.
-
-64. **Batched projection tiling must separate Q, K, V into independent loops.**
-    When Q/K/V weight tiles are loaded in a single `tl.static_range` loop, the
-    compiler unrolls the loop and keeps all three tiles alive simultaneously:
-    3 × 64KB = 192KB > 101KB. Splitting into 3 separate tiling loops (one per
-    projection) ensures only one 64KB tile is in shared memory at a time.
-
-65. **At d=1024, pipelined and persistent decode are nearly identical (1.22-1.23x).**
-    Persistent's in-kernel overhead (barriers, argmax, step-sync) takes ~5% of the
-    ~2ms/step, same proportion as the host sync it eliminates. Both pipelined and
-    persistent give ~1.22x over sync'd. The persistent technique's advantage over
-    pipelined vanishes when step time is long enough (~2ms) that host dispatch
-    overlaps almost completely with kernel execution.
-
-66. **Batched decode scaling is sublinear at d=1024 due to HBM-bound weights.**
-    B=4: 1.71-1.98x, B=8: 2.19x, B=16: 2.10x (worse than B=8). With 485MB weights
-    far exceeding 64MB L2, every step must stream all weights from HBM regardless
-    of batch size. The per-sequence attention cost (8.4MB KV × B) adds linearly.
-    At B=16, the KV overhead (134MB) is 28% of total, explaining the B=16 regression.
-    The d=512 model (55MB weights, fits in L2) scaled much better: B=4 gave 3.6x.
+Downloads all 5 sources from HuggingFace, tokenizes with 32K BPE, shuffles, and
+combines into `data/tokens_v2/train.bin` (31.4GB). Idempotent — re-run to resume
+interrupted downloads. Takes 1-2 hours depending on network speed.
