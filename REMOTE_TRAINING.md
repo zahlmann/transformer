@@ -65,7 +65,6 @@ steps are CPU-bound and take ~30 min total.
 
 To speed up downloads, make sure `HF_HUB_ENABLE_HF_TRANSFER=1` is set:
 ```bash
-pip install hf_transfer
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run python -u prepare_data_v2.py
 ```
 
@@ -106,12 +105,6 @@ If phase 1 OOMs, reduce base bs until all phases fit.
 Adding `--mtp-heads 3` improves model quality but adds ~56% training time
 (3 extra passes over 32K vocab per step). Skip it for speed. Add it later
 if you want better quality.
-
-### JAX cache
-Create the cache dir to avoid compilation warnings:
-```bash
-mkdir -p .jax_cache
-```
 
 ### Disable XLA debug output
 ```bash

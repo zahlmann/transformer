@@ -5,7 +5,9 @@ Usage: uv run train.py --d-model 768 --n-heads 24 --n-kv-heads 6 --n-layers 12 \
 """
 
 import os
-os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), ".jax_cache")
+_jax_cache = os.path.join(os.path.dirname(__file__), ".jax_cache")
+os.makedirs(_jax_cache, exist_ok=True)
+os.environ["JAX_COMPILATION_CACHE_DIR"] = _jax_cache
 os.environ.setdefault("JAX_COMPILATION_CACHE_MAX_SIZE", str(2 * 1024**3))
 
 import argparse

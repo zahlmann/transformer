@@ -15,10 +15,8 @@ cd transformer
 
 # 3. Install dependencies
 uv sync
-mkdir -p .jax_cache
 
 # 4. Download and prepare training data (~1-2h)
-pip install hf_transfer
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run python -u prepare_data_v2.py
 
 # 5. Train (1 epoch, checkpoints every 5000 steps)
