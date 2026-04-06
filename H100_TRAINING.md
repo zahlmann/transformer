@@ -5,7 +5,8 @@
 ## On the GPU server
 
 ```bash
-# 1. Install uv (installs to ~/.local/bin, adds to PATH)
+# 1. Install tools
+apt-get update && apt-get install -y tmux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.local/bin/env
 
