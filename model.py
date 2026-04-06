@@ -4,6 +4,8 @@ Architecture: RMSNorm, RoPE, GQA, SwiGLU, no biases, tied embeddings.
 Supports multi-token prediction (MTP) heads.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -302,7 +304,7 @@ def _chunked_ce_fwd(h, weight, targets, chunk_size):
     return jnp.mean(logsumexp - target_logits)
 
 
-@jax.custom_vjp
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
 def fused_cross_entropy(h, weight, targets, chunk_size):
     """Fused output projection + cross-entropy without materializing logits.
 
@@ -314,15 +316,15 @@ def fused_cross_entropy(h, weight, targets, chunk_size):
 
 def _fused_ce_fwd(h, weight, targets, chunk_size):
     loss = _chunked_ce_fwd(h, weight, targets, chunk_size)
-    return loss, (h, weight, targets, chunk_size)
+    return loss, (h, weight, targets)
 
 
-def _fused_ce_bwd(res, g):
+def _fused_ce_bwd(chunk_size, res, g):
     """Backward: compute grads w.r.t. h and weight without materializing full logits.
 
     Computation in f32 for numerical stability, results cast to input dtypes.
     """
-    h, weight, targets, chunk_size = res
+    h, weight, targets = res
     h_dtype, w_dtype = h.dtype, weight.dtype
     h = h.astype(jnp.float32)
     weight = weight.astype(jnp.float32)
@@ -360,7 +362,7 @@ def _fused_ce_bwd(res, g):
     grad_h = grad_h - target_emb * scale
     grad_weight = grad_weight.at[targets].add(-h * scale)
 
-    return grad_h.astype(h_dtype), grad_weight.astype(w_dtype), None, None
+    return grad_h.astype(h_dtype), grad_weight.astype(w_dtype), None
 
 
 fused_cross_entropy.defvjp(_fused_ce_fwd, _fused_ce_bwd)
