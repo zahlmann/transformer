@@ -10,7 +10,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.local/bin/env
 
 # 2. Clone repo
-git clone git@github.com:zahlmann/transformer.git
+git clone https://github.com/zahlmann/transformer.git
 cd transformer
 
 # 3. Install dependencies
