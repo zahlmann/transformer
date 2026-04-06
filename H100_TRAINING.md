@@ -5,9 +5,9 @@
 ## On the GPU server
 
 ```bash
-# 1. Install uv
+# 1. Install uv (installs to ~/.local/bin, adds to PATH)
 curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.cargo/env
+source ~/.local/bin/env
 
 # 2. Clone repo
 git clone git@github.com:zahlmann/transformer.git
