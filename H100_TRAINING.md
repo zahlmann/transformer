@@ -20,10 +20,13 @@ uv sync
 # 4. Start a tmux session (survives disconnects)
 tmux new -s train
 
-# 5. Download and prepare training data (~1-2h)
+# 5. Set HuggingFace token (paste your read token here)
+export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 6. Download and prepare training data (~1-2h)
 HF_HUB_ENABLE_HF_TRANSFER=1 uv run python -u prepare_data_v2.py
 
-# 6. Train (1 epoch, checkpoints every 5000 steps)
+# 7. Train (1 epoch, checkpoints every 5000 steps)
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 64 --epochs 1 \
@@ -46,7 +49,7 @@ Resume from your backed-up checkpoint (see below):
 ```bash
 scp ~/transformer-backup/checkpoint.pkl user@NEW_SERVER:~/transformer/
 
-# Then on the new server, after setup steps 1-5:
+# Then on the new server, after setup steps 1-6:
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 64 --epochs 1 \
