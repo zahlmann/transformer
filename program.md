@@ -91,7 +91,7 @@ RTX 4080 Super, bs=16, ctx=512, no gradient checkpointing:
 
 With --no-checkpoint on RTX 4090 (24GB), bs=32: ~31K tok/s
   3 epochs × 7.85B tokens = 23.5B tokens total
-  Expected: ~8.7h on 4090, ~13-14h on 4080 Super
+  ~83h per epoch on 4080 Super, ~6h per epoch on B200 (bs=256, ~341K tok/s)
 
 Curriculum training (--curriculum flag):
   Phase 1 (10%): ctx=128, bs=bs×4
@@ -299,7 +299,6 @@ Training:
   model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
   train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
   data.py                              streaming data loading (v2 memmap for 8B tokens, legacy datasets)
-  prepare_data.py                      legacy data download + tokenization (v1)
   prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
 
 Inference kernels:
@@ -325,7 +324,7 @@ Documentation:
   program.md                           this file (read first)
   repo_explained_from_zero.md          ground-up GPU kernel explanation
   README.md                            project overview
-  REMOTE_TRAINING.md                   instructions for training on rented GPU
+  H100_TRAINING.md                     cloud GPU training setup guide
 ```
 
 ---
@@ -490,19 +489,19 @@ weights: `cp weights_dXXX.pkl weights.pkl`.
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 3 \
-  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  --curriculum --lr 3e-4 --no-checkpoint \
   2>&1 | tee training.log
 
 # On RTX 4090 (24GB), bs=32:
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 32 --epochs 3 \
-  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  --curriculum --lr 3e-4 --no-checkpoint \
   2>&1 | tee training.log
 ```
 
-Expected performance on RTX 4090 with bs=32: ~31K tok/s, ~8.7h for 3 epochs (23.5B tokens).
-On RTX 4080 Super with bs=16: ~28.4K tok/s, ~13-14h.
+RTX 4080 Super with bs=16: ~26K tok/s, ~83h per epoch.
+NVIDIA B200 with bs=256: ~341K tok/s, ~6h per epoch.
 
 `--no-checkpoint` disables gradient checkpointing (+12% speed, more VRAM).
 `--curriculum` enables sequence length warmup (ctx=128→256→512).
@@ -515,7 +514,7 @@ Checkpoints are saved every 2000 steps and at end of each epoch to `checkpoint.p
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 3 \
-  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint \
+  --curriculum --lr 3e-4 --no-checkpoint \
   --resume checkpoint.pkl \
   2>&1 | tee -a training.log
 ```

@@ -1,6 +1,6 @@
 # Single-GPU Transformer
 
-Training and inference for a decoder-only transformer, entirely from scratch on one **RTX 4080 Super (16GB VRAM)**. Custom Triton kernels for decode. JAX for training. No frameworks, no shortcuts.
+Training and inference for a decoder-only transformer, built from scratch. Custom Triton kernels for decode. JAX for training. No frameworks, no shortcuts.
 
 Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation.
 
@@ -20,10 +20,10 @@ See [`repo_explained_from_zero.md`](repo_explained_from_zero.md) for a ground-up
      8% Cosmopedia     — synthetic textbooks
 ```
 
-## Inference Performance
+## Inference Performance (RTX 4080 Super)
 
 ```
-RTX 4080 Super | 306M param model (d=1024, l=24)
+306M param model (d=1024, l=24)
 
   Multi-SM sync:       501 tok/s  (2.0 ms/tok, 30% BW util)
   Pipelined:           618 tok/s  (1.6 ms/tok, 1.23x)
@@ -38,11 +38,11 @@ The entire decode step — embedding, attention, FFN, output projection — runs
 ## Training Performance
 
 ```
-RTX 4080 Super, bs=16, --no-checkpoint: 28.4K tok/s
-RTX 4090, bs=32, --no-checkpoint:       ~31K tok/s
+RTX 4080 Super (bs=16):  ~26K tok/s
+NVIDIA B200 (bs=256):   ~341K tok/s
 
 3 epochs × 7.85B tokens = 23.5B total
-Expected: ~8.7h on 4090, ~13-14h on 4080 Super
+~6h per epoch on B200, ~83h per epoch on 4080 Super
 ```
 
 ## Quick Start
@@ -63,11 +63,11 @@ uv run profile_kernels.py
 # prepare training data (download + tokenize 7.85B tokens from 5 sources)
 uv run prepare_data_v2.py
 
-# train (d=1024, 24 layers, ~31K tok/s on RTX 4090)
+# train (see H100_TRAINING.md for cloud GPU setup)
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 3 \
-  --dataset combined_v2 --curriculum --lr 3e-4 --no-checkpoint
+  --curriculum --lr 3e-4 --no-checkpoint
 ```
 
 ## What's In Here
@@ -84,9 +84,8 @@ uv run python -u train.py \
 Training:
   model.py                          JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
   train.py                          AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
-  data.py                           streaming data loading (v2 memmap for 8B tokens, legacy datasets)
+  data.py                           streaming data loading (v2 memmap for 8B tokens)
   prepare_data_v2.py                v2 data pipeline: 5-source download, tokenize, shuffle, combine
-  prepare_data.py                   legacy data download + tokenization (v1)
 
 Inference kernels:
   kernels/multi_sm_decode.py        multi-SM decode with atomic barriers + KV-split
@@ -107,5 +106,6 @@ Benchmarking:
 
 Documentation:
   program.md                        agent program / development log
+  H100_TRAINING.md                  cloud GPU training setup guide
   repo_explained_from_zero.md       ground-up GPU kernel explanation
 ```
