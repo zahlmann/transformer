@@ -601,13 +601,15 @@ def _get_tokenizer_path():
 
 
 def _tokenize_source(source_name, raw_path, tok_path, target_tokens, out_dir):
-    """Tokenize a source with EOS tokens between documents."""
+    """Tokenize a source with EOS tokens between documents. Streams to disk."""
     from tokenizers import Tokenizer
 
-    cache_path = out_dir / f"{source_name}.npz"
-    if cache_path.exists():
-        data = np.load(cache_path)
-        n = len(data["train"]) + len(data["val"])
+    cache_bin = out_dir / f"{source_name}.bin"
+    cache_meta = out_dir / f"{source_name}_meta.json"
+    if cache_bin.exists() and cache_meta.exists():
+        with open(cache_meta) as f:
+            meta = json.load(f)
+        n = meta["total_tokens"]
         print(f"  {source_name}: cached, {n/1e9:.2f}B tokens")
         return source_name, n
 
@@ -617,14 +619,14 @@ def _tokenize_source(source_name, raw_path, tok_path, target_tokens, out_dir):
     print(f"  Tokenizing {source_name} (target: {target_tokens/1e9:.1f}B tokens)...")
     t0 = time.time()
 
-    token_chunks = []
     total_tokens = 0
     batch_texts = []
     batch_chars = 0
     chunk_chars = 50_000_000  # 50M char batches
 
-    with open(raw_path) as f:
-        for line in f:
+    # stream tokens directly to flat binary file (no RAM accumulation)
+    with open(cache_bin, "wb") as fout, open(raw_path) as fin:
+        for line in fin:
             doc = json.loads(line)
             text = doc.get("text", doc.get("content", ""))
             if len(text) < 50:
@@ -635,10 +637,10 @@ def _tokenize_source(source_name, raw_path, tok_path, target_tokens, out_dir):
             if batch_chars >= chunk_chars:
                 encodings = tok.encode_batch(batch_texts)
                 for enc in encodings:
-                    ids = enc.ids
-                    chunk_arr = np.array(ids + [EOS_TOKEN_ID], dtype=np.int32)
-                    token_chunks.append(chunk_arr)
-                    total_tokens += len(chunk_arr)
+                    ids = enc.ids + [EOS_TOKEN_ID]
+                    arr = np.array(ids, dtype=np.int32)
+                    arr.tofile(fout)
+                    total_tokens += len(arr)
                 batch_texts = []
                 batch_chars = 0
                 elapsed = time.time() - t0
@@ -646,71 +648,81 @@ def _tokenize_source(source_name, raw_path, tok_path, target_tokens, out_dir):
                 if total_tokens >= target_tokens:
                     break
 
-    # flush remaining
-    if batch_texts:
-        encodings = tok.encode_batch(batch_texts)
-        for enc in encodings:
-            ids = enc.ids
-            chunk_arr = np.array(ids + [EOS_TOKEN_ID], dtype=np.int32)
-            token_chunks.append(chunk_arr)
-            total_tokens += len(chunk_arr)
+        # flush remaining
+        if batch_texts:
+            encodings = tok.encode_batch(batch_texts)
+            for enc in encodings:
+                ids = enc.ids + [EOS_TOKEN_ID]
+                arr = np.array(ids, dtype=np.int32)
+                arr.tofile(fout)
+                total_tokens += len(arr)
 
-    tokens = np.concatenate(token_chunks)
-    del token_chunks
+    # save metadata
+    with open(cache_meta, "w") as f:
+        json.dump({"total_tokens": total_tokens}, f)
 
-    # split val
-    n_val = max(int(len(tokens) * VAL_FRACTION), 10000)
-    val_tok = tokens[:n_val]
-    train_tok = tokens[n_val:]
-
-    np.savez(cache_path, train=train_tok, val=val_tok)
-    print(f"    {source_name}: {len(train_tok)/1e6:.1f}M train + {len(val_tok)/1e6:.1f}M val "
-          f"({time.time()-t0:.0f}s)")
-    return source_name, len(tokens)
+    elapsed = time.time() - t0
+    print(f"    {source_name}: {total_tokens/1e9:.2f}B tokens ({elapsed:.0f}s)")
+    return source_name, total_tokens
 
 
 def _combine_tokenized(source_configs, out_dir, dataset_name="main"):
     """Combine tokenized sources into flat binary + shuffled output."""
     print(f"\n--- Combining {dataset_name} dataset ---")
-    train_sizes = {}
-    val_sizes = {}
-    source_stats = {}
+    source_sizes = {}
 
     for name in source_configs:
-        cache = out_dir / f"{name}.npz"
-        if cache.exists():
-            data = np.load(cache)
-            train_sizes[name] = len(data["train"])
-            val_sizes[name] = len(data["val"])
-            source_stats[name] = train_sizes[name] + val_sizes[name]
-            print(f"  {name}: {train_sizes[name]/1e9:.2f}B train, {val_sizes[name]/1e6:.1f}M val")
-            del data
+        meta_file = out_dir / f"{name}_meta.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                meta = json.load(f)
+            source_sizes[name] = meta["total_tokens"]
+            print(f"  {name}: {source_sizes[name]/1e9:.2f}B tokens")
 
-    total_train = sum(train_sizes.values())
-    total_val = sum(val_sizes.values())
-    print(f"  Total: {total_train/1e9:.2f}B train, {total_val/1e6:.1f}M val")
+    total_all = sum(source_sizes.values())
+    n_val_total = max(int(total_all * VAL_FRACTION), 100000)
+    # distribute val tokens proportionally across sources
+    val_per_source = {}
+    for name, n in source_sizes.items():
+        val_per_source[name] = max(int(n_val_total * n / total_all), 10000)
 
-    # write val
+    print(f"  Total: {total_all/1e9:.2f}B tokens, val: {sum(val_per_source.values())/1e6:.1f}M")
+
+    # write val (small — read first N tokens from each source .bin)
     val_parts = []
     for name in source_configs:
-        cache = out_dir / f"{name}.npz"
-        if cache.exists():
-            val_parts.append(np.load(cache)["val"])
+        src_bin = out_dir / f"{name}.bin"
+        if src_bin.exists() and name in val_per_source:
+            src = np.memmap(src_bin, dtype=np.int32, mode="r")
+            n_val = min(val_per_source[name], len(src))
+            val_parts.append(np.array(src[:n_val]))
+            del src
     val_combined = np.concatenate(val_parts)
     del val_parts
     np.save(out_dir / "val.npy", val_combined)
 
-    # write train to flat binary
+    # write train to flat binary (skip val tokens from each source)
     train_bin = out_dir / "train.bin"
     print(f"Writing train data to flat binary...")
+    total_train = 0
+    source_stats = {}
     with open(train_bin, "wb") as f:
         for name in source_configs:
-            cache = out_dir / f"{name}.npz"
-            if cache.exists():
-                arr = np.load(cache)["train"]
-                arr.tofile(f)
-                print(f"  wrote {name}: {len(arr)/1e9:.2f}B tokens")
-                del arr
+            src_bin = out_dir / f"{name}.bin"
+            if src_bin.exists() and name in val_per_source:
+                src = np.memmap(src_bin, dtype=np.int32, mode="r")
+                skip = val_per_source[name]
+                # stream in 100M token chunks to avoid loading all into RAM
+                chunk = 100_000_000
+                written = 0
+                for start in range(skip, len(src), chunk):
+                    end = min(start + chunk, len(src))
+                    np.array(src[start:end]).tofile(f)
+                    written += end - start
+                source_stats[name] = source_sizes[name]
+                total_train += written
+                print(f"  wrote {name}: {written/1e9:.2f}B train tokens")
+                del src
 
     # shuffle via memmap
     print("Shuffling (memory-mapped, chunk-by-chunk)...")
