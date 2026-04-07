@@ -62,6 +62,7 @@ def _multi_sm_decode(
     VOCAB_SIZE: tl.constexpr,
     VOCAB_PAD: tl.constexpr,
     FF_PER_BLOCK: tl.constexpr,
+    FFN_PARTIAL_OFF: tl.constexpr,
     ATTN_ML_OFF: tl.constexpr,
     BARRIER_OFF: tl.constexpr,
     DONE_OFF: tl.constexpr,
@@ -76,7 +77,8 @@ def _multi_sm_decode(
     token_id = tl.load(token_id_ptr)
     pos = tl.load(pos_ptr)
 
-    partial_ptr = workspace_ptr
+    attn_partial_ptr = workspace_ptr                     # attention O-proj results
+    ffn_partial_ptr = workspace_ptr + FFN_PARTIAL_OFF    # FFN partial results (separate to avoid race)
     attn_ml_ptr = workspace_ptr + ATTN_ML_OFF
     barrier_ptr = workspace_ptr + BARRIER_OFF
     done_ptr = workspace_ptr + DONE_OFF
@@ -129,7 +131,7 @@ def _multi_sm_decode(
         cache_off = kv_head * MAX_SEQ * D_HEAD
 
         # Store h_norm for tiled projections
-        tl.store(partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
+        tl.store(attn_partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
 
         Q = tl.zeros((D_HEAD,), dtype=tl.float32)
         K_new = tl.zeros((D_HEAD,), dtype=tl.float32)
@@ -137,7 +139,7 @@ def _multi_sm_decode(
         for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
             dt = dd + tl.arange(0, PROJ_TILE)
             dt_mask = dt < D_MODEL
-            h_tile = tl.load(partial_ptr + pid * D_BLOCK + dt,
+            h_tile = tl.load(attn_partial_ptr + pid * D_BLOCK + dt,
                              mask=dt_mask, other=0.0).to(tl.bfloat16)
             wq_t = tl.load(packed_w_ptr + wq_off + dt[:, None] * D_MODEL + hd[None, :],
                            mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
@@ -153,7 +155,7 @@ def _multi_sm_decode(
         cos_val = tl.load(cos_ptr + pos * D_HALF + rope_lo).to(tl.float32)
         sin_val = tl.load(sin_ptr + pos * D_HALF + rope_lo).to(tl.float32)
 
-        scratch = partial_ptr + pid * D_BLOCK
+        scratch = attn_partial_ptr + pid * D_BLOCK
         # Rotate Q
         tl.store(scratch + dh, Q)
         q_lo = tl.load(scratch + rope_lo)
@@ -171,8 +173,11 @@ def _multi_sm_decode(
         K_new = tl.load(scratch + dh)
 
         # Store K_new (with RoPE) and V_new to output cache
-        tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
-        tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+        # Only one block per kv_head writes to avoid redundant concurrent stores
+        is_kv_primary = (head_id == kv_head * GQA_GROUP)
+        if is_kv_primary:
+            tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
+            tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
 
         # ── Split KV attention with online softmax ──
         m_i = tl.full((1,), value=-1e9, dtype=tl.float32)
@@ -190,15 +195,17 @@ def _multi_sm_decode(
                             mask=tile_mask[:, None], other=0.0,
                             eviction_policy='evict_last').to(tl.float32)
             K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
-            tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
-                    K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+            if is_kv_primary:
+                tl.store(kv_out_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                        K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
 
             V_tile = tl.load(kv_in_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
                             mask=tile_mask[:, None], other=0.0,
                             eviction_policy='evict_last').to(tl.float32)
             V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
-            tl.store(kv_out_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
-                    V_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+            if is_kv_primary:
+                tl.store(kv_out_ptr + vc_base + cache_off + tile_pos[:, None] * D_HEAD + dh[None, :],
+                        V_tile.to(tl.bfloat16), mask=tile_mask[:, None])
 
             s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
             s = tl.where(tile_mask, s, -1e9)
@@ -220,18 +227,18 @@ def _multi_sm_decode(
             wo_t = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + dt[None, :],
                            mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
             o_tile = tl.dot(attn_out[None, :].to(tl.bfloat16), wo_t).to(tl.float32).sum(axis=0)
-            tl.store(partial_ptr + pid * D_BLOCK + dt, o_tile, mask=dt_mask)
+            tl.store(attn_partial_ptr + pid * D_BLOCK + dt, o_tile, mask=dt_mask)
         tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
         tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
 
-        # Split barrier
-        b0 = layer * 2
-        old_cnt = tl.atomic_add(barrier_ptr + b0, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + b0, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + b0, 0.0, sem='acquire', scope='gpu') < 1.0:
+        # Global memory fence before and after barrier
+        tl.debug_barrier()
+        tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        b0 = layer * 3
+        tl.atomic_add(barrier_ptr + b0, 1.0, sem='acq_rel', scope='gpu')
+        while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
             pass
+        tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
 
         # ── PHASE 2: Merge attention + RMSNorm2 + SwiGLU FFN ──
         attn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
@@ -245,7 +252,7 @@ def _multi_sm_decode(
             for s in tl.static_range(KV_SPLITS):
                 m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
                 l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
-                o_s = tl.load(partial_ptr + (head * KV_SPLITS + s) * D_BLOCK + d, mask=d_mask, other=0.0)
+                o_s = tl.load(attn_partial_ptr + (head * KV_SPLITS + s) * D_BLOCK + d, mask=d_mask, other=0.0)
                 w = l_s * tl.exp(m_s - m_max_val)
                 l_total = l_total + w
                 o_merged = o_merged + o_s * w
@@ -281,21 +288,28 @@ def _multi_sm_decode(
                              mask=ff_mask[:, None] & d_mask[None, :], other=0.0).to(tl.bfloat16)
             ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
 
-        tl.store(partial_ptr + pid * D_BLOCK + d, ffn_partial, mask=d_mask)
+        tl.store(ffn_partial_ptr + pid * D_BLOCK + d, ffn_partial, mask=d_mask)
 
-        b1 = layer * 2 + 1
-        old_cnt = tl.atomic_add(barrier_ptr + b1, 1.0, sem='release', scope='gpu')
-        if old_cnt >= TOTAL_BLOCKS - 1:
-            _ = tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu')
-            tl.atomic_add(done_ptr + b1, 1.0, sem='release', scope='gpu')
-        while tl.atomic_add(done_ptr + b1, 0.0, sem='acquire', scope='gpu') < 1.0:
+        tl.debug_barrier()
+        tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        b1 = layer * 3 + 1
+        tl.atomic_add(barrier_ptr + b1, 1.0, sem='acq_rel', scope='gpu')
+        while tl.atomic_add(barrier_ptr + b1, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
             pass
+        tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
 
         # ── PHASE 3: Reduce FFN + residual ──
         ffn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
         for i in tl.range(TOTAL_BLOCKS):
-            ffn_total += tl.load(partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
+            ffn_total += tl.load(ffn_partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
         h = h + ffn_total
+
+        # Barrier after reduce: prevent next iteration from overwriting before all reads complete
+        tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        b2 = layer * 3 + 2
+        tl.atomic_add(barrier_ptr + b2, 1.0, sem='acq_rel', scope='gpu')
+        while tl.atomic_add(barrier_ptr + b2, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+            pass
 
     # ── OUTPUT: final RMSNorm + tied output projection ──
     ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
@@ -325,12 +339,10 @@ def _multi_sm_decode(
     tl.store(argmax_ptr + pid * 2, best_val)
     tl.store(argmax_ptr + pid * 2 + 1, best_idx)
 
-    N_BARRIERS: tl.constexpr = 2 * N_LAYERS
-    old_cnt = tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
-    if old_cnt >= TOTAL_BLOCKS - 1:
-        _ = tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu')
-        tl.atomic_add(done_ptr + N_BARRIERS, 1.0, sem='release', scope='gpu')
-    while tl.atomic_add(done_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < 1.0:
+    tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+    N_BARRIERS: tl.constexpr = 3 * N_LAYERS
+    tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='acq_rel', scope='gpu')
+    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
         pass
 
     if pid == 0:
@@ -375,10 +387,13 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
     ff_per_block = ((raw_ff + block_k - 1) // block_k) * block_k
 
     # Workspace layout
-    attn_ml_off = total_blocks * d_block
+    # Workspace layout: separate attn and FFN partial buffers to avoid race
+    n_barriers = 3 * n_layers + 1  # 3 per layer (attn + FFN + post-reduce) + 1 for output
+    ffn_partial_off = total_blocks * d_block          # attn partials: [0, ffn_partial_off)
+    attn_ml_off = ffn_partial_off + total_blocks * d_block  # FFN partials: [ffn_partial_off, attn_ml_off)
     barrier_off = attn_ml_off + total_blocks * 2
-    done_off = barrier_off + 32
-    argmax_off = done_off + 32
+    done_off = barrier_off + n_barriers
+    argmax_off = done_off + n_barriers
     workspace_size = argmax_off + 2 * total_blocks
 
     workspace = jnp.zeros((workspace_size,), dtype=jnp.float32)
@@ -406,6 +421,7 @@ def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_s
         KV_SPLITS=kv_splits, TOTAL_BLOCKS=total_blocks,
         VOCAB_SIZE=vocab_size, VOCAB_PAD=vocab_pad,
         FF_PER_BLOCK=ff_per_block,
+        FFN_PARTIAL_OFF=ffn_partial_off,
         ATTN_ML_OFF=attn_ml_off,
         BARRIER_OFF=barrier_off,
         DONE_OFF=done_off,

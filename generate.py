@@ -91,14 +91,14 @@ def _prefill(params, config, prompt_ids, vocab_size):
     logits, k_caches, v_caches = prefill_with_kv(params, config, x)
     _ = logits.block_until_ready()
 
-    w = prepare_decode_weights_nlayer(params, config, vocab_size)
+    w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=1)
     kv_packed = pack_kv_caches(k_caches, v_caches)
     first_logits = logits[prompt_len - 1]
 
     # Warmup decode step to trigger Triton JIT compilation
     warmup_tok = jnp.argmax(first_logits)
     _tok, _, _kv = multi_sm_decode_nlayer(
-        w, config, warmup_tok, prompt_len, kv_packed, vocab_size)
+        w, config, warmup_tok, prompt_len, kv_packed, vocab_size, kv_splits=1)
     _ = int(_tok)
 
     return w, first_logits, prompt_len, kv_packed
@@ -127,7 +127,7 @@ def stream_tokens(params, config, prompt_ids, max_tokens=128,
     tok = jnp.int32(first_id)
     for i in range(max_tokens - 1):
         tok_out, logits, kv_packed = multi_sm_decode_nlayer(
-            w, config, tok, start_pos + i, kv_packed, vocab_size)
+            w, config, tok, start_pos + i, kv_packed, vocab_size, kv_splits=1)
 
         if temperature == 0.0 and rep_penalty == 1.0:
             token_id = int(tok_out)

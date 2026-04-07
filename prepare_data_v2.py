@@ -598,7 +598,7 @@ def tokenize_all():
 
     meta = {
         "vocab_size": VOCAB_SIZE,
-        "tokenizer_path": str(tok_path),
+        "tokenizer_path": str(tok_path.relative_to(Path(__file__).parent)),
         "sources": source_stats,
         "total_train_tokens": total_train_tok,
         "total_val_tokens": total_val_tok,

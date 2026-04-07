@@ -42,7 +42,10 @@ def load_data(context_len):
     n_train_seqs = (len(train_mmap) - 1) // context_len
     print(f"  {n_train_seqs:,} train seqs (streamed), {len(val_x):,} val seqs, vocab={vocab_size}")
 
-    tok = Tokenizer.from_file(meta["tokenizer_path"])
+    tok_path = meta["tokenizer_path"]
+    if not os.path.isabs(tok_path):
+        tok_path = os.path.join(os.path.dirname(__file__), tok_path)
+    tok = Tokenizer.from_file(tok_path)
     decode_tokens = lambda ids: tok.decode(list(int(i) for i in ids))
 
     # save vocab mapping for inference (generate.py, serve.py)
@@ -74,6 +77,9 @@ def load_bpe_vocab():
         saved = pickle.load(f)
     if saved.get("tokenizer_type") == "trained_bpe":
         from tokenizers import Tokenizer
-        tok = Tokenizer.from_file(saved["tokenizer_path"])
+        tok_path = saved["tokenizer_path"]
+        if not os.path.isabs(tok_path):
+            tok_path = os.path.join(os.path.dirname(__file__), tok_path)
+        tok = Tokenizer.from_file(tok_path)
         saved["decode_fn"] = lambda ids: tok.decode(list(int(i) for i in ids))
     return saved
