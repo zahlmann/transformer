@@ -44,10 +44,12 @@ def main():
                         help="Sequence length curriculum: start short (128), grow to full ctx")
     parser.add_argument("--no-checkpoint", action="store_true",
                         help="Disable gradient checkpointing (faster but uses more VRAM)")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Path to tokenized data dir (default: data/tokens_v2)")
     args = parser.parse_args()
 
-    # data — v2 streaming only (combined_v2, trained_bpe 32K)
-    data = load_data(context_len=args.context_len)
+    # data — streaming memmap dataset (v2 or v3)
+    data = load_data(context_len=args.context_len, data_dir=args.data_dir)
     vocab_size = data["vocab_size"]
     assert data.get("streaming", False), "expected v2 streaming dataset"
 

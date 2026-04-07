@@ -298,8 +298,9 @@ Variants:
 Training:
   model.py                             JAX transformer (RMSNorm, RoPE, SwiGLU, GQA, fused CE, MTP)
   train.py                             AdamW training (bf16 fwd, cuDNN FlashAttn, curriculum, checkpointing)
-  data.py                              streaming data loading (v2 memmap for 8B tokens, legacy datasets)
+  data.py                              streaming data loading (v2/v3 memmap, legacy datasets)
   prepare_data_v2.py                   v2 data pipeline: 5-source download, tokenize, shuffle, combine
+  prepare_data_v3.py                   v3 data pipeline: 6 sources (28B) + annealing (3B)
 
 Inference kernels:
   kernels/multi_sm_decode.py           multi-SM decode with atomic barriers + KV-split
@@ -322,6 +323,7 @@ Benchmarking:
 
 Documentation:
   program.md                           this file (read first)
+  data_research.md                     training data research findings and recommendations
   repo_explained_from_zero.md          ground-up GPU kernel explanation
   README.md                            project overview
   H100_TRAINING.md                     cloud GPU training setup guide
@@ -508,79 +510,93 @@ Best sampling settings:
 
 ---
 
-## Current Task: Research and Prepare Data for Continued Training
+## Completed: Research and Prepare Data for Continued Training
 
-The model has completed 3 epochs on 7.85B tokens (val_loss=2.86, ppl=17.42).
-The Triton decode kernel works and generates coherent text. The question now:
-**how do we continue training to improve quality?**
+Research complete. See `data_research.md` for full findings and rationale.
 
-### Context
+**Key findings:**
+- Tokens/param ratio (25.6x unique) is extremely low vs peers (SmolLM2-360M: 11,000x)
+- 3 epochs on current data is fine (up to 4 safe), but more unique data is the lever
+- Data mix was too heavy on code (29%) and math (19%) vs general-purpose models (70%+ web)
+- Annealing on high-quality data is standard practice (Llama 3, SmolLM2, MiniCPM)
+- Instruction tuning degrades quality at 306M scale — skip it
+
+**Implemented:** `prepare_data_v3.py` creates expanded v3 dataset + annealing dataset.
+Run `uv run prepare_data_v3.py` to download and prepare.
+
+---
+
+## Current Task: Run v3 Data Preparation and Train
+
+### Step 1: Prepare v3 data
+
+```bash
+# Download and tokenize main dataset (~28B tokens, several hours)
+uv run prepare_data_v3.py
+
+# Then prepare annealing dataset (~3B tokens)
+uv run prepare_data_v3.py --anneal-only
+```
+
+### Step 2: Train on v3 data (Phase 1 — extended pretraining)
+
+```bash
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 2 \
+  --data-dir data/tokens_v3 \
+  --curriculum --lr 3e-4 --no-checkpoint \
+  --resume checkpoint.pkl \
+  2>&1 | tee training_v3.log
+```
+
+### Step 3: Anneal (Phase 2 — high-quality cooldown)
+
+```bash
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 512 --batch-size 16 --epochs 1 \
+  --data-dir data/tokens_v3_anneal \
+  --lr 3e-5 --no-checkpoint \
+  --resume checkpoint.pkl \
+  2>&1 | tee training_anneal.log
+```
+
+### Step 4: Context extension (Phase 3 — optional)
+
+```bash
+uv run python -u train.py \
+  --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
+  --context-len 1024 --batch-size 8 --epochs 1 \
+  --data-dir data/tokens_v3 \
+  --lr 1e-4 --no-checkpoint \
+  --resume checkpoint.pkl \
+  2>&1 | tee training_ctx1024.log
+```
+
+### v3 Data Mix (~28B unique tokens)
 
 ```
-Current model: 306M params, d=1024, h=16, kv=4, l=24, ctx=512
-Training so far: 3 epochs × 7.85B tokens = 23.5B tokens seen
-Current data mix:
-  34% FineWeb-Edu (quality-filtered web, score >= 3)
-  30% StarCoder code (13 languages)
-  19% OpenWebMath (math with LaTeX)
-   9% Wikipedia
-   8% Cosmopedia (synthetic textbooks)
-val_loss=2.86, ppl=17.42 (after 3 epochs)
+Source                  Tokens    Pct    HuggingFace Path
+FineWeb-Edu (>= 3)     10.0B    36%    HuggingFaceFW/fineweb-edu sample-10BT
+DCLM-Edu                5.0B    18%    HuggingFaceTB/dclm-edu
+StarCoder               5.5B    20%    bigcode/starcoderdata
+OpenWebMath             3.0B    11%    open-web-math/open-web-math
+Wikipedia               2.0B     7%    wikimedia/wikipedia
+Cosmopedia v2           2.5B     9%    HuggingFaceTB/smollm-corpus cosmopedia-v2
+─────────────────────────────────────
+Total                  28.0B   100%
+
+Web: 70% | Code: 20% | Math: 11%
 ```
 
-The model has seen each training token ~3 times. Scaling laws (Chinchilla, etc.)
-suggest ~6B tokens would be compute-optimal for 306M params, so we're well past that
-at 23.5B. But quality can still improve with better data.
+### Annealing Data Mix (~3B tokens)
 
-### What to research
-
-1. **Should we train more epochs on the same data?** Diminishing returns? At what
-   point does overfit set in for a 306M model with 7.85B unique tokens?
-
-2. **Should we change the data mix?** The current mix is heavy on code (30%) and
-   math (19%). For a general-purpose model, is this optimal? Look at what Llama 3,
-   SmolLM2, Phi, and other recent small models use.
-
-3. **Should we add new data sources?** Consider:
-   - Instruction-following data (FLAN, OpenAssistant, UltraChat)
-   - More diverse web data (RedPajama, Dolma, DCLM)
-   - Conversation/dialogue data
-   - Books (Project Gutenberg, BookCorpus alternatives)
-   - Reasoning traces (GSM8K with chain-of-thought)
-
-4. **Should we do a second training phase?** Many modern models use multi-phase:
-   - Phase 1: large-scale pretraining on web data
-   - Phase 2: "annealing" on high-quality curated data at lower LR
-   - Phase 3: instruction tuning / alignment
-   Would a Phase 2 annealing pass on curated data improve our model?
-
-5. **Context length**: currently 512. Should we extend to 1024 or 2048 for the
-   next training phase? What data considerations does this require?
-
-### What to do
-
-1. Research the above questions. Check Llama 3 paper, SmolLM2 paper, Phi papers,
-   Chinchilla scaling laws, and any other relevant work. Use web search.
-
-2. Write a concrete recommendation: what data, what mix, how much, what training
-   schedule (LR, epochs, curriculum, phases).
-
-3. Implement the data preparation:
-   - Add new data sources to `prepare_data_v2.py` if needed
-   - Adjust the data mix ratios
-   - Create a new combined dataset (e.g. `data/tokens_v3/`)
-   - Update the training command in this file
-
-4. Save research findings and recommendations to a file (e.g. `data_research.md`)
-   so the rationale is documented.
-
-### What NOT to do
-
-- Don't change the model architecture (keep 306M, d=1024, etc.)
-- Don't change the training code (train.py is working)
-- Don't change the tokenizer (keep the 32K BPE already trained)
-- Don't start training — just prepare the data and document the plan
-- Don't delete existing data in `data/tokens_v2/`
+```
+FineWeb-Edu score >= 4  1.5B    50%    HuggingFaceFW/fineweb-edu (score filter)
+FineMath 4+             0.8B    27%    HuggingFaceTB/finemath finemath-4plus
+Stack-Edu               0.7B    23%    HuggingFaceTB/stack-edu
+```
 
 ---
 

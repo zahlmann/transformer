@@ -1,4 +1,4 @@
-"""Load v2 streaming dataset (trained BPE, vocab 32k, multi-source mix)."""
+"""Load streaming dataset (trained BPE, vocab 32k, multi-source mix)."""
 
 import json
 import os
@@ -16,22 +16,22 @@ def _make_sequences(arr, context_len):
     return x, y
 
 
-def load_data(context_len):
-    """Load v2 tokenized dataset. Returns memmap train stream + materialized val splits."""
+def load_data(context_len, data_dir=None):
+    """Load tokenized dataset. Returns memmap train stream + materialized val splits."""
     from tokenizers import Tokenizer
 
-    token_dir = os.path.join(DATA_DIR, "tokens_v2")
+    token_dir = data_dir or os.path.join(DATA_DIR, "tokens_v2")
     train_bin = os.path.join(token_dir, "train.bin")
     val_npy = os.path.join(token_dir, "val.npy")
     meta_path = os.path.join(token_dir, "metadata.json")
 
-    assert os.path.exists(train_bin), f"V2 dataset not found at {train_bin}. Run: uv run prepare_data_v2.py"
+    assert os.path.exists(train_bin), f"Dataset not found at {train_bin}. Run: uv run prepare_data_v3.py"
     assert os.path.exists(meta_path), f"Metadata not found at {meta_path}"
 
     with open(meta_path) as f:
         meta = json.load(f)
 
-    print(f"Loading v2 dataset ({meta['total_train_tokens']/1e9:.2f}B train tokens)...")
+    print(f"Loading dataset from {token_dir} ({meta['total_train_tokens']/1e9:.2f}B train tokens)...")
     print(f"  Sources: {', '.join(f'{k} ({v/1e9:.1f}B)' for k, v in meta['sources'].items())}")
 
     train_mmap = np.memmap(train_bin, dtype=np.int32, mode="r")
