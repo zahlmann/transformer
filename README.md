@@ -6,9 +6,9 @@ Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-st
 
 ## Documentation
 
+- [`program.md`](knowledge/program.md) — the agent program that drove development, with full architecture decisions and optimization history
 - [`inference_explained.md`](knowledge/inference_explained.md) — ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all inference techniques used
 - [`training_explained.md`](knowledge/training_explained.md) — first-principles explanation of the training pipeline (data, model, training loop)
-- [`program.md`](knowledge/program.md) — full development log and agent program
 - [`data_research.md`](knowledge/data_research.md) — training data research and rationale
 
 ## Current Model
