@@ -1,1093 +1,2133 @@
 # Custom GPU Kernels for Transformer Inference
 
-How to write Triton kernels that fuse an entire transformer decode step into a single
-GPU launch — from register-level data flow to multi-SM parallelism with atomic barriers.
-No GPU experience required — just Python and a rough idea of what neural nets do.
+How we fuse an entire 24-layer, 306M-parameter transformer decode step into a single
+GPU kernel launch — and why that makes it fast. This document explains every line of
+inference code in the project, from first principles. You only need to know Python.
+
+**Files covered:**
+- `kernels/fused_decode_nlayer.py` — weight/KV packing utilities + single-SM decode kernel
+- `kernels/multi_sm_decode.py` — multi-SM fused decode kernel (the fast one)
+- `generate.py` — streaming text generation CLI
+- `profile_kernels.py` — benchmarking and roofline analysis
 
 ---
 
 ## Table of Contents
 
-**Part I: The Fundamentals (d=64, 1 layer, 66K params)**
-
-1. [The Problem](#1-the-problem)
-2. [How GPUs Actually Work](#2-how-gpus-actually-work)
+1. [How GPUs Work](#1-how-gpus-work)
+2. [GPU Memory Hierarchy](#2-gpu-memory-hierarchy)
 3. [The Memory Wall](#3-the-memory-wall)
-4. [Our Transformer (the Tiny One)](#4-our-transformer-the-tiny-one)
-5. [What Happens When JAX Runs Your Model](#5-what-happens-when-jax-runs-your-model)
-6. [The Big Idea: One Kernel to Rule Them All](#6-the-big-idea-one-kernel-to-rule-them-all)
-7. [Triton: GPU Programming for Humans](#7-triton-gpu-programming-for-humans)
-8. [The Prefill Kernel, Line by Line](#8-the-prefill-kernel-line-by-line)
-9. [KV Cache: Why We Don't Recompute Everything](#9-kv-cache-why-we-dont-recompute-everything)
-10. [The Decode Kernel, Line by Line](#10-the-decode-kernel-line-by-line)
+4. [Triton: GPU Programming in Python](#4-triton-gpu-programming-in-python)
+5. [Our Transformer Model](#5-our-transformer-model)
+6. [Prefill and Decode](#6-prefill-and-decode)
+7. [Weight Packing](#7-weight-packing)
+8. [KV Cache Packing](#8-kv-cache-packing)
+9. [The Single-SM Decode Kernel](#9-the-single-sm-decode-kernel)
+10. [The Multi-SM Decode Kernel](#10-the-multi-sm-decode-kernel)
 11. [The Generation Loop](#11-the-generation-loop)
-12. [Results and Why It's Faster](#12-results-and-why-its-faster)
-
-**Part II: Scaling Up (d=512, 8 layers, 30M params)**
-
-13. [Scaling the Model](#13-scaling-the-model)
-14. [Multi-SM Decode: Using the Whole GPU](#14-multi-sm-decode-using-the-whole-gpu)
-15. [What Didn't Work](#15-what-didnt-work)
-16. [Key Lessons](#16-key-lessons)
-
-**Part III: Production Scale (d=768+, 12-24 layers)**
-
-17. [GQA: Grouped Query Attention](#17-gqa-grouped-query-attention)
-18. [Non-Power-of-2 D_MODEL (D_BLOCK Padding)](#18-non-power-of-2-d_model-d_block-padding)
-19. [L2 Cache Hints and Bandwidth Optimization](#19-l2-cache-hints-and-bandwidth-optimization)
-20. [Tensor Core Batched Projections](#20-tensor-core-batched-projections)
-21. [Sampling and Decoding Strategies](#21-sampling-and-decoding-strategies)
+12. [Profiling and Roofline Analysis](#12-profiling-and-roofline-analysis)
 
 ---
 
-## 1. The Problem
+## 1. How GPUs Work
 
-You have a trained transformer model. You want to generate text with it — feed in a prompt,
-get tokens out, one at a time. The standard approach uses JAX (or PyTorch), which compiles
-your Python code into GPU operations via XLA. This works, but it's slow.
+A GPU is a chip with thousands of tiny processors that all run the same program
+simultaneously. Understanding four concepts is enough to understand our kernels.
 
-**How slow?** For our tiny model (66K parameters, character-level Shakespeare), JAX generates
-at 185 tokens/second. Our custom Triton kernel does the same job at 740 tokens/second.
-**4x faster**, same outputs.
+### Streaming Multiprocessors (SMs)
 
-The speed difference isn't about better math. Both do identical matrix multiplications.
-The difference is about **where the data lives** during computation.
+The RTX 4080 Super has **80 SMs** (Streaming Multiprocessors). Each SM is like a
+small independent computer with its own registers, shared memory, and execution units.
+When you launch a GPU program (called a "kernel"), the GPU assigns blocks of work
+to SMs. If you launch 16 blocks, 16 SMs each run one block simultaneously.
+
+### Warps and Threads
+
+Each SM runs threads in groups of **32 called warps**. All 32 threads in a warp
+execute the same instruction at the same time (this is called SIMT — Single Instruction,
+Multiple Threads). If one thread in a warp takes a branch and another doesn't, both
+paths execute sequentially — the divergent threads just sit idle. This is why GPU
+code avoids if/else when possible.
+
+Our kernels use `num_warps=4`, meaning each block runs 4 × 32 = **128 threads**.
+With 128 threads, each thread gets access to more registers (the GPU has a fixed
+register file per SM that's divided among active threads).
+
+### Tensor Cores
+
+Modern NVIDIA GPUs have special hardware units called **tensor cores** that can
+multiply small matrices (like 16×16 × 16×16) in a single clock cycle. When Triton
+sees a `tl.dot(A, B)` call, it automatically uses tensor cores if the shapes are
+compatible. This gives us massive throughput for matrix multiplications — the
+RTX 4080 Super can do **52 TFLOPS** of FP16 matrix math per second using tensor cores.
+
+For comparison, without tensor cores, the same GPU does about 26 TFLOPS — tensor
+cores roughly double matrix multiplication throughput.
+
+### How a Kernel Launch Works
+
+When Python calls a GPU kernel, here's what happens:
+
+1. The CPU sends a small command to the GPU: "run this program with this many blocks"
+2. The GPU scheduler assigns each block to an SM
+3. All blocks run simultaneously (if there are enough SMs)
+4. When all blocks finish, the CPU can read the results
+
+The key insight: launching a kernel has **fixed overhead** (~0.1-0.4ms for Python dispatch
+via `jax_triton`). If the kernel itself only takes 0.5ms, that overhead is significant.
+This is why we fuse everything — embedding, 24 transformer layers, and output projection
+— into a **single kernel launch**. One launch, one overhead cost.
 
 ---
 
-## 2. How GPUs Actually Work
+## 2. GPU Memory Hierarchy
 
-A GPU is not one fast processor — it's thousands of slow processors that all run the same
-code simultaneously. An NVIDIA GPU has about 10,000 "CUDA cores" organized into groups.
-
-### The three things that matter
-
-**Threads.** The GPU runs your code on thousands of threads at once. You don't control
-individual threads. Instead, you write a "kernel" — a function that says what ONE thread
-block should do — and the GPU runs many copies of it in parallel.
-
-**Warps.** Threads are grouped into "warps" of 32 threads that execute in lockstep. If one
-thread in a warp takes a branch and the others don't, all 32 wait. A "thread block" typically
-has 4-8 warps (128-256 threads).
-
-**Tensor cores.** Special hardware units that multiply small matrices (like 16×16) in a single
-clock cycle. They're the reason modern GPUs are so fast for deep learning. To use them, your
-data must be in bfloat16 or float16 format.
-
-### The memory hierarchy
-
-This is the single most important concept for GPU performance:
+The GPU has four levels of memory, each faster but smaller than the last. Understanding
+this hierarchy is the key to writing fast kernels.
 
 ```
-┌─────────────────────────────┐
-│        Registers            │   ← Fastest. Private to each thread.
-│   Speed: ~1 cycle           │     128-256 registers per thread.
-│   Size:  ~256 KB per block  │     Data here costs almost nothing to read.
-├─────────────────────────────┤
-│      Shared Memory          │   ← Fast. Shared within a thread block.
-│   Speed: ~5 cycles          │     Up to 164 KB per block (on modern GPUs).
-│   Size:  ~164 KB per block  │     Useful for communication between threads.
-├─────────────────────────────┤
-│     HBM (Global Memory)     │   ← Slow. The GPU's main memory.
-│   Speed: ~200-400 cycles    │     Where your tensors normally live.
-│   Size:  16-80 GB           │     Every jnp.array sits here.
-└─────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    Registers                          │
+│   Speed: ~20 TB/s    Size: 255 per thread             │
+│   Scope: private to each thread                       │
+│   Access: instant (0 cycles latency)                  │
+├──────────────────────────────────────────────────────┤
+│                  Shared Memory                        │
+│   Speed: ~3-6 TB/s   Size: 101 KB per SM              │
+│   Scope: shared within one block (all threads on SM)  │
+│   Access: ~20 cycles latency                          │
+├──────────────────────────────────────────────────────┤
+│                    L2 Cache                            │
+│   Speed: ~3-6 TB/s   Size: 64 MB total                │
+│   Scope: shared across all SMs                        │
+│   Access: ~200 cycles latency                         │
+├──────────────────────────────────────────────────────┤
+│               HBM (Global Memory)                     │
+│   Speed: 836 GB/s    Size: 16 GB total                │
+│   Scope: accessible by CPU and GPU                    │
+│   Access: ~400 cycles latency                         │
+└──────────────────────────────────────────────────────┘
 ```
 
-**The speed gap is enormous.** Reading from registers is roughly 200x faster than reading
-from HBM. Most GPU programs are "memory-bound" — the math units sit idle, waiting for
-data to arrive from HBM.
+### Registers
 
-For our model, every weight matrix fits in registers. The entire model (66K parameters ×
-2 bytes = 132 KB) fits in the register file of a single thread block (128 threads × 255
-registers × 4 bytes = 130 KB). This is the foundation of everything that follows.
+Each thread has up to **255 registers**, each holding 4 bytes (one float32 or two
+bfloat16 values). With 128 threads per block (our `num_warps=4`), that's
+128 × 255 × 4 = **131 KB** of register file per block. Registers are the fastest
+storage — zero latency, bandwidth in the tens of terabytes per second.
+
+The challenge: if your kernel needs more than 255 registers per thread, the compiler
+"spills" excess values to slower shared memory or global memory. This is called
+**register pressure** and it's a constant concern in our kernels.
+
+### Shared Memory
+
+Each SM has **101 KB** of shared memory (on our RTX 4080 Super). All threads in a
+block can read and write to it. It's much faster than global memory (~20 cycles vs
+~400 cycles latency) but much smaller.
+
+We use shared memory as a scratch pad — for example, when computing RoPE (rotary
+position embeddings), we write intermediate values to shared memory so we can read
+them back in a different order. Triton manages shared memory automatically when you
+use `tl.dot` — it stages matrix tiles in shared memory for tensor core consumption.
+
+**Key constraint:** When Triton computes `tl.dot(A, B)`, it loads tiles of A and B
+into shared memory. If A is (512, 64), that's 512 × 64 × 2 = 64 KB in bf16. Two
+such tiles would be 128 KB > 101 KB, so we can't load two large matrices at once.
+This drives our `PROJ_TILE=512` design — we tile projections to fit within shared memory.
+
+### L2 Cache
+
+The **64 MB** L2 cache sits between the SMs and main memory. When any SM reads from
+global memory, the data passes through L2 and gets cached. If another SM (or the same
+SM later) reads the same address, it hits L2 instead of going to slow HBM.
+
+For our 306M model, the weight buffer is **607 MB** — almost 10x larger than L2.
+This means weights can't stay cached between decode steps. Every step re-fetches
+all weights from HBM. At smaller model sizes (d=512, ~55 MB weights), the entire
+model fits in L2, giving much better performance.
+
+We use **L2 cache eviction hints** (`eviction_policy='evict_last'` and `'evict_first'`)
+to tell the GPU which data to keep vs evict. KV cache data is reused across steps,
+so we hint `evict_last` (keep it). Output projection data is used once, so we hint
+`evict_first` (evict it immediately to make room for more useful data).
+
+### HBM (High Bandwidth Memory)
+
+The main GPU memory: **16 GB** at **836 GB/s** bandwidth. This is where all weights,
+KV caches, and activations live. Despite the name "high bandwidth," 836 GB/s is the
+bottleneck for inference — the compute units can process data much faster than HBM
+can deliver it.
 
 ---
 
 ## 3. The Memory Wall
 
-When JAX (or PyTorch) runs a transformer, XLA compiles each operation into a separate GPU
-kernel:
+Here's the central insight for understanding inference performance:
+
+**Generating one token requires reading all model weights from memory, but only doing
+a tiny amount of math with each weight.**
+
+Let's do the arithmetic for our 306M model:
 
 ```
-Operation              What happens in memory
-─────────────────────  ─────────────────────────────────
-token_emb[x]           Load tokens from HBM, load embedding table from HBM,
-                       write result to HBM
+Weight buffer:    607 MB (all 24 layers' weights, bf16)
+KV cache:         ~6 MB (grows with sequence length)
+Total per step:   ~613 MB of data to read
 
-+ pos_emb[:seq_len]    Load pos_emb from HBM, load previous result from HBM,
-                       write sum to HBM
+HBM bandwidth:    836 GB/s
+Theoretical min:  613 MB ÷ 836 GB/s = 0.73 ms per token
 
-layer_norm(...)        Load from HBM, compute mean+var, write to HBM
-
-x @ Wq                 Load x from HBM, load Wq from HBM, write Q to HBM
-x @ Wk                 Load x from HBM, load Wk from HBM, write K to HBM
-x @ Wv                 Load x from HBM, load Wv from HBM, write V to HBM
-
-Q @ K^T                Load Q from HBM, load K from HBM, write scores to HBM
-softmax(scores)        Load scores from HBM, write attention to HBM
-attn @ V               Load attn from HBM, load V from HBM, write out to HBM
-
-... (FFN, final LN, output projection — same pattern)
+Compute required: ~612M multiply-adds per token
+Tensor core throughput: 52 TFLOPS
+Compute time:     612M ÷ 52T = 0.012 ms per token
 ```
 
-Count the HBM round-trips. **Every intermediate result** gets written to slow global memory
-and then read back for the next operation. For a single forward pass with our model, that's
-roughly 15-20 separate kernels, each doing a load-compute-store cycle.
+The compute takes **0.012 ms** but reading the data takes **0.73 ms**. The GPU spends
+98% of its time waiting for data, not computing. This is the **memory wall** —
+inference is **bandwidth-bound**, not compute-bound.
 
-The math takes nanoseconds. The memory transfers take microseconds. The kernel launch overhead
-(just starting each kernel) takes microseconds. **Most of the GPU's time is spent waiting.**
+This has a profound consequence: **the only way to make inference faster is to read
+less data or read it faster**. Making the math more efficient doesn't help — the GPU
+is already idle most of the time. This is why we:
+
+1. Pack everything into bf16 (half the bytes of f32)
+2. Fuse all layers into one kernel (each weight is read once, used, and discarded)
+3. Use L2 eviction hints (keep useful data cached, evict one-time-use data)
+4. Don't bother with quantization (our goal is learning kernels, not shrinking models)
+
+**Bandwidth utilization** is our key metric. Our multi-SM kernel achieves about 17%
+of theoretical bandwidth, delivering ~235 tok/s. The gap between 17% and 100% comes
+from:
+- Barrier synchronization overhead (blocks waiting for each other)
+- Uneven work distribution across blocks
+- Memory access patterns that don't achieve peak bandwidth
+- L2 cache misses forcing HBM round-trips
 
 ---
 
-## 4. Our Transformer
+## 4. Triton: GPU Programming in Python
 
-Before diving into the kernel code, let's understand exactly what our model computes.
+[Triton](https://triton-lang.org/) is a Python-like language for writing GPU kernels.
+It compiles to the same low-level GPU instructions (PTX) as CUDA, but handles memory
+coalescing, register allocation, and tiling automatically. You write at the level of
+**blocks of data** rather than individual threads.
 
-### Architecture
+### Key Triton Concepts Used in Our Code
 
-```
-vocab_size:    32000  (BPE tokenizer trained on corpus)
-d_model:        1024  (dimension of token representations)
-n_heads:          16  (number of query attention heads)
-n_kv_heads:        4  (number of key/value heads — GQA)
-d_head:           64  (= d_model / n_heads)
-d_ff:           2816  (SwiGLU FFN hidden dimension)
-n_layers:         24  (transformer layers)
-context_len:     512  (maximum sequence length)
-parameters: 306M
-```
-
-### The forward pass
-
-Given a sequence of token IDs like `[14, 27, 51, 3, ...]`, the model:
-
-**Step 1: Embedding.** Look up each token in a (32000 × 1024) table. Token 14 becomes a
-1024-dimensional vector. No positional embedding — position is encoded via RoPE in step 3.
-Result: `h` with shape (512, 1024).
-
-**Step 2: RMSNorm.** For each position independently, normalize the 1024 values by their
-root-mean-square, then scale by learned parameters. Simpler than LayerNorm (no mean
-subtraction, no bias):
-
-```
-rms = sqrt(mean(h²) + 1e-5)
-h_norm = scale * h / rms
-```
-
-**Step 3: Multi-Head Attention with GQA and RoPE.** This is where tokens "talk to each
-other." 16 query heads, but only 4 KV heads (each shared by 4 query heads — GQA).
-
-```
-Q = h_norm @ Wq    # (512, 1024) — 16 heads × 64 dims
-K = h_norm @ Wk    # (512, 256)  — 4 KV heads × 64 dims
-V = h_norm @ Wv    # (512, 256)  — 4 KV heads × 64 dims
-
-Q, K = apply_rope(Q, K, position)  # rotate by position-dependent angles
-
-scores = Q @ K^T / sqrt(64)  # attention scores
-scores = mask_future(scores)  # causal: position i only sees 0..i
-attn = softmax(scores)
-out = attn @ V
-```
-
-RoPE (Rotary Position Embeddings) encodes position by rotating Q and K vectors. The dot
-product Q·K then depends on relative position, not absolute — better generalization.
-
-Project back: `h = h + out @ Wo`
-
-**Step 4: RMSNorm + SwiGLU FFN.** Three weight matrices with a gating mechanism:
-
-```
-h_norm = rms_norm(h)
-gate = h_norm @ W_gate          # (512, 2816)
-up   = h_norm @ W_up            # (512, 2816)
-act  = silu(gate) * up          # gated activation
-down = act @ W_down             # (2816, 1024) → back to model dim
-h = h + down                    # residual connection
-```
-
-SiLU: `silu(x) = x * sigmoid(x)`. SwiGLU uses the gate output to control how much of
-each hidden dimension passes through — consistently better quality than standard ReLU FFN.
-
-**Repeat** steps 2-4 for all 24 layers.
-
-**Step 5: Final RMSNorm + Output Projection.**
-
-```
-h = rms_norm(h)
-logits = h @ token_emb.T    # (512, 32000) — tied weights (reuse embedding table)
-```
-
-The logits at position `i` are scores for what token should come at position `i+1`.
-To generate text, look at the last position's logits and pick the highest (greedy)
-or sample from the distribution.
-
----
-
-## 5. What Happens When JAX Runs Your Model
-
-JAX's `transformer_forward` in `model.py` is clean, readable Python:
-
+**`@triton.jit`** — Decorator that compiles a Python function into a GPU kernel:
 ```python
-def transformer_forward(params, config, x):
-    h = params["token_emb"][x] + params["pos_emb"][:seq_len]
-    h_norm = layer_norm(h, params["layer0.ln1.scale"], params["layer0.ln1.bias"])
-    attn_out = causal_attention(h_norm, wq, wk, wv, wo, n_heads)
-    h = h + attn_out
-    h_norm = layer_norm(h, params["layer0.ln2.scale"], params["layer0.ln2.bias"])
-    h_ff = jax.nn.gelu(h_norm @ params["layer0.ffn.up"])
-    h_ff = h_ff @ params["layer0.ffn.down"]
-    h = h + h_ff
-    h = layer_norm(h, params["ln_final.scale"], params["ln_final.bias"])
-    return h @ params["output_proj"]
-```
-
-When you call this with `jax.jit`, XLA compiles it into a sequence of GPU kernels.
-Each line becomes one or more kernel launches. Each kernel reads its inputs from HBM,
-computes, writes results to HBM, and the next kernel picks up from there.
-
-For **one forward pass**, there are roughly 15-20 HBM round-trips. For **autoregressive
-generation** of 64 tokens, JAX calls this function 64 times (once per token, with growing
-input length), so that's **~1000 kernel launches** with HBM round-trips each.
-
-This is what we're going to fix.
-
----
-
-## 6. The Big Idea: One Kernel to Rule Them All
-
-What if we wrote a single GPU kernel that does the **entire forward pass** — embedding,
-layer norm, attention, FFN, output projection — without ever writing intermediate results
-to HBM?
-
-```
-Normal (JAX/XLA):
-  HBM → Embedding → HBM → LN → HBM → QKV → HBM → Attention → HBM → FFN → HBM → Logits
-
-Fused kernel:
-  HBM → [Embedding → LN → QKV → Attention → FFN → Logits] → HBM
-         └──────────── all in registers ────────────────┘
-```
-
-The data enters registers once (loading weights + input tokens from HBM), flows through
-every operation in registers, and writes the final logits back to HBM once. **One HBM
-round-trip instead of fifteen.**
-
-This is possible because our model is small enough to fit in registers:
-
-```
-Total parameters: 66,368 × 2 bytes (bf16) = ~132 KB
-Register file per block: 128 threads × 255 regs × 4 bytes = ~130 KB
-```
-
-It's tight, but it works. The weights aren't all live simultaneously — each phase loads
-the weights it needs, uses them, then those registers get reused for the next phase.
-
-For the attention scores matrix (128 × 128 = 16K values at 4 bytes each = 64 KB), this
-is the largest live tensor and the binding constraint. It fits because we use 4 warps
-(128 threads), giving each thread enough registers.
-
----
-
-## 7. Triton: GPU Programming for Humans
-
-[Triton](https://openai.com/index/triton/) is a GPU programming language by OpenAI.
-It compiles Python-like code to the same PTX machine code that CUDA produces, but it's
-much easier to write because:
-
-1. **You think in blocks, not threads.** Instead of "what does thread #47 do?", you think
-   "what does this block of 128 values do?"
-2. **Memory coalescing is automatic.** Triton figures out how to load data efficiently.
-3. **Register allocation is automatic.** You don't manually manage which values go in
-   which registers.
-
-### Triton basics
-
-A Triton kernel looks like a Python function with special types:
-
-```python
-import triton
-import triton.language as tl
-
 @triton.jit
-def my_kernel(input_ptr, output_ptr):
-    # tl.arange creates a vector of indices: [0, 1, 2, ..., 127]
-    idx = tl.arange(0, 128)
-
-    # tl.load reads from GPU memory into registers
-    x = tl.load(input_ptr + idx)
-
-    # Math happens in registers (no memory access)
-    y = x * 2.0 + 1.0
-
-    # tl.store writes from registers back to GPU memory
-    tl.store(output_ptr + idx, y)
+def my_kernel(ptr, N: tl.constexpr):
+    ...
 ```
 
-Key operations we use:
+**`tl.constexpr`** — Marks a parameter as a compile-time constant. The compiler sees
+the actual value and can optimize accordingly. All our shape parameters (D_MODEL,
+N_HEADS, etc.) are constexpr because they never change at runtime.
 
-| Operation | What it does | Example |
-|-----------|-------------|---------|
-| `tl.load(ptr + offsets)` | Read from HBM into registers | Loading a weight matrix |
-| `tl.store(ptr + offsets, val)` | Write from registers to HBM | Storing output logits |
-| `tl.dot(A, B)` | Matrix multiply using tensor cores | Q @ K^T, h @ W_q |
-| `tl.sum(x, axis=)` | Reduce along an axis | Computing mean for layer norm |
-| `tl.exp(x)` | Element-wise exponential | Softmax numerator |
-| `tl.where(cond, a, b)` | Conditional select | Causal mask |
-| `tl.arange(0, N)` | Index vector [0, 1, ..., N-1] | Position offsets |
-| `.to(tl.bfloat16)` | Cast to bfloat16 | Preparing for tensor core matmul |
+**`tl.program_id(0)`** — Returns the index of the current block in the grid. If you
+launch with `grid=(16,)`, blocks get IDs 0 through 15. Each block runs independently
+on its own SM.
 
-### The bf16 + f32 pattern
-
-Tensor cores require bfloat16 inputs but produce float32 outputs. So the standard pattern is:
-
+**`tl.arange(0, N)`** — Creates a vector of consecutive integers [0, 1, 2, ..., N-1].
+**N must be a power of 2** — this is a Triton requirement. We use this to create index
+vectors for loading/storing data:
 ```python
-# Cast inputs to bf16 for tensor cores, accumulate in f32 for precision
-result = tl.dot(A.to(tl.bfloat16), B.to(tl.bfloat16)).to(tl.float32)
+d = tl.arange(0, D_BLOCK)  # [0, 1, 2, ..., 1023]
+h = tl.load(ptr + d)       # loads 1024 consecutive values
 ```
 
-This gives you the speed of tensor cores (8-16× faster than scalar math) with the precision
-of float32 accumulation.
+**`tl.load(ptr + offsets, mask=mask, other=0.0)`** — Reads values from GPU memory at
+the given addresses. The `mask` parameter controls which lanes are active — masked-off
+lanes get the `other` value instead of reading memory. We use masks for two purposes:
+1. **D_MODEL padding:** when D_MODEL=1024 but D_BLOCK=1024 (both happen to match here,
+   but the mask handles the general case)
+2. **Sequence masking:** in attention, we mask out future positions (tile_pos > pos)
 
-### Calling Triton kernels from JAX
+**`tl.store(ptr + offsets, values, mask=mask)`** — Writes values to GPU memory.
 
-We use `jax_triton`, a bridge library. It passes JAX arrays as pointers to the Triton kernel
-with zero-copy sharing (same GPU memory):
-
+**`tl.dot(A, B)`** — Matrix multiplication using tensor cores. A and B must be 2D with
+compatible shapes. Returns A @ B. Triton handles tiling and shared memory staging
+automatically. We use bf16 inputs with f32 accumulation for numerical precision:
 ```python
-import jax_triton as jt
-
-result = jt.triton_call(
-    input_array,          # inputs (JAX arrays → pointers)
-    kernel=my_kernel,     # the @triton.jit function
-    out_shape=[           # shape/dtype of outputs (jax_triton allocates them)
-        jax.ShapeDtypeStruct((128,), jnp.float32),
-    ],
-    grid=(1,),            # how many thread blocks to launch
-    num_warps=4,          # threads per block = num_warps × 32
-)
+result = tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16)).to(tl.float32)
 ```
+
+**`tl.range(start, stop, step)`** — A dynamic loop. The compiler generates a single
+loop body that executes repeatedly. This is crucial for our 24-layer kernel — if we
+used `tl.static_range`, the compiler would unroll all 24 iterations, duplicating the
+code 24 times. This causes massive register spill and 10+ minute compilation times.
+`tl.range` compiles the body once.
+
+**`tl.static_range(start, stop, step)`** — A compile-time unrolled loop. Each iteration
+becomes separate code. We use this for small loops (like iterating over KV_SPLITS=1-2)
+where the overhead of loop control would exceed the body.
+
+**`tl.atomic_add(ptr, val, sem='acq_rel', scope='gpu')`** — Atomically adds `val` to
+the value at `ptr` and returns the old value. We use this for **cross-block barriers**
+— all blocks increment a counter, and the last one to arrive knows everyone is done.
+The `sem` (semantics) and `scope` parameters control memory ordering visibility.
+
+**`grid=(N,)`** — When launching a kernel, the grid specifies how many blocks to run.
+`grid=(16,)` launches 16 blocks, each getting a unique `tl.program_id(0)` from 0 to 15.
+
+**`num_warps=4`** — How many warps per block. 4 warps × 32 threads = 128 threads.
+More warps mean more threads sharing the register file (fewer registers per thread).
+4 is optimal for our kernels — 2 has poor occupancy, 8 causes register pressure.
+
+**`num_stages=1`** — Pipeline depth for memory loads. `num_stages=2` would double-buffer
+tiles (loading the next tile while computing the current one), but this requires double
+the shared memory. At D_BLOCK=1024, double-buffering would need 128 KB > 101 KB shared
+memory, so we use `num_stages=1`.
+
+### bf16 Computation with f32 Accumulation
+
+Throughout our kernels, we follow this pattern:
+```python
+# Load in bf16 (saves memory bandwidth — half the bytes of f32)
+w = tl.load(ptr).to(tl.bfloat16)
+h = h_norm.to(tl.bfloat16)
+
+# Multiply in bf16 on tensor cores (fast, uses specialized hardware)
+result = tl.dot(h[None, :], w)
+
+# Accumulate in f32 (prevents precision loss over many additions)
+accum += result.to(tl.float32)
+```
+
+bf16 (bfloat16) has the same exponent range as f32 but only 7 bits of mantissa
+(vs 23 for f32). Individual multiplications are fine, but summing many bf16 values
+loses precision. So we multiply in bf16 (fast, on tensor cores) and accumulate in
+f32 (accurate, on regular ALUs).
 
 ---
 
-## 8. Prefill: Processing the Prompt
+## 5. Our Transformer Model
 
-"Prefill" processes the entire input prompt at once — all positions computed in parallel.
-It produces the KV cache that the decode kernel reads from.
+Our model is a **decoder-only transformer** with 306M parameters. Here are the key
+specs and what each means:
 
-In our system, prefill runs in **JAX** (`model.py: prefill_with_kv`), not in a custom
-Triton kernel. This is because:
+```
+d_model  = 1024    # hidden dimension: every token is a vector of 1024 numbers
+n_heads  = 16      # attention heads: 16 independent attention patterns per layer
+n_kv_heads = 4     # KV heads: only 4 unique key/value sets (GQA, explained below)
+d_head   = 64      # per-head dimension: 1024 ÷ 16 = 64 numbers per head
+n_layers = 24      # depth: the input passes through 24 transformer layers
+d_ff     = 2816    # FFN hidden dimension: SwiGLU expands from 1024 → 2816 → 1024
+context_len = 512  # maximum sequence length
+vocab_size = 32000 # vocabulary: 32K BPE tokens
+```
 
-1. Prefill only runs **once** per generation (processing the prompt). Decode runs hundreds
-   of times (one call per generated token). Optimizing decode has 100x more impact.
-2. Prefill is **compute-bound** (large matrix multiplications), not memory-bound. JAX/XLA
-   already handles compute-bound operations efficiently via cuDNN.
-3. The prefill code in `model.py` is straightforward JAX: run all layers, save K/V from
-   each layer into cache arrays, return logits + caches.
+### What Each Layer Does
 
-After prefill, the KV caches are packed into a flat buffer with `pack_kv_caches()`
-(`kernels/fused_decode_nlayer.py`) for the Triton decode kernel to read.
+Every transformer layer takes a 1024-dimensional vector (the hidden state `h`) and
+transforms it through two sub-layers:
+
+**Sub-layer 1: Attention**
+```
+h_norm = RMSNorm(h)          # normalize to unit variance
+Q, K, V = h_norm @ Wq/Wk/Wv # project into query/key/value spaces
+Q, K = RoPE(Q, K, pos)       # inject position information
+attn = softmax(Q @ K.T) @ V  # weighted sum of values
+h = h + attn @ Wo            # residual connection
+```
+
+**Sub-layer 2: Feed-Forward Network (SwiGLU)**
+```
+h_norm = RMSNorm(h)                      # normalize again
+gate = h_norm @ W_gate                    # gate projection (1024 → 2816)
+up = h_norm @ W_up                        # up projection (1024 → 2816)
+ffn_out = (SiLU(gate) * up) @ W_down      # activate, multiply, project down (2816 → 1024)
+h = h + ffn_out                           # residual connection
+```
+
+After all 24 layers, a final RMSNorm and output projection produce logits:
+```
+h = RMSNorm(h)
+logits = h @ token_embedding.T   # tied embeddings: reuse the input embedding matrix
+```
+
+### RMSNorm
+
+RMSNorm normalizes a vector by dividing by the root-mean-square of its elements,
+then scaling by a learned parameter:
+
+$$\text{RMSNorm}(h) = \gamma \cdot \frac{h}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} h_i^2 + \epsilon}}$$
+
+In code:
+```python
+h_norm = scale * h * rsqrt(mean(h * h) + 1e-5)
+```
+
+Concrete example with a 4-element vector:
+```
+h = [2.0, -1.0, 0.5, 1.5]
+scale = [1.1, 0.9, 1.0, 0.8]
+
+mean(h²) = (4.0 + 1.0 + 0.25 + 2.25) / 4 = 1.875
+rsqrt(1.875 + 0.00001) = 1 / sqrt(1.875) ≈ 0.730
+
+h_norm = scale * h * 0.730
+       = [1.1 * 2.0 * 0.730,  0.9 * -1.0 * 0.730,  ...]
+       = [1.606, -0.657, 0.365, 0.876]
+```
+
+Unlike LayerNorm, RMSNorm doesn't subtract the mean — it only divides by the RMS.
+This is ~10-15% faster (one less reduction operation) and works just as well in practice.
+
+### RoPE (Rotary Position Embedding)
+
+RoPE encodes position information by rotating pairs of dimensions in Q and K by
+angles that depend on position. Each pair of dimensions rotates at a different
+frequency — low dimensions rotate slowly (capturing broad position patterns),
+high dimensions rotate fast (capturing fine-grained position).
+
+The rotation formula for position $p$ and dimension pair $i$:
+
+$$\theta_i = 10000^{-2i/d_\text{head}}$$
+
+$$\begin{bmatrix} q'_{2i} \\ q'_{2i+1} \end{bmatrix} = \begin{bmatrix} \cos(p\theta_i) & -\sin(p\theta_i) \\ \sin(p\theta_i) & \cos(p\theta_i) \end{bmatrix} \begin{bmatrix} q_{2i} \\ q_{2i+1} \end{bmatrix}$$
+
+In our implementation, the "even/odd" split is actually "first half / second half":
+```python
+q_lo, q_hi = Q[:d_head//2], Q[d_head//2:]
+Q_rotated_lo = q_lo * cos - q_hi * sin
+Q_rotated_hi = q_lo * sin + q_hi * cos
+```
+
+The RoPE tables are precomputed once in `precompute_rope_table()` (`model.py:101-107`):
+```python
+def precompute_rope_table(context_len, d_head, base=10000.0):
+    half = d_head // 2                              # 32 for d_head=64
+    freqs = base ** (-arange(0, half) * 2.0 / d_head)  # 32 frequencies, from 1.0 to ~0.00015
+    positions = arange(context_len)                  # [0, 1, 2, ..., 511]
+    angles = positions[:, None] * freqs[None, :]     # (512, 32) angle matrix
+    return cos(angles), sin(angles)                  # each (512, 32)
+```
+
+Concrete example for d_head=64, position 5:
+```
+freqs = [10000^0, 10000^(-2/64), 10000^(-4/64), ..., 10000^(-62/64)]
+      = [1.0, 0.724, 0.524, ..., 0.000147]
+
+angles at pos 5 = [5*1.0, 5*0.724, 5*0.524, ..., 5*0.000147]
+               = [5.0, 3.62, 2.62, ..., 0.000735]
+
+cos_val = [cos(5.0), cos(3.62), ..., cos(0.000735)]
+sin_val = [sin(5.0), sin(3.62), ..., sin(0.000735)]
+```
+
+The key property: the dot product Q·K between two positions depends only on their
+**relative distance**, not absolute positions. This means the model generalizes to
+positions it hasn't seen during training.
+
+### GQA (Grouped-Query Attention)
+
+Standard multi-head attention has separate K and V matrices for each head. With 16
+heads and d_head=64, that's 16 × 64 = 1024 dimensions for K and 1024 for V.
+
+GQA (Grouped-Query Attention) **shares K and V across groups of heads**. Our model
+has 16 query heads but only 4 KV heads. Each group of 4 query heads shares one KV head:
+
+```
+Query heads:  0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15
+KV heads:     0  0  0  0 | 1  1  1  1 | 2  2  2  2 |  3  3  3  3
+
+GQA_GROUP = N_HEADS // N_KV_HEADS = 16 // 4 = 4
+kv_head = head_id // GQA_GROUP    # maps query head → shared KV head
+```
+
+Why GQA? It reduces KV cache size by 4x (only 4 KV heads instead of 16) without
+significant quality loss. During decode, the KV cache is a major memory consumer,
+so this matters.
+
+Memory savings:
+```
+Full attention KV cache:  16 heads × 512 positions × 64 dims × 2 bytes = 1.0 MB/layer
+GQA KV cache:              4 heads × 512 positions × 64 dims × 2 bytes = 0.25 MB/layer
+With 24 layers:            24 MB → 6 MB total KV cache (4x reduction)
+```
+
+### SwiGLU FFN
+
+SwiGLU is a gated activation function that replaced the standard ReLU FFN:
+
+$$\text{SwiGLU}(h) = (\text{SiLU}(h W_\text{gate}) \odot (h W_\text{up})) W_\text{down}$$
+
+where SiLU(x) = x × sigmoid(x) and ⊙ is element-wise multiplication.
+
+```python
+gate = h_norm @ W_gate    # (1024,) → (2816,) — gate projection
+up   = h_norm @ W_up      # (1024,) → (2816,) — up projection
+act  = SiLU(gate) * up    # (2816,) — gated activation
+out  = act @ W_down        # (2816,) → (1024,) — down projection
+```
+
+SwiGLU uses 3 weight matrices instead of 2 (standard FFN uses W1 and W2 only).
+This costs 50% more parameters per layer but gives ~15% better quality per FLOP.
+
+### Tied Embeddings
+
+The output projection (hidden state → vocabulary logits) reuses the token embedding
+matrix transposed:
+
+```
+logits = h @ token_emb.T    # (1024,) @ (1024, 32000) → (32000,)
+```
+
+This means the model doesn't learn separate input and output embeddings — one matrix
+serves both purposes. It saves 32000 × 1024 × 2 = 65.5 MB of parameters and acts as
+a regularizer.
 
 ---
 
-## 9. KV Cache: Why We Don't Recompute Everything
+## 6. Prefill and Decode
 
-When generating text, we produce tokens one at a time:
+Text generation has two phases with fundamentally different performance characteristics.
 
-```
-Prompt:    "The cat sat on the"
-Generate:   → "m"     (position 5)
-            → "a"     (position 6)
-            → "t"     (position 7)
-            ...
-```
+### Prefill
 
-At position 6, the model needs to attend to positions 0-6. The Q/K/V projections for
-positions 0-5 are **exactly the same** as they were when we processed the prompt. Only
-position 6 is new.
-
-Without caching, we'd recompute Q, K, V for ALL previous positions every time we generate
-a token. For 64 generated tokens, that's 64 + 63 + 62 + ... + 1 = 2,080 position
-computations instead of just 64.
-
-**The KV cache** stores K and V for all previous positions. When generating position 6,
-we only compute K and V for position 6, look up K and V for positions 0-5 from the cache,
-and do the attention.
+**What:** Process the entire prompt at once, producing KV caches for all positions.
 
 ```
-Cache layout: (n_heads, max_seq, d_head) = (2, 128, 32) in bf16
-              = 2 × 128 × 32 × 2 bytes = 16 KB
+Input:  "The cat sat on" → [token_0, token_1, token_2, token_3]
+Output: logits for the next token after each position, plus KV caches
+```
 
-After prefill:  positions 0-63 filled (from prompt)
-After decode 1: position 64 filled
-After decode 2: position 65 filled
+Prefill processes all tokens in parallel — it's a batch matrix multiplication.
+This is **compute-bound** because the batch dimension amortizes the weight loading:
+each weight is loaded once but used for N tokens (where N = prompt length).
+
+We use JAX (not Triton) for prefill because JAX's XLA compiler with cuDNN FlashAttention
+is already highly optimized for parallel attention. Our prefill runs at ~3,469 tok/s
+for a 128-token prompt.
+
+The implementation is in `model.py:195-232` (`prefill_with_kv()`):
+```python
+def prefill_with_kv(params, config, x):
+    h = params["token_emb"][x]          # (seq_len, 1024) — embed all tokens
+    k_caches, v_caches = [], []
+
+    for layer in range(config["n_layers"]):
+        h_norm = rms_norm(h, params[f"layer{layer}.ln1.scale"])
+
+        # Project K and V, apply RoPE to K, store in caches
+        k_proj = (h_norm @ params[f"layer{layer}.attn.k"]).reshape(seq_len, n_kv_heads, d_head)
+        k_proj = apply_rope(k_proj, cos, sin)
+        k_cache = zeros((n_kv_heads, max_seq, d_head), bf16)
+        k_cache = k_cache.at[:, :seq_len, :].set(k_proj.transpose(1, 0, 2))
+
+        # Run attention and FFN normally
+        attn_out = causal_attention(h_norm, wq, wk, wv, wo, ...)
+        h = h + attn_out
+        h = h + swiGLU(rms_norm(h, ln2_scale))
+
+    logits = rms_norm(h, ln_final) @ token_emb.T
+    return logits, k_caches, v_caches
+```
+
+### Decode
+
+**What:** Generate one token at a time. Each step takes the previous token, looks up
+its KV cache entries from all previous positions, and produces the next token.
+
+```
+Step 0: process "the"   → reads KV cache positions [0..3], produces token 4
+Step 1: process token 4  → reads KV cache positions [0..4], produces token 5
+Step 2: process token 5  → reads KV cache positions [0..5], produces token 6
 ...
 ```
 
-The prefill kernel outputs the KV cache as a side effect. The decode kernel reads
-from it and outputs new K/V vectors, which the JAX wrapper inserts at the right position.
+Decode is **bandwidth-bound** because we only process one token at a time.
+Every weight is loaded from memory, multiplied with a single 1024-element vector,
+and the result is added to an accumulator. The math is trivial — it's all
+matrix-vector products — but we still need to read all 607 MB of weights every step.
+
+This is where our custom Triton kernels shine. By fusing all 24 layers into a single
+kernel launch, we:
+1. Eliminate 24 × (multiple kernel launches per layer) = hundreds of launch overheads
+2. Keep intermediate values (`h`) in registers across layers — never writing them
+   to global memory and reading them back
+3. Apply all optimizations (RoPE, RMSNorm, SwiGLU) inline without extra memory passes
 
 ---
 
-## 10. The Decode Kernel: Processing One Token
+## 7. Weight Packing
 
-The decode kernel (`kernels/fused_decode_nlayer.py: _fused_decode_nlayer`) processes
-**one token** through all 24 layers in a single kernel launch. This is the simpler
-single-SM version; section 14 covers the multi-SM version that we actually use.
+Before decode can run, we pack all model weights into a single flat bf16 buffer.
+This eliminates per-layer pointer arithmetic and lets the kernel index weights
+with simple offsets.
 
-Decode is fundamentally different from prefill:
-
-| | Prefill | Decode |
-|---|---|---|
-| Tokens processed | 128 | 1 |
-| Matmul shape | (128, 1024) @ (1024, 64) | (1, 1024) @ (1024, 64) |
-| Attention | (128, 128) — compute-bound | (1, pos) — memory-bound |
-| Bottleneck | Compute (matmuls) | Memory (loading 607MB of weights) |
-
-### The layer loop
-
-The kernel processes all 24 layers in a `tl.range` loop. All weights for all layers
-are packed into one flat buffer, with offsets computed per layer:
+### `pack_weights()` — `fused_decode_nlayer.py:250-270`
 
 ```python
-for layer in tl.range(N_LAYERS):
-    w_base = layer * LAYER_W_SIZE   # offset into packed weight buffer
-    kv_base = layer * LAYER_KV_SIZE # offset into packed KV cache
+def pack_weights(params, config):
+    """Pack per-layer weights into a single bf16 buffer.
+
+    Layout per layer: ln1_s, wq, wk, wv, wo, ln2_s, gate, up, down
+    """
+    n_layers = config["n_layers"]
+    layer_tensors = []
+    for i in range(n_layers):
+        p = f"layer{i}"
+        layer_tensors.extend([
+            params[f"{p}.ln1.scale"].reshape(-1),     # (1024,)
+            params[f"{p}.attn.q"].reshape(-1),         # (1024, 1024) → (1048576,)
+            params[f"{p}.attn.k"].reshape(-1),         # (1024, 256)  → (262144,)
+            params[f"{p}.attn.v"].reshape(-1),         # (1024, 256)  → (262144,)
+            params[f"{p}.attn.o"].reshape(-1),         # (1024, 1024) → (1048576,)
+            params[f"{p}.ln2.scale"].reshape(-1),     # (1024,)
+            params[f"{p}.ffn.gate"].reshape(-1),       # (1024, 2816) → (2883584,)
+            params[f"{p}.ffn.up"].reshape(-1),         # (1024, 2816) → (2883584,)
+            params[f"{p}.ffn.down"].reshape(-1),       # (2816, 1024) → (2883584,)
+        ])
+    return jnp.concatenate(layer_tensors).astype(jnp.bfloat16)
 ```
 
-`tl.range` (not `tl.static_range`) means Triton compiles the loop body **once** and
-reuses it. With 24 layers, `tl.static_range` would unroll into 24 copies, causing
-10+ minute compilation and register spilling.
+Each layer contributes:
+```
+ln1_scale:   1,024 elements
+Wq:          1,024 × 1,024 = 1,048,576
+Wk:          1,024 × 256   =   262,144      (D_KV = n_kv_heads × d_head = 4 × 64 = 256)
+Wv:          1,024 × 256   =   262,144
+Wo:          1,024 × 1,024 = 1,048,576
+ln2_scale:   1,024
+W_gate:      1,024 × 2,816 = 2,883,584
+W_up:        1,024 × 2,816 = 2,883,584
+W_down:      2,816 × 1,024 = 2,883,584
+─────────────────────────────────────
+Total per layer:          11,274,240 elements
+× 24 layers:             270,581,760 elements
+× 2 bytes (bf16):        541,163,520 bytes ≈ 541 MB
+```
 
-### Projections via tl.dot
+The kernel computes each layer's offset using `LAYER_W_SIZE`:
+```python
+LAYER_W_SIZE = (D_MODEL +                           # ln1_scale
+                D_MODEL*D_MODEL + D_MODEL*D_KV +    # Wq + Wk
+                D_MODEL*D_KV + D_MODEL*D_MODEL +    # Wv + Wo
+                D_MODEL +                            # ln2_scale
+                D_MODEL*D_FF + D_MODEL*D_FF +        # gate + up
+                D_FF*D_MODEL)                        # down
+```
 
-At d=1024, the representation vector `h` has 1024 elements. Projecting it to a
-64-dimensional head via element-wise `h[:, None] * W` would need a `(1024, 64)` tensor
-in registers — 65,536 values, far exceeding the 255-register limit. Instead we use
-`tl.dot`:
+Within each layer, individual weight matrices are located by accumulating offsets:
+```python
+off = w_base                          # start of this layer's weights
+ln1_s_off = off;    off += D_MODEL    # first comes ln1_scale (1024 elements)
+wq_off = off;       off += D_MODEL * D_MODEL  # then Wq (1024×1024 elements)
+wk_off = off;       off += D_MODEL * D_KV     # then Wk (1024×256 elements)
+...
+```
+
+### `prepare_decode_weights_nlayer()` — `fused_decode_nlayer.py:299-320`
+
+This function prepares everything the decode kernel needs:
 
 ```python
-Q = tl.dot(h_norm_2d, wq_tile).to(tl.float32).sum(axis=0)
+def prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=2):
+    n_heads = config["n_heads"]
+    d_head = config["d_head"]
+    output_vtile = 32
+    total_blocks = n_heads * kv_splits
+    align = output_vtile * total_blocks
+    vocab_pad = ((vocab_size + align - 1) // align) * align
+    pad_v = vocab_pad - vocab_size
 ```
 
-`h_norm_2d` is `h_norm[None, :]` reshaped to `(1, 1024)`. `tl.dot` tiles the reduction
-internally, never materializing the full outer product. This uses tensor cores despite
-M=1 because we reshape h to be a 2D matrix.
+**Vocab padding:** The output projection tiles over the vocabulary in chunks of
+`OUTPUT_VTILE=32`. In the multi-SM kernel, these tiles are distributed across
+`total_blocks` (= 16 heads × 1 kv_split = 16 blocks). For clean distribution,
+vocab_size must be padded to a multiple of `output_vtile × total_blocks = 32 × 16 = 512`.
 
-### Online softmax attention over the KV cache
+```
+vocab_size = 32000
+align = 512
+vocab_pad = ceil(32000 / 512) * 512 = 63 * 512 = 32256
+pad_v = 32256 - 32000 = 256 extra columns (padded with zeros)
+```
 
-The KV cache can hold up to 512 positions. We can't load all 512 K vectors at once
-(too much memory), so we tile in chunks of `KV_TILE=64` positions and use **online
-softmax** to accumulate the result:
+The function returns a dictionary with:
+```python
+return {
+    "token_emb": params["token_emb"].astype(jnp.bfloat16),     # (32000, 1024) bf16
+    "packed_w": pack_weights(params, config),                    # flat bf16 buffer
+    "lnf_s": params["ln_final.scale"].astype(jnp.bfloat16),    # (1024,) bf16
+    "cos": cos.astype(jnp.bfloat16),                            # (512, 32) bf16
+    "sin": sin.astype(jnp.bfloat16),                            # (512, 32) bf16
+    "output_proj_padded": pad(emb_T, [(0,0),(0,pad_v)]).bf16,   # (1024, 32256) bf16
+    "vocab_pad": vocab_pad,                                      # 32256
+}
+```
+
+The output projection is the token embedding matrix transposed and padded:
+`emb_T = params["token_emb"].T` gives shape (1024, 32000), then padded to (1024, 32256).
+
+---
+
+## 8. KV Cache Packing
+
+Like weights, KV caches are packed into a single flat buffer so the kernel can
+index them with simple arithmetic.
+
+### `pack_kv_caches()` — `fused_decode_nlayer.py:273-283`
 
 ```python
-m_i = tl.full((1,), value=-1e9, dtype=tl.float32)  # running max
-l_i = tl.zeros((1,), dtype=tl.float32)              # running sum of exp
-o_i = tl.zeros((D_HEAD,), dtype=tl.float32)         # running weighted output
+def pack_kv_caches(k_caches, v_caches):
+    """Pack per-layer KV caches into a single bf16 buffer.
 
-for t in tl.range(0, MAX_SEQ, KV_TILE):
-    tile_pos = t + tl.arange(0, KV_TILE)
-    tile_mask = tile_pos <= pos    # only attend to positions 0..pos
-
-    K_tile = tl.load(kv_in_ptr + ..., mask=tile_mask[:, None], other=0.0)
-    V_tile = tl.load(kv_in_ptr + ..., mask=tile_mask[:, None], other=0.0)
-
-    # Insert new K/V at current position
-    K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
-    V_tile = tl.where(tile_pos[:, None] == pos, V_new[None, :], V_tile)
-
-    s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
-    s = tl.where(tile_mask, s, -1e9)
-
-    # Online softmax update
-    m_ij = tl.max(s)
-    m_new = tl.maximum(m_i, m_ij)
-    alpha = tl.exp(m_i - m_new)     # rescale previous accumulation
-    p = tl.exp(s - m_new)           # current tile's softmax weights
-    l_i = l_i * alpha + tl.sum(p)
-    o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
-    m_i = m_new
-
-attn_out = o_i / l_i
+    Input: k_caches[i] shape (n_kv_heads, max_seq, d_head) bf16
+    Output: flat buffer with layout [layer0_k, layer0_v, layer1_k, layer1_v, ...]
+    """
+    parts = []
+    for k, v in zip(k_caches, v_caches):
+        parts.append(k.reshape(-1))
+        parts.append(v.reshape(-1))
+    return jnp.concatenate(parts)
 ```
 
-The key insight: standard softmax needs the max across ALL positions before computing
-any exponentials. Online softmax tracks a running max and rescales previous results
-when a new max is found. This is the same trick FlashAttention uses — process tiles
-sequentially without ever materializing the full attention matrix.
+Each layer's K and V caches are interleaved:
 
-### SwiGLU FFN with tiled weights
+```
+Layout: [L0_K | L0_V | L1_K | L1_V | ... | L23_K | L23_V]
 
-The FFN has three weight matrices (gate, up, down) with d_ff=2816 hidden units.
-We tile over the hidden dimension in chunks of `BLOCK_K=32`:
+Per-layer cache size:
+  K cache: n_kv_heads × max_seq × d_head = 4 × 512 × 64 = 131,072 elements
+  V cache: same = 131,072
+  Total per layer: 262,144 elements = LAYER_KV_SIZE
+
+  24 layers total: 6,291,456 elements × 2 bytes = 12.6 MB
+```
+
+The kernel locates each layer's caches using:
+```python
+LAYER_KV_SIZE = 2 * N_KV_HEADS * MAX_SEQ * D_HEAD    # 262,144
+kv_base = layer * LAYER_KV_SIZE
+kc_base = kv_base                                      # K cache starts at kv_base
+vc_base = kv_base + N_KV_HEADS * MAX_SEQ * D_HEAD     # V cache starts after K
+```
+
+Within each cache, a specific position for a specific KV head is at:
+```python
+cache_off = kv_head * MAX_SEQ * D_HEAD    # offset to this head's data
+# K[kv_head, pos, :] is at: kc_base + cache_off + pos * D_HEAD + dh
+```
+
+### `unpack_kv_caches()` — `fused_decode_nlayer.py:286-296`
+
+The inverse operation, used after generation to extract per-layer caches:
+```python
+def unpack_kv_caches(packed, n_layers, n_kv_heads, max_seq, d_head):
+    layer_kv_size = 2 * n_kv_heads * max_seq * d_head
+    cache_size = n_kv_heads * max_seq * d_head
+    k_caches, v_caches = [], []
+    for i in range(n_layers):
+        base = i * layer_kv_size
+        k_caches.append(packed[base:base + cache_size].reshape(n_kv_heads, max_seq, d_head))
+        v_caches.append(packed[base + cache_size:base + layer_kv_size].reshape(...))
+    return k_caches, v_caches
+```
+
+---
+
+## 9. The Single-SM Decode Kernel
+
+`fused_decode_nlayer.py` contains a simpler decode kernel that runs on a **single SM**
+(one block, `grid=(1,)`). It's slower than the multi-SM version but easier to
+understand. We'll use it to build intuition before tackling the parallel version.
+
+### Kernel Signature — `fused_decode_nlayer.py:37-67`
 
 ```python
-for k in tl.range(0, D_FF, BLOCK_K):
-    kk = k + tl.arange(0, BLOCK_K)
-    gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
-    up   = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
-    act  = (gate * tl.sigmoid(gate)) * up    # SwiGLU activation
-    ffn_accum += tl.dot(act_2d, down_w).to(tl.float32).sum(axis=0)
+@triton.jit
+def _fused_decode_nlayer(
+    token_emb_ptr,     # token embeddings (32000, 1024) bf16
+    packed_w_ptr,      # all layer weights concatenated, bf16
+    lnf_s_ptr,         # final RMSNorm scale (1024,) bf16
+    output_proj_ptr,   # tied output projection (1024, vocab_pad) bf16
+    cos_ptr, sin_ptr,  # RoPE tables (512, 32) bf16
+    token_id_ptr,      # scalar: which token we're decoding
+    pos_ptr,           # scalar: position in the sequence
+    kv_in_ptr,         # packed KV caches (input from previous step)
+    logits_ptr,        # OUTPUT: vocabulary logits (vocab_pad,) f32
+    kv_out_ptr,        # OUTPUT: updated KV caches
+    # Config (all compile-time constants)
+    D_MODEL: tl.constexpr,    # 1024
+    D_HEAD: tl.constexpr,     # 64
+    D_FF: tl.constexpr,       # 2816
+    N_HEADS: tl.constexpr,    # 16
+    N_KV_HEADS: tl.constexpr, # 4
+    D_KV: tl.constexpr,       # 256 (n_kv_heads × d_head = 4 × 64)
+    N_LAYERS: tl.constexpr,   # 24
+    MAX_SEQ: tl.constexpr,    # 512
+    VOCAB_SIZE: tl.constexpr, # 32000
+    VOCAB_PAD: tl.constexpr,  # 32256 (padded for tiling)
+):
 ```
 
-Each iteration processes 32 hidden units. The activation `gate * sigmoid(gate) * up`
-is SwiGLU — a gated variant that consistently outperforms standard ReLU.
+All config parameters are `tl.constexpr` — the compiler substitutes their actual
+values and optimizes the resulting code. This means we get a different compiled
+kernel for each model configuration, but each one is maximally optimized.
+
+### Constants and Setup — Lines 29-34, 68-91
+
+```python
+BLOCK_K    = tl.constexpr(32)    # FFN tiling: process 32 hidden units at a time
+VOCAB_TILE = tl.constexpr(128)   # output tiling: compute 128 logits at a time
+KV_TILE    = tl.constexpr(64)    # attention tiling: process 64 KV positions at a time
+OUTPUT_VTILE = tl.constexpr(32)  # output vocab tiling for multi-SM
+```
+
+Inside the kernel:
+```python
+d = tl.arange(0, D_MODEL)     # [0, 1, 2, ..., 1023] — index vector for d_model dimension
+token_id = tl.load(token_id_ptr)  # which token to decode (scalar)
+pos = tl.load(pos_ptr)            # position in sequence (scalar)
+```
+
+The `d` vector is the workhorse index — we use it to load entire 1024-dimensional
+vectors in one instruction: `tl.load(ptr + d)` loads 1024 consecutive values.
+
+### Embedding Lookup — Line 73
+
+```python
+h = tl.load(token_emb_ptr + token_id * D_MODEL + d).to(tl.float32)
+```
+
+This loads the embedding for `token_id` from the embedding table. The embedding table
+has shape (32000, 1024), stored as a flat array. To get row `token_id`, we jump to
+offset `token_id * 1024` and load 1024 values.
+
+Example: if token_id = 42, we load elements at indices [42×1024, 42×1024+1, ..., 42×1024+1023].
+
+The `.to(tl.float32)` converts from bf16 (storage format) to f32 (computation format).
+The hidden state `h` lives in f32 registers throughout all 24 layers — it's never
+written back to global memory until the very end.
+
+### Layer Loop — Line 93
+
+```python
+for layer in tl.range(N_LAYERS):  # 0, 1, 2, ..., 23
+```
+
+This is a dynamic loop — the body is compiled once and executed 24 times. Using
+`tl.static_range` would unroll all 24 iterations, causing massive register spill
+(the compiler tries to keep all 24 iterations' variables live simultaneously)
+and 10+ minute compilation times.
+
+### Weight and KV Cache Offsets — Lines 94-109
+
+```python
+    w_base = layer * LAYER_W_SIZE      # start of this layer's weights in packed_w
+    kv_base = layer * LAYER_KV_SIZE    # start of this layer's KV caches
+    kc_base = kv_base                  # K cache is first
+    vc_base = kv_base + N_KV_HEADS * MAX_SEQ * D_HEAD  # V cache follows K
+
+    # Individual weight offsets within this layer
+    off = w_base
+    ln1_s_off = off;    off += D_MODEL              # RMSNorm1 scale
+    wq_off = off;       off += D_MODEL * D_MODEL    # query projection
+    wk_off = off;       off += D_MODEL * D_KV       # key projection
+    wv_off = off;       off += D_MODEL * D_KV       # value projection
+    wo_off = off;       off += D_MODEL * D_MODEL    # output projection
+    ln2_s_off = off;    off += D_MODEL              # RMSNorm2 scale
+    gate_off = off;     off += D_MODEL * D_FF       # SwiGLU gate
+    up_off = off;       off += D_MODEL * D_FF       # SwiGLU up
+    down_off = off                                  # SwiGLU down
+```
+
+This is pure offset arithmetic — no memory accesses. Since LAYER_W_SIZE is a constexpr,
+the compiler can compute these offsets at compile time.
+
+### RMSNorm 1 — Lines 112-113
+
+```python
+    ln_s = tl.load(packed_w_ptr + ln1_s_off + d).to(tl.float32)
+    h_norm = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
+```
+
+Step by step:
+1. Load the learned scale parameter (1024 values)
+2. Compute `h * h` — element-wise square of the hidden state
+3. `tl.sum(h * h)` — sum all 1024 squared values (a reduction across all threads)
+4. `/ D_MODEL` — divide by 1024 to get the mean
+5. `+ 1e-5` — add epsilon to prevent division by zero
+6. `tl.math.rsqrt(...)` — reciprocal square root (1/√x), a single fast instruction
+7. `h * rsqrt(...)` — normalize h
+8. `ln_s * ...` — multiply by learned scale
+
+Note: this operates on the **single-SM kernel** where D_MODEL is a power of 2 (1024),
+so no masking is needed. The multi-SM kernel (section 10) needs D_BLOCK padding and masks.
+
+### Attention with RoPE and GQA — Lines 115-208
+
+The attention computation loops over all 16 query heads:
+
+```python
+    attn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
+    h_norm_2d = h_norm[None, :].to(tl.bfloat16)  # (1, 1024) for tl.dot
+
+    cos_val = tl.load(cos_ptr + pos * D_HALF + dh_lo).to(tl.float32)  # (32,)
+    sin_val = tl.load(sin_ptr + pos * D_HALF + dh_lo).to(tl.float32)  # (32,)
+
+    for head in tl.range(N_HEADS):  # 0..15
+        kv_head = head // GQA_GROUP  # maps to 0..3
+```
+
+**RoPE cos/sin loading:** Position `pos` has 32 cos and 32 sin values (one per dimension
+pair in d_head=64). These are loaded once before the head loop since they're the same
+for all heads.
+
+**GQA mapping:** `kv_head = head // GQA_GROUP` where GQA_GROUP = 16//4 = 4.
+Heads 0-3 use KV head 0, heads 4-7 use KV head 1, etc.
+
+#### Q/K Projections with RoPE — Lines 126-149
+
+The Q and K projections are done in **two halves** for efficient RoPE application:
+
+```python
+        # Index vectors for this head's Q dimensions
+        hd_lo = head * D_HEAD + dh_lo    # e.g., head=3: [192, 193, ..., 223]
+        hd_hi = head * D_HEAD + dh_hi    # e.g., head=3: [224, 225, ..., 255]
+
+        # Q projection — low half
+        wq_lo = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd_lo[None, :])
+        q_lo = tl.dot(h_norm_2d, wq_lo).to(tl.float32).sum(axis=0)  # (1,1024)@(1024,32)→(32,)
+
+        # Q projection — high half
+        wq_hi = tl.load(packed_w_ptr + wq_off + d[:, None] * D_MODEL + hd_hi[None, :])
+        q_hi = tl.dot(h_norm_2d, wq_hi).to(tl.float32).sum(axis=0)  # (32,)
+
+        # RoPE on Q
+        Q_lo = q_lo * cos_val - q_hi * sin_val
+        Q_hi = q_lo * sin_val + q_hi * cos_val
+```
+
+Why split into halves? RoPE rotates pairs of dimensions: (q_0, q_32), (q_1, q_33), etc.
+By projecting the low half (dims 0-31) and high half (dims 32-63) separately, we can
+apply RoPE as simple multiply-and-add operations without any dimension shuffling.
+
+The same pattern applies to K projection:
+```python
+        # K projection and RoPE (using KV head indices, not query head indices)
+        wk_lo = tl.load(packed_w_ptr + wk_off + d[:, None] * D_KV + kv_hd_lo[None, :])
+        k_lo = tl.dot(h_norm_2d, wk_lo).to(tl.float32).sum(axis=0)
+        # ... similar for k_hi ...
+        K_new_lo = k_lo * cos_val - k_hi * sin_val
+        K_new_hi = k_lo * sin_val + k_hi * cos_val
+```
+
+Note that K uses `D_KV` (256) for column indexing, not `D_MODEL` (1024), because there
+are only 4 KV heads × 64 dims = 256 K columns total.
+
+#### V Projection — Lines 152-154
+
+```python
+        # V projection (no RoPE — only Q and K get rotary embeddings)
+        kv_hd = kv_head * D_HEAD + dh  # full 64-dim index for this KV head
+        wv = tl.load(packed_w_ptr + wv_off + d[:, None] * D_KV + kv_hd[None, :])
+        V_new = tl.dot(h_norm_2d, wv).to(tl.float32).sum(axis=0)  # (64,)
+```
+
+V doesn't need the lo/hi split because it doesn't get RoPE.
+
+#### KV Cache Write — Lines 157-159
+
+```python
+        # Store K (with RoPE) and V to output cache
+        tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh_lo, K_new_lo.to(tl.bfloat16))
+        tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh_hi, K_new_hi.to(tl.bfloat16))
+        tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+```
+
+The K values are stored **after RoPE** — this is important. When we later read K from
+the cache during attention, the rotation is already baked in. We don't need to re-apply
+RoPE to cached K values.
+
+#### Online Softmax (FlashAttention-style) — Lines 161-200
+
+This is the most mathematically interesting part. Standard attention computes:
+
+$$\text{attn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_\text{head}}}\right) V$$
+
+The naive implementation would:
+1. Compute all scores QK^T — a vector of length `pos+1` (all previous positions)
+2. Find the max, subtract it, exponentiate — the full softmax
+3. Multiply softmax weights by V values
+
+This requires storing all scores simultaneously. With 512 positions, that's fine (512
+floats). But the pattern doesn't scale, and more importantly, it requires loading all
+KV cache data at once.
+
+**Online softmax** processes the KV cache in tiles of KV_TILE=64 positions, maintaining
+a running estimate of the softmax that's corrected as new tiles arrive:
+
+```python
+        m_i = tl.full((1,), value=-1e9, dtype=tl.float32)  # running max score
+        l_i = tl.zeros((1,), dtype=tl.float32)              # running sum of exp(scores)
+        o_i = tl.zeros((D_HEAD,), dtype=tl.float32)          # running weighted sum of V
+
+        for t in tl.range(0, MAX_SEQ, KV_TILE):  # 0, 64, 128, ..., 448
+            tile_pos = t + tl.arange(0, KV_TILE)   # [t, t+1, ..., t+63]
+            tile_mask = tile_pos <= pos              # only valid positions
+```
+
+For each tile of 64 KV positions:
+
+**1. Load K tile and compute attention scores:**
+```python
+            K_tile_lo = tl.load(kv_in_ptr + kc_base + cache_off + tile_pos[:, None] * D_HEAD + dh_lo[None, :],
+                               mask=tile_mask[:, None], other=0.0)
+            # ... similarly for K_tile_hi ...
+
+            # Overlay the new K we just computed (it's not in kv_in yet)
+            K_tile_lo = tl.where(tile_pos[:, None] == pos, K_new_lo[None, :], K_tile_lo)
+
+            # Copy to output KV cache
+            tl.store(kv_out_ptr + kc_base + ..., K_tile_lo, mask=tile_mask[:, None])
+
+            # Score = Q · K (dot product split across lo/hi halves)
+            s = (tl.sum(Q_lo[None, :] * K_tile_lo, axis=1)
+               + tl.sum(Q_hi[None, :] * K_tile_hi, axis=1)) * scale
+            s = tl.where(tile_mask, s, -1e9)  # mask future positions
+```
+
+The score is `Q · K / sqrt(d_head)` where `scale = 1 / sqrt(64) ≈ 0.125`.
+
+**2. Online softmax update:**
+```python
+            m_ij = tl.max(s)                    # max score in this tile
+            m_new = tl.maximum(m_i, m_ij)       # new global max
+            alpha = tl.exp(m_i - m_new)         # correction factor for previous tiles
+            p = tl.exp(s - m_new)               # softmax weights for this tile
+            l_i = l_i * alpha + tl.sum(p)       # update running sum
+            o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)  # update weighted sum
+            m_i = m_new
+```
+
+Here's the key insight: when we find a new maximum in tile j that's larger than our
+running maximum, all previous softmax weights need to be scaled down. Instead of
+going back and re-scaling them, we apply a correction factor `alpha = exp(m_old - m_new)`.
+
+Numerical example with 3 tiles of 2 values each:
+
+```
+Tile 0: scores = [3.0, 1.0], V = [[1,0], [0,1]]
+  m_i = -1e9 → m_new = 3.0
+  alpha = exp(-1e9 - 3.0) ≈ 0 (initial, doesn't matter)
+  p = [exp(3-3), exp(1-3)] = [1.0, 0.135]
+  l_i = 0 * 0 + 1.135 = 1.135
+  o_i = [0,0] * 0 + [1.0*[1,0] + 0.135*[0,1]] = [1.0, 0.135]
+
+Tile 1: scores = [5.0, 2.0], V = [[1,1], [0,0]]
+  m_i = 3.0 → m_new = 5.0
+  alpha = exp(3.0 - 5.0) = 0.135 (scale down previous tiles!)
+  p = [exp(5-5), exp(2-5)] = [1.0, 0.050]
+  l_i = 1.135 * 0.135 + 1.050 = 1.203
+  o_i = [1.0, 0.135] * 0.135 + [1.0*[1,1] + 0.050*[0,0]] = [1.135, 1.018]
+
+Final: attn_out = o_i / l_i = [0.943, 0.846]
+```
+
+This gives the exact same result as computing the full softmax over all 4 scores
+[3, 1, 5, 2], but we never stored more than 2 scores at a time.
+
+**3. Final attention output:**
+```python
+        attn_out = o_i / l_i  # (D_HEAD,) — normalize by total softmax weight
+```
+
+#### O Projection — Lines 204-207
+
+```python
+        hd = head * D_HEAD + dh
+        wo = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + d[None, :])
+        attn_accum += tl.dot(attn_out[None, :].to(tl.bfloat16), wo).to(tl.float32).sum(axis=0)
+```
+
+Each head produces a (D_HEAD,)-dimensional output. The O projection maps it back
+to D_MODEL dimensions. All 16 heads' O projections are summed in `attn_accum`.
+
+After the head loop, the attention residual is added:
+```python
+    h = h + attn_accum  # (D_MODEL,) — residual connection
+```
+
+### SwiGLU FFN — Lines 211-230
+
+```python
+    # RMSNorm 2
+    ln_s = tl.load(packed_w_ptr + ln2_s_off + d).to(tl.float32)
+    h_norm = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
+    h_norm_2d = h_norm[None, :].to(tl.bfloat16)  # (1, 1024) for tl.dot
+
+    ffn_accum = tl.zeros((D_MODEL,), dtype=tl.float32)
+    for k in tl.range(0, D_FF, BLOCK_K):  # 0, 32, 64, ..., 2784
+        kk = k + tl.arange(0, BLOCK_K)    # [k, k+1, ..., k+31]
+```
+
+The FFN is tiled over the hidden dimension (d_ff=2816) in chunks of BLOCK_K=32.
+Each tile:
+
+```python
+        # Gate projection: (1, 1024) @ (1024, 32) → (32,)
+        gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :])
+        gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+
+        # Up projection: (1, 1024) @ (1024, 32) → (32,)
+        up_w = tl.load(packed_w_ptr + up_off + d[:, None] * D_FF + kk[None, :])
+        up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
+
+        # SwiGLU activation: SiLU(gate) * up
+        act = (gate * tl.sigmoid(gate)) * up
+
+        # Down projection: (1, 32) @ (32, 1024) → (1024,)
+        down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :])
+        ffn_accum += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
+```
+
+The tiling pattern: we compute 32 hidden units of the FFN at a time. For each tile,
+we load the gate and up weights, compute the gated activation, then immediately
+project back down and accumulate. This way, we never materialize the full 2816-dimensional
+hidden state — only 32 elements at a time, fitting comfortably in registers.
+
+After the FFN loop:
+```python
+    h = h + ffn_accum  # residual connection
+```
+
+### Output: Final RMSNorm + Tied Projection — Lines 232-245
+
+After all 24 layers, one final RMSNorm and output projection:
+
+```python
+    # Final RMSNorm
+    ln_s = tl.load(lnf_s_ptr + d).to(tl.float32)
+    h_final = ln_s * h * tl.math.rsqrt(tl.sum(h * h) / D_MODEL + 1e-5)
+    h_final_2d = h_final[None, :].to(tl.bfloat16)
+
+    # Tied output projection: h @ token_emb.T, tiled over vocabulary
+    for v_start in tl.range(0, VOCAB_PAD, OUTPUT_VTILE):  # 0, 32, 64, ..., 32224
+        vv = v_start + tl.arange(0, OUTPUT_VTILE)          # [v_start, ..., v_start+31]
+        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :])
+        tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
+        tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)  # mask padding
+        tl.store(logits_ptr + vv, tile_logits)
+```
+
+The output projection computes 32 logits at a time: (1, 1024) @ (1024, 32) → (32,).
+Padded vocab entries beyond VOCAB_SIZE get -1e9 (negative infinity), so they can never
+be selected.
+
+### Python Wrapper — `fused_decode_nlayer()` at line 323
+
+```python
+def fused_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size):
+    ...
+    logits_pad, kv_out = jt.triton_call(
+        w["token_emb"], w["packed_w"], w["lnf_s"], w["output_proj_padded"],
+        w["cos"], w["sin"],
+        jnp.int32(token_id), jnp.int32(pos),
+        kv_packed,
+        kernel=_fused_decode_nlayer,
+        out_shape=[
+            jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),    # logits
+            jax.ShapeDtypeStruct((total_kv_size,), jnp.bfloat16),  # updated KV caches
+        ],
+        grid=(1,),          # single block = single SM
+        num_warps=4,        # 128 threads per block
+        num_stages=1,       # no double-buffering (not enough shared memory)
+        ...
+    )
+    return logits_pad[:vocab_size], kv_out
+```
+
+`jt.triton_call` is the bridge between JAX and Triton: it takes JAX arrays, passes
+them to the Triton kernel as raw pointers, and wraps the outputs back as JAX arrays.
+`out_shape` tells JAX what output arrays to allocate.
+
+`grid=(1,)` means one block, one SM. This is the simplest launch — no parallelism,
+no synchronization needed. The downside: 79 of our 80 SMs sit idle.
+
+---
+
+## 10. The Multi-SM Decode Kernel
+
+The multi-SM kernel (`kernels/multi_sm_decode.py`) is our fast decode kernel. It does
+the same computation as the single-SM kernel but distributes work across all 16 blocks
+(one per attention head, with `kv_splits=1`), using the entire GPU.
+
+### Why Multi-SM?
+
+The single-SM kernel runs on one SM. The RTX 4080 Super has 80 SMs. Even though
+inference is bandwidth-bound (not compute-bound), using multiple SMs helps because:
+
+1. **Multiple memory controllers:** Different SMs can issue memory requests in parallel,
+   better saturating the HBM bandwidth channels
+2. **Parallelizable attention:** Each head's attention is independent — 16 heads can
+   run on 16 SMs simultaneously
+3. **Distributed FFN:** The 2816-wide FFN can be split across blocks, each handling
+   a portion
+
+But multi-SM introduces a problem: blocks need to **synchronize** at certain points.
+For example, all blocks must finish attention before any block starts the FFN (because
+the FFN input depends on attention output). This requires barriers.
+
+### Architecture Overview — `multi_sm_decode.py:1-21`
+
+```
+grid = (N_HEADS * KV_SPLITS,) = (16 * 1,) = 16 blocks
+
+Per layer, 3 phases with barriers between them:
+
+Phase 1: [all 16 blocks independently]
+  RMSNorm1 → QKV projection → RoPE → attention → O projection
+  Each block handles ONE attention head
+  → write results to workspace → BARRIER
+
+Phase 2: [all 16 blocks independently]
+  Merge attention from all heads → residual → RMSNorm2 → SwiGLU FFN
+  Each block handles D_FF/16 ≈ 176 hidden units of FFN
+  → write FFN partial to workspace → BARRIER
+
+Phase 3: [all 16 blocks independently]
+  Sum FFN partials from all blocks → residual → h ready for next layer
+  → BARRIER (prevent next layer from overwriting before all reads complete)
+```
+
+### D_BLOCK Padding — Lines 72-75
+
+```python
+    pid = tl.program_id(0)               # 0..15, one per head
+    head_id = pid // KV_SPLITS           # with KV_SPLITS=1: head_id = pid
+    kv_split = pid % KV_SPLITS           # with KV_SPLITS=1: always 0
+    d = tl.arange(0, D_BLOCK)            # [0, 1, ..., D_BLOCK-1]
+    d_mask = d < D_MODEL                 # [True, True, ..., True] when D_BLOCK == D_MODEL
+```
+
+`tl.arange` requires a **power-of-2** argument. D_MODEL=1024 happens to already be a
+power of 2, so D_BLOCK=1024 and d_mask is all True. But the code handles the general
+case: if D_MODEL were 768, D_BLOCK would be 1024, and d_mask would be True for indices
+0-767 and False for 768-1023.
+
+The mask is applied everywhere data touches D_MODEL dimensions:
+```python
+h = tl.load(ptr + d, mask=d_mask, other=0.0)   # load with padding
+tl.store(ptr + d, value, mask=d_mask)           # store only valid elements
+h_sq = tl.where(d_mask, h * h, 0.0)            # zero padding in RMSNorm variance
+```
+
+This is computed by `_next_power_of_2()` in the Python wrapper:
+```python
+def _next_power_of_2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+```
+
+### Workspace Layout — Lines 80-85, 389-397
+
+The kernel uses a shared workspace buffer for cross-block communication. It has
+separate regions to avoid **race conditions** (explained below):
+
+```python
+    attn_partial_ptr = workspace_ptr                     # attention O-proj results
+    ffn_partial_ptr = workspace_ptr + FFN_PARTIAL_OFF    # FFN partial results (separate!)
+    attn_ml_ptr = workspace_ptr + ATTN_ML_OFF            # attention m and l values
+    barrier_ptr = workspace_ptr + BARRIER_OFF            # barrier counters
+    done_ptr = workspace_ptr + DONE_OFF                  # done flags (unused but allocated)
+    argmax_ptr = workspace_ptr + ARGMAX_OFF              # per-block argmax results
+```
+
+The Python wrapper computes these offsets:
+```python
+    # ffn_partial_off = total_blocks * d_block
+    #   → attn partials: [0, ffn_partial_off)  — 16 × 1024 = 16,384 floats
+    # attn_ml_off = ffn_partial_off + total_blocks * d_block
+    #   → FFN partials: [ffn_partial_off, attn_ml_off) — 16 × 1024 = 16,384 floats
+    # barrier_off = attn_ml_off + total_blocks * 2
+    #   → m/l pairs: total_blocks × 2 = 32 floats
+    # done_off = barrier_off + n_barriers
+    #   → n_barriers = 3 × 24 + 1 = 73 barrier counters
+    # argmax_off = done_off + n_barriers
+    #   → argmax: total_blocks × 2 = 32 floats (value + index per block)
+```
+
+**Why separate attn and FFN buffers?** In earlier versions, both attention O-projection
+results and FFN partial sums shared the same buffer region. This caused a race condition:
+when a fast block finished Phase 1 (writing attention output) and moved to Phase 2
+(writing FFN partials), it overwrote data that a slow block hadn't read yet. Separating
+the buffers eliminated this bug.
+
+### Projection Tiling (PROJ_TILE) — Lines 139-152
+
+The single-SM kernel loads full weight matrices like `(D_MODEL, D_HEAD) = (1024, 64)`.
+This is 1024 × 64 × 2 = 128 KB in bf16, which exceeds the 101 KB shared memory limit.
+
+The multi-SM kernel tiles projections with PROJ_TILE=512:
+
+```python
+    PROJ_TILE = tl.constexpr(512)
+
+    Q = tl.zeros((D_HEAD,), dtype=tl.float32)
+    K_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+    V_new = tl.zeros((D_HEAD,), dtype=tl.float32)
+
+    for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):  # dd = 0, 512
+        dt = dd + tl.arange(0, PROJ_TILE)   # [0..511], then [512..1023]
+        dt_mask = dt < D_MODEL
+
+        # Load h_norm tile from scratch buffer
+        h_tile = tl.load(attn_partial_ptr + pid * D_BLOCK + dt,
+                         mask=dt_mask, other=0.0).to(tl.bfloat16)
+
+        # Q projection tile: (1, 512) @ (512, 64) → (64,)
+        wq_t = tl.load(packed_w_ptr + wq_off + dt[:, None] * D_MODEL + hd[None, :],
+                       mask=dt_mask[:, None], other=0.0).to(tl.bfloat16)
+        Q += tl.dot(h_tile[None, :], wq_t).to(tl.float32).sum(axis=0)
+
+        # K, V projections similarly...
+```
+
+Two iterations: first tile processes h[0:512] × W[0:512, :], second processes
+h[512:1024] × W[512:1024, :]. Each tile loads (512, 64) = 64 KB of weights, well
+within shared memory limits.
+
+The `.sum(axis=0)` after `tl.dot` is necessary because tl.dot returns a 2D result
+even for (1, 512) × (512, 64) — it gives (1, 64), and `.sum(axis=0)` collapses the
+first dimension.
+
+Note `h_norm` is **stored to the workspace buffer** before the projection loop:
+```python
+    tl.store(attn_partial_ptr + pid * D_BLOCK + d, h_norm, mask=d_mask)
+```
+This is because the tiled projection reads `h_norm` in chunks, and we can't read
+different subsets of a register vector — we need to write it to accessible memory first.
+
+### RoPE via Scratch Buffer — Lines 154-173
+
+The multi-SM kernel applies RoPE through a scratch buffer because RoPE shuffles
+dimensions (it needs to read q_lo and q_hi separately, which requires the values
+to be in addressable memory, not just registers):
+
+```python
+    cos_val = tl.load(cos_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+    sin_val = tl.load(sin_ptr + pos * D_HALF + rope_lo).to(tl.float32)
+
+    scratch = attn_partial_ptr + pid * D_BLOCK  # reuse workspace
+
+    # Store Q to scratch, read halves, rotate, read back
+    tl.store(scratch + dh, Q)
+    q_lo = tl.load(scratch + rope_lo)           # first 32 elements
+    q_hi = tl.load(scratch + D_HALF + rope_lo)  # last 32 elements
+    tl.store(scratch + rope_lo, q_lo * cos_val - q_hi * sin_val)
+    tl.store(scratch + D_HALF + rope_lo, q_lo * sin_val + q_hi * cos_val)
+    Q = tl.load(scratch + dh)                   # read rotated Q back
+```
+
+This store-rotate-load pattern is necessary because Triton doesn't support arbitrary
+indexing into register vectors — you can't write `Q[0:32]` to get the first half of
+a register-resident vector. Writing to memory, reading specific indices, and writing
+back is the workaround.
+
+### KV Cache Writes — Lines 175-208
+
+```python
+    # Only one block per kv_head writes to avoid redundant concurrent stores
+    is_kv_primary = (head_id == kv_head * GQA_GROUP)
+    if is_kv_primary:
+        tl.store(kv_out_ptr + kc_base + cache_off + pos * D_HEAD + dh, K_new.to(tl.bfloat16))
+        tl.store(kv_out_ptr + vc_base + cache_off + pos * D_HEAD + dh, V_new.to(tl.bfloat16))
+```
+
+With GQA, multiple query heads (e.g., heads 0-3) share the same KV head (KV head 0).
+All 4 blocks compute the same K_new and V_new for KV head 0, but only one needs to
+write it. `is_kv_primary` ensures only head 0 (the first in the group) writes.
+
+During the attention loop, the same principle applies — only primary blocks write
+back KV cache tiles:
+```python
+            K_tile = tl.where(tile_pos[:, None] == pos, K_new[None, :], K_tile)
+            if is_kv_primary:
+                tl.store(kv_out_ptr + ..., K_tile.to(tl.bfloat16), mask=tile_mask[:, None])
+```
+
+### L2 Cache Eviction Hints — Lines 194-204
+
+```python
+            K_tile = tl.load(kv_in_ptr + ...,
+                            mask=tile_mask[:, None], other=0.0,
+                            eviction_policy='evict_last')    # keep in L2
+```
+
+`eviction_policy='evict_last'` tells the L2 cache controller: "this data is likely
+to be needed again, evict it last." KV cache data is reused across decode steps —
+position 0's K values are read at every step — so keeping it in L2 avoids HBM
+round-trips.
+
+Later, for the output projection:
+```python
+        out_w = tl.load(output_proj_ptr + ...,
+                        eviction_policy='evict_first')   # evict immediately
+```
+
+Output projection weights are used once and never again (they're not shared across
+layers), so we hint `evict_first` to make room for more useful data.
+
+These hints give ~3% throughput improvement.
+
+### Attention Scores — Lines 210-218
+
+```python
+            s = tl.sum(Q[None, :] * K_tile, axis=1) * scale
+            s = tl.where(tile_mask, s, -1e9)
+```
+
+Unlike the single-SM kernel (which splits Q into lo/hi halves), the multi-SM kernel
+uses the full 64-dim Q and K_tile. The RoPE is already applied via the scratch buffer,
+so Q has the complete rotated vector.
+
+The online softmax update is identical to the single-SM version:
+```python
+            m_ij = tl.max(s)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new)
+            l_i = l_i * alpha + tl.sum(p)
+            o_i = o_i * alpha + tl.sum(p[:, None] * V_tile, axis=0)
+            m_i = m_new
+```
+
+### O Projection (Tiled) — Lines 224-230
+
+```python
+    for dd in tl.static_range(0, D_BLOCK, PROJ_TILE):
+        dt = dd + tl.arange(0, PROJ_TILE)
+        dt_mask = dt < D_MODEL
+        wo_t = tl.load(packed_w_ptr + wo_off + hd[:, None] * D_MODEL + dt[None, :],
+                       mask=dt_mask[None, :], other=0.0).to(tl.bfloat16)
+        o_tile = tl.dot(attn_out[None, :].to(tl.bfloat16), wo_t).to(tl.float32).sum(axis=0)
+        tl.store(attn_partial_ptr + pid * D_BLOCK + dt, o_tile, mask=dt_mask)
+```
+
+Same PROJ_TILE=512 tiling as for QKV projections. The O projection result is stored
+to the workspace for the next phase (merging attention outputs from all heads).
+
+After the O projection, the block also stores its attention statistics (m and l):
+```python
+    tl.store(attn_ml_ptr + pid * 2, tl.sum(m_i))
+    tl.store(attn_ml_ptr + pid * 2 + 1, tl.sum(l_i))
+```
+
+### Atomic Barriers and Memory Fences — Lines 234-241
+
+This is the trickiest part of the multi-SM kernel. After Phase 1 (attention), all
+blocks must wait for each other before Phase 2 can read their results.
+
+```python
+    # Global memory fence: ensure all stores are visible to other SMs
+    tl.debug_barrier()
+    tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;",
+                              "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+    # Barrier: each block increments counter, then spins until all blocks arrive
+    b0 = layer * 3          # barrier index for this phase of this layer
+    tl.atomic_add(barrier_ptr + b0, 1.0, sem='acq_rel', scope='gpu')
+    while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+        pass
+
+    # Another memory fence after passing the barrier
+    tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;",
+                              "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+```
+
+Let's break this down:
+
+**`tl.debug_barrier()`** — A block-level barrier that ensures all threads within this
+block have completed their stores. This is a sync point within one block (128 threads).
+
+**`membar.gl` (global memory barrier)** — This is inline PTX assembly (the lowest level
+of GPU programming). `membar.gl` is a "memory barrier, global level" instruction that
+ensures all previous memory writes from this SM are visible to all other SMs. Without
+this, the Triton compiler might reorder stores to appear after the atomic barrier,
+meaning other blocks would pass the barrier but read stale data.
+
+The unusual syntax `"membar.gl; mov.u32 $0, 0;"` adds a dummy `mov` instruction because
+`tl.inline_asm_elementwise` requires an output — the `membar.gl` itself doesn't produce
+one. The `"=r"` constraint says "output to a register," `is_pure=False` prevents the
+compiler from optimizing it away, and `pack=1` says it's a scalar operation.
+
+**Atomic barrier pattern:**
+```python
+    # Step 1: "I've arrived" — atomically increment the counter
+    tl.atomic_add(barrier_ptr + b0, 1.0, sem='acq_rel', scope='gpu')
+
+    # Step 2: spin-wait until all blocks have arrived
+    while tl.atomic_add(barrier_ptr + b0, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+        pass
+```
+
+Each block atomically adds 1 to the barrier counter. Then it spins, reading the counter
+(adding 0 is a read that goes through the atomic unit to get the latest value) until
+it reaches TOTAL_BLOCKS (16). When all 16 blocks have incremented, the counter equals 16
+and everyone proceeds.
+
+`sem='acq_rel'` on the increment means:
+- `acquire`: all memory reads after this see the latest writes from other threads
+- `release`: all memory writes before this are visible to other threads
+
+`sem='acquire'` on the read means: when we see the counter reach 16, we're guaranteed
+to also see all the stores that other blocks made before their increments.
+
+`scope='gpu'` means this applies across all SMs on the GPU (not just within one SM).
+
+**Why 3 barriers per layer?** Each layer has:
+- Barrier 0 (`layer*3`): after Phase 1 (attention) — before merging attention outputs
+- Barrier 1 (`layer*3+1`): after Phase 2 (FFN) — before reducing FFN partials
+- Barrier 2 (`layer*3+2`): after Phase 3 (reduce) — before next layer overwrites buffers
+
+Plus one final barrier (`3*N_LAYERS`) for the output projection.
+
+Total barrier count: `3 × 24 + 1 = 73`. These need separate counter slots in the
+workspace buffer — the barrier slot overflow bug (where 73 barriers were allocated
+only 32 slots, causing barriers to corrupt adjacent memory) was one of the hardest
+bugs to find.
+
+### Phase 2: Merge Attention + FFN — Lines 243-291
+
+After the barrier, each block reads all other blocks' attention results and merges them:
+
+```python
+    # Merge attention outputs from all heads with online softmax correction
+    attn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
+    for head in tl.range(N_HEADS):    # 0..15
+        m_max_val = tl.full((), -1e9, dtype=tl.float32)
+        # Find max m across KV splits for this head
+        for s in tl.static_range(KV_SPLITS):  # with KV_SPLITS=1, just one iteration
+            m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+            m_max_val = tl.maximum(m_max_val, m_s)
+
+        # Merge with correction weights
+        l_total = tl.full((), 0.0, dtype=tl.float32)
+        o_merged = tl.zeros((D_BLOCK,), dtype=tl.float32)
+        for s in tl.static_range(KV_SPLITS):
+            m_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2)
+            l_s = tl.load(attn_ml_ptr + (head * KV_SPLITS + s) * 2 + 1)
+            o_s = tl.load(attn_partial_ptr + (head * KV_SPLITS + s) * D_BLOCK + d,
+                          mask=d_mask, other=0.0)
+            w = l_s * tl.exp(m_s - m_max_val)    # correction weight
+            l_total = l_total + w
+            o_merged = o_merged + o_s * w
+        attn_total = attn_total + o_merged / l_total
+    h = h + attn_total
+```
+
+With KV_SPLITS=1, there's only one "split" per head, so the merge is trivially
+`attn_total += o_s / l_s` (the correction factor exp(m - m) = 1). The merge logic
+exists for KV_SPLITS>1 where each head's attention is split across multiple blocks
+for even more parallelism — but kv_splits=1 turned out to be more reliable.
+
+#### Distributed SwiGLU FFN — Lines 270-291
+
+```python
+    # Each block handles a slice of the FFN hidden dimension
+    ff_start = pid * FF_PER_BLOCK
+    ffn_partial = tl.zeros((D_BLOCK,), dtype=tl.float32)
+
+    for k in tl.range(0, FF_PER_BLOCK, BLOCK_K):  # BLOCK_K = 16
+        kk = ff_start + k + tl.arange(0, BLOCK_K)
+        ff_mask = kk < D_FF
+        # Gate: (1, D_BLOCK) @ (D_BLOCK, 16) → (16,)
+        gate_w = tl.load(packed_w_ptr + gate_off + d[:, None] * D_FF + kk[None, :],
+                         mask=d_mask[:, None] & ff_mask[None, :], other=0.0)
+        gate = tl.dot(h_norm_2d, gate_w).to(tl.float32).sum(axis=0)
+        # Up: similar
+        up_w = tl.load(...)
+        up = tl.dot(h_norm_2d, up_w).to(tl.float32).sum(axis=0)
+        # SwiGLU
+        act = (gate * tl.sigmoid(gate)) * up
+        # Down: (1, 16) @ (16, D_BLOCK) → (D_BLOCK,)
+        down_w = tl.load(packed_w_ptr + down_off + kk[:, None] * D_MODEL + d[None, :],
+                         mask=ff_mask[:, None] & d_mask[None, :], other=0.0)
+        ffn_partial += tl.dot(act[None, :].to(tl.bfloat16), down_w).to(tl.float32).sum(axis=0)
+```
+
+**FF_PER_BLOCK calculation** (Python wrapper, lines 385-387):
+```python
+    raw_ff = (d_ff + total_blocks - 1) // total_blocks   # ceil(2816 / 16) = 176
+    ff_per_block = ((raw_ff + block_k - 1) // block_k) * block_k  # ceil(176/16)*16 = 176
+```
+
+Each block handles 176 hidden units (out of 2816 total). With BLOCK_K=16, that's
+11 tiles per block. The `ff_mask = kk < D_FF` handles the last block cleanly when
+D_FF isn't evenly divisible.
+
+Note BLOCK_K=16 in the multi-SM kernel vs BLOCK_K=32 in the single-SM kernel. The
+multi-SM kernel loads both gate and up weights simultaneously (both (D_BLOCK, BLOCK_K)
+tiles), so each tile is 1024 × 16 × 2 = 32 KB. Two tiles = 64 KB, fitting within
+shared memory. With BLOCK_K=32, each tile would be 64 KB, and two would be 128 KB >
+101 KB.
+
+The FFN partial is stored to a **separate buffer** from attention partials:
+```python
+    tl.store(ffn_partial_ptr + pid * D_BLOCK + d, ffn_partial, mask=d_mask)
+```
+
+### Phase 3: Reduce FFN + Residual — Lines 301-312
+
+```python
+    # Sum FFN partials from all blocks
+    ffn_total = tl.zeros((D_BLOCK,), dtype=tl.float32)
+    for i in tl.range(TOTAL_BLOCKS):  # 0..15
+        ffn_total += tl.load(ffn_partial_ptr + i * D_BLOCK + d, mask=d_mask, other=0.0)
+    h = h + ffn_total
+
+    # Barrier to prevent next layer from overwriting before all reads complete
+    tl.inline_asm_elementwise("membar.gl; mov.u32 $0, 0;", ...)
+    b2 = layer * 3 + 2
+    tl.atomic_add(barrier_ptr + b2, 1.0, sem='acq_rel', scope='gpu')
+    while tl.atomic_add(barrier_ptr + b2, 0.0, sem='acquire', scope='gpu') < TOTAL_BLOCKS:
+        pass
+```
+
+Every block reads all 16 FFN partials and sums them. This is **redundant computation**
+— all 16 blocks compute the same sum. But it's faster than having one block compute
+the sum and broadcasting it (which would require another barrier).
+
+The final barrier ensures no block starts the next layer (which reuses the workspace
+buffers) before all blocks have finished reading.
+
+### Output: Final RMSNorm + Distributed Argmax — Lines 314-357
+
+```python
+    # Final RMSNorm (same as within layers)
+    ln_s = tl.load(lnf_s_ptr + d, mask=d_mask, other=0.0).to(tl.float32)
+    h_sq = tl.where(d_mask, h * h, 0.0)
+    h_final = tl.where(d_mask,
+                       ln_s * h * tl.math.rsqrt(tl.sum(h_sq) / D_MODEL + 1e-5),
+                       0.0)
+    h_final_2d = h_final[None, :].to(tl.bfloat16)
+```
+
+#### Distributed Output Projection
+
+```python
+    # Each block handles TILES_PER_BLOCK tiles of the vocabulary
+    TILES_PER_BLOCK = VOCAB_PAD // (OUTPUT_VTILE * TOTAL_BLOCKS)
+    #  = 32256 // (32 * 16) = 63 tiles per block
+
+    best_val = -1e9
+    best_idx = 0.0
+    for tile_idx in tl.range(0, TILES_PER_BLOCK):
+        v_start = (pid * TILES_PER_BLOCK + tile_idx) * OUTPUT_VTILE
+        vv = v_start + tl.arange(0, OUTPUT_VTILE)
+        out_w = tl.load(output_proj_ptr + d[:, None] * VOCAB_PAD + vv[None, :],
+                        mask=d_mask[:, None], other=0.0,
+                        eviction_policy='evict_first').to(tl.bfloat16)
+        tile_logits = tl.dot(h_final_2d, out_w).to(tl.float32).sum(axis=0)
+        tile_logits = tl.where(vv < VOCAB_SIZE, tile_logits, -1e9)
+        tl.store(logits_ptr + vv, tile_logits)
+
+        # Track local best for in-kernel argmax
+        tile_max = tl.max(tile_logits)
+        if tile_max > best_val:
+            best_val = tile_max
+            best_idx = (v_start + tl.argmax(tile_logits, axis=0)).to(tl.float32)
+```
+
+The vocabulary is striped across blocks: block 0 handles vocab indices
+[0..62×32-1], block 1 handles [63×32..125×32-1], etc. Each block computes 63 tiles
+of 32 logits each = 2016 logits per block, totaling 16 × 2016 = 32,256 logits.
+
+#### In-Kernel Argmax — Lines 339-357
+
+Finding the best token entirely on the GPU avoids a round-trip to the CPU:
+
+```python
+    # Step 1: each block writes its local best value and index
+    tl.store(argmax_ptr + pid * 2, best_val)
+    tl.store(argmax_ptr + pid * 2 + 1, best_idx)
+
+    # Barrier to ensure all blocks have written
+    tl.inline_asm_elementwise("membar.gl; ...", ...)
+    tl.atomic_add(barrier_ptr + N_BARRIERS, 1.0, sem='acq_rel', scope='gpu')
+    while tl.atomic_add(barrier_ptr + N_BARRIERS, 0.0, ...) < TOTAL_BLOCKS:
+        pass
+
+    # Step 2: block 0 finds the global best
+    if pid == 0:
+        global_best_val = -1e9
+        global_best_idx = 0.0
+        for i in tl.range(TOTAL_BLOCKS):    # 0..15
+            v = tl.load(argmax_ptr + i * 2)
+            idx = tl.load(argmax_ptr + i * 2 + 1)
+            if v > global_best_val:
+                global_best_val = v
+                global_best_idx = idx
+        tl.store(next_token_ptr, global_best_idx.to(tl.int32))
+```
+
+Two-level argmax: each block finds its best among ~2016 logits, then block 0 finds
+the global best among the 16 per-block winners. This avoids transferring all 32000
+logits to the CPU for argmax — only the single winning token ID comes back.
+
+The `next_token_ptr` output is a single int32 — the predicted next token. When using
+greedy decoding (temperature=0), this is all generate.py needs from the kernel.
+
+### Python Wrapper — `multi_sm_decode_nlayer()` at line 369
+
+```python
+def multi_sm_decode_nlayer(w, config, token_id, pos, kv_packed, vocab_size, kv_splits=2):
+    ...
+    logits_pad, kv_out, next_token = jt.triton_call(
+        w["token_emb"], w["packed_w"], w["lnf_s"], w["output_proj_padded"],
+        w["cos"], w["sin"],
+        jnp.int32(token_id), jnp.int32(pos),
+        kv_packed,
+        workspace,
+        kernel=_multi_sm_decode,
+        out_shape=[
+            jax.ShapeDtypeStruct((vocab_pad,), jnp.float32),       # logits
+            jax.ShapeDtypeStruct((total_kv_size,), jnp.bfloat16),  # updated KV
+            jax.ShapeDtypeStruct((1,), jnp.int32),                 # next_token
+        ],
+        grid=(total_blocks,),    # 16 blocks (one per head)
+        num_warps=4,
+        num_stages=1,
+        ...
+    )
+    return next_token[0], logits_pad[:vocab_size], kv_out
+```
+
+The key differences from the single-SM wrapper:
+1. `grid=(total_blocks,)` instead of `grid=(1,)` — 16 blocks
+2. A `workspace` buffer is passed in for cross-block communication
+3. Three outputs instead of two — `next_token` is the in-kernel argmax result
+4. Extra constexpr parameters for workspace offsets, block work distribution, etc.
 
 ---
 
 ## 11. The Generation Loop
 
-The complete generation pipeline (simplified from `generate.py`):
+`generate.py` orchestrates the end-to-end text generation pipeline.
+
+### Prefill — `_prefill()` at line 82
 
 ```python
-def generate(params, config, prompt_ids, n_tokens, vocab_size):
-    # 1. Prefill: JAX processes entire prompt, produces KV caches
-    x = jnp.pad(prompt_ids, (0, ctx_len - len(prompt_ids)))
-    logits, k_caches, v_caches = prefill_with_kv(params, config, x)
+def _prefill(params, config, prompt_ids, vocab_size):
+    ctx_len = config["context_len"]      # 512
+    prompt_len = len(prompt_ids)
+    # Pad prompt to context length (JAX needs fixed shapes for XLA compilation)
+    x = jnp.pad(prompt_ids, (0, ctx_len - prompt_len)).astype(jnp.int32)
 
-    # 2. Pack weights and KV caches for the Triton decode kernel
+    # Run JAX prefill: processes all tokens in parallel, returns logits + KV caches
+    logits, k_caches, v_caches = prefill_with_kv(params, config, x)
+    _ = logits.block_until_ready()  # force synchronous execution
+```
+
+`block_until_ready()` forces JAX to complete the computation before continuing.
+JAX normally uses lazy evaluation — computations are queued and executed later.
+For benchmarking and sequencing, we need the result now.
+
+```python
+    # Prepare decode weights (pack all layer weights, prepare output proj, etc.)
     w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=1)
+
+    # Pack KV caches into flat buffer for Triton kernel
     kv_packed = pack_kv_caches(k_caches, v_caches)
 
-    # 3. First token from prefill logits
-    token = jnp.argmax(logits[len(prompt_ids) - 1])
-
-    # 4. Decode loop: one Triton kernel call per token
-    for i in range(n_tokens):
-        token, _, kv_packed = multi_sm_decode_nlayer(
-            w, config, token, len(prompt_ids) + i, kv_packed, vocab_size, kv_splits=1)
-        print(decode_fn([int(token)]), end='', flush=True)
+    # First decode token comes from the last prompt position's logits
+    first_logits = logits[prompt_len - 1]
 ```
 
-**Step 1:** JAX prefill runs the prompt through all 24 layers, saving K/V at each layer.
-
-**Step 2:** `prepare_decode_weights_nlayer` packs all weights into a single flat bf16
-buffer. `pack_kv_caches` does the same for KV caches. This is done once before decoding.
-
-**Step 3:** `argmax` picks the most probable next token (greedy decoding).
-
-**Step 4:** Each iteration calls the Triton multi-SM decode kernel. The kernel returns
-the next token (via in-kernel argmax) and the updated KV cache. The KV cache grows by
-one entry per step — the kernel writes the new K/V at the current position.
-
----
-
-## 12. Results and Why It's Faster
-
-### The numbers (d=64, 1 layer)
-
-```
-Prompt: 64 tokens, Generate: 64 tokens
-
-Triton fused:   740 tok/s  (86.5 ms total)
-JAX baseline:   185 tok/s  (362.6 ms total)
-Speedup:        4.0x
-```
-
-Both produce identical text, confirming the kernels are correct.
-
-### Where does the speedup come from?
-
-**1. Fewer HBM round-trips.** The prefill does one round-trip instead of ~15. The decode
-kernel does one kernel launch instead of ~15. Over 64 decode steps, that's ~900 fewer
-kernel launches.
-
-**2. No kernel launch overhead.** Each GPU kernel launch has 5-10 µs of overhead. For JAX's
-~15 kernels per forward pass × 64 decode steps = ~960 launches × ~7 µs = ~6.7 ms of pure
-overhead. The Triton version has 65 launches (1 prefill + 64 decode) × ~7 µs = ~0.5 ms.
-
-**3. Data stays in registers.** Intermediate activations (the `h` matrix, attention scores,
-FFN hidden states) never leave registers. In JAX, each intermediate is written to HBM
-(~400 cycles per read/write) and read back. In the fused kernel, it's ~1 cycle per access.
-
-**4. No redundant computation.** The KV cache means the decode kernel only processes 1 token
-instead of recomputing all previous tokens. (JAX doesn't implement KV caching in our
-baseline, so it processes the full growing sequence each time.)
-
-### What it's NOT
-
-- **Not better math.** Both do the same multiplications.
-- **Not parallel tokens.** Both process one token at a time during decode.
-- **Not quantization.** Both use bf16 for matmuls.
-
-The speedup is purely from keeping data close to the compute units.
-
-This was the starting point. Everything that follows is about scaling this approach to a
-real model and dealing with the problems that emerge at larger scale.
-
----
-
-## 13. Scaling the Model
-
-The fused-kernel approach works brilliantly at d=64 because the entire model fits in
-registers. But what happens when we scale up?
-
-### The scaling journey
-
-```
-d=64,  1L,   66K params:    740 tok/s  (4.0x vs JAX)
-d=128, 2L,  674K params:   2504 tok/s  (14.0x — in-kernel KV cache updates)
-d=256, 4L, 5.3M params:   1396 tok/s  (15.1x — fused N-layer decode)
-d=512, 8L,  30M params:    287 tok/s  (single SM, 2% bandwidth utilization)
-                          4777 tok/s  (persistent kernel, final)
-```
-
-Each scale-up introduced new problems. Here's what happened and how we solved them.
-
-### d=128: The model no longer fits in one block
-
-At d=128, the hidden state `h` is (128, 128) = 64 KB — it can't coexist with the attention
-scores matrix (also 128 × 128 = 64 KB) in the 130 KB register file. Solution: **multi-block
-prefill**. Tile the sequence dimension into BLOCK_SEQ=32 row blocks. Each of 4 thread blocks
-handles 32 positions. h_block is (32, 128) = 16 KB. Scores are (32, 128) = 16 KB. Fits.
-
-The cost is that blocks can't communicate within a single kernel. So projections (which write
-K/V to HBM) must be a separate kernel launch from attention (which reads K/V from HBM).
-Three kernels per layer instead of one.
-
-The decode kernel stays fused — with M=1, all tensors are 1D and tiny.
-
-The three biggest optimizations at this scale:
-
-1. **In-kernel KV cache updates (3.6x win).** Instead of outputting K_new/V_new and having
-   JAX do `.at[pos].set()` (which copies the entire cache per step), the kernel writes the
-   updated cache directly to an output buffer. This eliminated the biggest bottleneck.
-
-2. **Precomputed bf16 weights (57% win).** `.astype(bf16)` inside the decode loop created
-   a new JAX array per call — 28 weights × 63 steps = 1764 allocations. Converting once
-   before the loop: free.
-
-3. **Fused multi-layer decode (35% win).** Instead of one kernel call per layer, a single
-   kernel processes all layers with h staying in registers between them.
-
-### d=256: Fused N-layer decode with packed buffers
-
-At 4 layers, passing individual weight pointers becomes unwieldy (50+ arguments). Solution:
-**packed weight buffer** — concatenate all per-layer weights into one bf16 buffer. The kernel
-computes offsets from the layer index. Same for KV caches: all layers packed into one flat
-buffer.
-
-FlashAttention becomes necessary at context > 256. The full scores matrix would be (16, 512)
-= 32 KB per head, too large alongside K and V. Tiled KV with online softmax (KV_TILE=64)
-keeps peak memory at ~20 KB per tile regardless of context length.
-
-### d=512: Register pressure and the single-SM bottleneck
-
-At d=512, two critical problems emerge:
-
-**Register overflow.** Element-wise projections `tl.sum(h[:, None] * W, axis=0)` create a
-(512, 32) intermediate = 128 registers per thread. The product with h needs another 128.
-Total: 260 > 255 limit. Fix: `tl.dot` tiles the reduction internally, never materializing
-the full intermediate.
-
-**Single-SM bottleneck.** The fused kernel runs on grid=(1,) — one thread block on one SM.
-The RTX 4080 Super has 80 SMs. At d=512 with 8 layers, the kernel takes 3.48 ms per token.
-Profiling showed: kernel=93% of time, host=3%. The GPU is 98% idle — not because it's
-waiting for data, but because 79 of 80 SMs have no work.
-
-This is the fundamental challenge that the next three sections address.
-
----
-
-## 14. Multi-SM Decode: Using the Whole GPU
-
-### The problem
-
-At d=512, a single thread block runs the entire decode step. It processes 16 attention heads
-sequentially, then the full FFN, then layer norm, for each of 8 layers. 79 out of 80 SMs
-sit idle. Bandwidth utilization: 2%.
-
-### The solution: one block per attention head
-
-Launch grid=(N_HEADS,) = grid=(16,). Each of the 16 blocks handles one attention head's
-Q/K/V projections, attention, and O-projection. Then all 16 blocks split the FFN work
-(each handles D_FF/16 = 128 columns of the up-projection).
-
-```
-Block 0:  head 0 attention + FFN columns 0-127
-Block 1:  head 1 attention + FFN columns 128-255
-...
-Block 15: head 15 attention + FFN columns 1920-2047
-```
-
-### Cross-block synchronization with atomic barriers
-
-The problem: blocks can't communicate within a kernel. After attention, all blocks must
-wait for all partial results before anyone can compute the next layer's input.
-
-Solution: **atomic barriers** using GPU-scope atomics in L2 cache.
+**kv_splits=1:** We use 1 KV split (not 2) because kv_splits=2 caused non-determinism
+at 24 layers due to excessive barrier interaction noise. With kv_splits=1, grid=(16,)
+with one block per head.
 
 ```python
-# Barrier implementation (simplified):
-# Each block arrives by atomically incrementing a counter
-old = tl.atomic_add(barrier_ptr, 1, sem='release', scope='gpu')
-if old == N_BLOCKS - 1:
-    # Last block to arrive: set done flag
-    tl.atomic_xchg(done_ptr, 1, sem='release', scope='gpu')
-# All blocks wait for done flag
-while tl.atomic_add(done_ptr, 0, sem='acquire', scope='gpu') == 0:
-    pass  # spin-wait
+    # Warmup decode step: triggers Triton JIT compilation
+    warmup_tok = jnp.argmax(first_logits)
+    _tok, _, _kv = multi_sm_decode_nlayer(
+        w, config, warmup_tok, prompt_len, kv_packed, vocab_size, kv_splits=1)
+    _ = int(_tok)  # force execution
 ```
 
-Two barriers per layer: one after attention (before FFN), one after FFN (before next layer).
-With 8 layers + 1 final: 17 barriers total.
+The first call to a Triton kernel triggers JIT compilation (~1-3 seconds). We do this
+during prefill so the actual generation loop doesn't include compilation time. The
+warmup result is discarded — we restart decode from the first_logits.
 
-**Key insight: redundant computation is cheaper than synchronization.** All 16 blocks
-independently compute LayerNorm and reduce the 16 partial FFN results. This is redundant
-(each block reads 32 KB from L2) but costs only ~1 µs. The alternative — one block computes
-and broadcasts — would need an additional barrier (~5 µs) plus a serial bottleneck.
-
-### KV-split parallelism (FlashDecoding)
-
-With 16 blocks on 80 SMs, utilization is only 20%. **KV-split parallelism** doubles the
-grid to 32 by having 2 blocks per attention head, each handling half the KV cache tiles.
-
-Each block computes a partial online softmax (partial O-projection + running max + running
-sum). After the barrier, all blocks merge the partials using the log-sum-exp trick:
-
-$$h_{head} = \frac{\sum_s o_s \cdot l_s \cdot e^{m_s - m_{max}}}{\sum_s l_s \cdot e^{m_s - m_{max}}}$$
-
-where $o_s$ is the normalized partial output, $l_s$ is the partial sum of exponentials, and
-$m_s$ is the partial maximum. This is mathematically exact — no approximation.
-
-### Split barrier optimization
-
-The standard barrier has all blocks polling the same counter address while others are still
-arriving. This causes **L2 cache line thrashing** — arrivals invalidate the line that pollers
-are reading.
-
-Fix: separate the arrival counter and done-flag on different cache lines. Arrivals write to
-`counter[]`, the last-arriving block sets `done[]`, all blocks poll `done[]`. Result: +5%
-kernel speedup.
-
-### Results
-
-```
-Single-SM (grid=1):        287 tok/s  (3.48 ms/tok, 2% BW utilization)
-Multi-SM (grid=16):       1734 tok/s  (0.58 ms/tok, 14% BW, 6.0x)
-+ KV splits (grid=32):   1851 tok/s  (0.54 ms/tok, 15% BW, +7%)
-+ Split barrier:          1937 tok/s  (0.52 ms/tok, 16% BW, +5%)
-Without GPU→CPU sync:     3108 tok/s  (0.32 ms/tok — pure GPU speed)
-```
-
-The 6.0x speedup from multi-SM is the single largest improvement at d=512.
-GPU→CPU sync (`int()` per token) costs 34% of total time — addressed in section 16.
-
----
-
-## 15. What Didn't Work
-
-Not everything we tried improved performance. Documenting failures is as important as
-documenting successes — they reveal what the actual bottlenecks are.
-
-**GQA (Grouped Query Attention).** 4 KV heads instead of 16 Q heads. KV cache shrinks from
-8.4 MB to 2.1 MB per sequence. But decode speed was unchanged — the kernel is
-barrier-limited, not memory-limited. The data already fits in L2 at high bandwidth. GQA
-helps batched inference (where KV cache scales with batch size) but not single-sequence.
-
-**Parallel residual (attn || FFN).** Compute attention and FFN in parallel, reducing
-barriers from 17 to 9. Result: +1.3% speedup. Why? Barrier cost is dominated by straggler
-*variance* (proportional to total work per step), not fixed overhead. Halving barriers
-saves ~8 µs of fixed overhead, but the ~80 µs of straggler time stays constant.
-
-**num_warps sweep.** 2, 4, 8 warps all within 5%. The kernel is not warp-limited.
-
-**Speculative decoding.** With fused kernels, both draft (~2500 tok/s) and target (~1400
-tok/s) are fast. The speed ratio is only ~2x, not the ~10x needed. Acceptance rate was
-36-51% with a 1-layer draft — you need 80%+ to break even at this ratio.
-
----
-
-## 16. Key Lessons
-
-### Fundamentals
-
-**1. Memory bandwidth is the bottleneck, not compute.** Modern GPUs do trillions of ops/s
-but read ~2 TB/s from HBM. For small models, math finishes instantly — the GPU waits for data.
-
-**2. Kernel fusion is the highest-leverage optimization.** Eliminating HBM round-trips
-gives the biggest speedup. In-kernel KV cache updates alone gave 3.6x.
-
-**3. bf16 + f32 accumulation is the sweet spot.** Cast to bf16 for tensor cores, accumulate
-in f32. FP8 was slower (register pressure from casts outweighed gains).
-
-**4. Dynamic loops prevent register spilling.** `tl.range` emits a real loop; `tl.static_range`
-unrolls, requiring registers for all tiles simultaneously.
-
-### Scaling
-
-**5. BLOCK_SEQ scales inversely with d_model.** Register file is fixed. d=128: BLOCK_SEQ=32.
-d=256: BLOCK_SEQ=16. d=512: BLOCK_SEQ=8. The h_block stays at ~16 KB.
-
-**6. Use tl.dot for projections at d >= 512.** Element-wise `h[:, None] * W` materializes the
-full (d, d_head) intermediate. tl.dot tiles internally, avoiding register overflow.
-
-**7. The bottleneck shifts with model size.** At d=64, host dispatch dominates (Python overhead).
-At d=512, the GPU kernel dominates (93% of step time). Optimizations that help at one scale
-may be irrelevant at another. Always profile first.
-
-### Multi-SM and parallelism
-
-**8. Multi-SM with atomic barriers unlocks the full GPU.** Going from grid=(1,) to grid=(32,)
-gave 6.8x speedup at d=512. The technique: one block per attention head, all blocks split
-the FFN, atomic barriers for cross-block sync.
-
-**9. Redundant computation beats synchronization.** All blocks independently compute LayerNorm
-(~1 µs from L2) rather than one block computing and broadcasting (needs a ~5 µs barrier).
-
-**10. GPU→CPU sync is the #1 bottleneck at 30M params.** `int()` per token costs 30-60% of
-wall time. Persistent kernels and pipelining eliminate this entirely.
-
-### Batched inference
-
-**11. Weight amortization requires careful loop structure.** Outer k-loop / inner b-loop loads
-weights once per tile. The naive fused approach loads them B times.
-
-**12. Shared buffers need double-buffering or phase separation.** Any buffer that is both read
-and written by all blocks within a barrier-delimited phase needs either double-buffering or a
-separate buffer for the write phase.
-
-### What doesn't help
-
-**13. Reducing barrier count gives minimal speedup.** Straggler variance (proportional to total
-work) dominates fixed barrier overhead. Halving barriers from 17 to 9 gave only 1.3%.
-
-**14. GQA doesn't help when barrier-limited.** If data already fits in L2, reducing it further
-doesn't matter. GQA helps when KV cache is the memory bottleneck (batched, long-context).
-
----
-
-## Running It Yourself
-
-```bash
-# generate text
-uv run generate.py --prompt "Once upon a time" --temp 0.7 --top-p 0.95
-
-# profile decode kernel
-uv run profile_kernels.py
-```
-
----
-
-## Part III: Production Scale (d=768+, 12-24 layers)
-
----
-
-## 17. GQA: Grouped Query Attention
-
-Standard multi-head attention uses N_HEADS separate K/V heads. GQA (Grouped Query
-Attention) shares K/V across groups of Q heads, reducing KV cache size.
-
-With d=768, 24 Q heads, 6 KV heads: each KV head is shared by 4 Q heads (GQA_GROUP=4).
-KV cache shrinks 4x: from 24 × ctx × d_head to 6 × ctx × d_head per layer.
-
-**Kernel change:** In the attention loop, map Q head to KV head via `kv_head = head_id // GQA_GROUP`.
-Load K/V from `kv_head`'s cache, not `head_id`'s. Weights follow the same pattern:
-Q/O weight matrices are (D_MODEL, N_HEADS × D_HEAD), K/V are (D_MODEL, N_KV_HEADS × D_HEAD).
-
-**Prefill kernel change:** The projection kernel has two loops — Q over N_HEADS, K/V over
-N_KV_HEADS. The attention kernel maps each Q head to its KV group. KV cache output shape
-is (N_KV_HEADS, SEQ, D_HEAD) instead of (N_HEADS, SEQ, D_HEAD).
-
-**Why GQA matters:** At d=768 with B=8 batched inference, GQA reduces KV cache from
-37.6 MB to 9.4 MB per step — fits entirely in L2 cache (~64 MB on RTX 4080 Super).
-
----
-
-## 18. Non-Power-of-2 D_MODEL (D_BLOCK Padding)
-
-Triton's `tl.arange` requires power-of-2 dimensions. For d_model=768, we use D_BLOCK=1024
-(next power of 2) with masking:
+### Streaming Generation — `stream_tokens()` at line 107
 
 ```python
-d = tl.arange(0, D_BLOCK)      # 0..1023
-d_mask = d < D_MODEL            # True for 0..767, False for 768..1023
+def stream_tokens(params, config, prompt_ids, max_tokens=128,
+                  temperature=0.0, top_p=1.0, rep_penalty=1.0, seed=None):
+    """Yield token IDs one at a time with optional sampling."""
+    if seed is not None:
+        np.random.seed(seed)
 
-# All loads use the mask:
-h = tl.load(ptr + d, mask=d_mask, other=0.0)
+    vocab_size = config["vocab_size"]
+    w, first_logits, start_pos, kv_packed = _prefill(
+        params, config, prompt_ids, vocab_size)
 
-# All stores use the mask:
-tl.store(ptr + d, h, mask=d_mask)
+    generated = []
+
+    # First token from prefill logits
+    if temperature == 0.0 and rep_penalty == 1.0:
+        first_id = int(jnp.argmax(first_logits))
+    else:
+        first_id = sample_token(first_logits, temperature, top_p,
+                                rep_penalty, generated)
+    generated.append(first_id)
+    yield first_id
 ```
 
-The padding (positions 768-1023) is always zero. `tl.dot` with zero-padded operands
-produces correct results: $0 \times \text{anything} = 0$.
-
-**Cost:** D_BLOCK=1024 wastes 33% of register/shared memory capacity compared to
-D_BLOCK=768 (if it were possible). This is why `num_stages=2` (software pipelining)
-fails at d=768 — the double-buffered tiles at (1024, 32) exceed shared memory.
-
----
-
-## 19. L2 Cache Hints and Bandwidth Optimization
-
-At d=768, the weight buffer (162 MB) exceeds the L2 cache (~64 MB). Every decode step
-re-fetches all weights from HBM — the "terminal bandwidth bottleneck."
-
-**Eviction policies** tell the GPU which data to keep and which to evict first:
+The first token uses prefill logits (the logits at the last prompt position). This is
+yielded immediately — the caller sees tokens as they're generated.
 
 ```python
-# KV cache (4.7 MB, fits in L2, reused across steps):
-K_tile = tl.load(kv_ptr + ..., eviction_policy='evict_last')
+    tok = jnp.int32(first_id)
+    for i in range(max_tokens - 1):
+        # Run one decode step: produces next token + updated KV cache
+        tok_out, logits, kv_packed = multi_sm_decode_nlayer(
+            w, config, tok, start_pos + i, kv_packed, vocab_size, kv_splits=1)
 
-# Output projection (6.3 MB, single-use per step):
-out_w = tl.load(out_ptr + ..., eviction_policy='evict_first')
+        if temperature == 0.0 and rep_penalty == 1.0:
+            token_id = int(tok_out)    # use in-kernel argmax (greedy)
+        else:
+            token_id = sample_token(logits, temperature, top_p,
+                                    rep_penalty, generated)
+
+        generated.append(token_id)
+        yield token_id
+        tok = jnp.int32(token_id)
 ```
 
-`evict_last` keeps KV cache hot in L2 between decode steps. `evict_first` on output
-projection prevents it from evicting KV data. Combined effect: ~3% throughput improvement.
+Each iteration:
+1. Calls the multi-SM kernel with the previous token and its position
+2. Gets back: `tok_out` (greedy argmax from the kernel), `logits` (full vocabulary
+   scores), and `kv_packed` (updated KV caches)
+3. For greedy decoding: uses `tok_out` directly (no CPU-side logits processing)
+4. For sampling: transfers `logits` to CPU and runs `sample_token()`
+5. Yields the token ID and feeds it back for the next step
 
-**Barrier merging:** The persistent kernel had 2 barriers per step for output (one for
-output projection sync, one for step-sync). By having the last-arriving block do the
-argmax reduction inline before signaling, we merge them into 1 barrier. Saves ~2%.
+The `kv_packed` returned from each step becomes the input for the next step — it
+contains all KV caches updated with the new position's K and V values.
 
-**What was tried but didn't help:**
-- KV_SPLITS=1 (24 blocks): 15% slower — insufficient parallelism
-- KV_SPLITS=4 (96 blocks): compilation too slow, likely worse from contention
-- num_stages=2: shared memory overflow at D_BLOCK=1024
-
----
-
-## 20. Tensor Core Batched Projections
-
-With batched inference, each block processes B sequences. Previously, Q/K/V projections
-looped over sequences:
+### Sampling — `sample_token()` at line 28
 
 ```python
-# OLD: B sequential (1, D_BLOCK) × (D_BLOCK, D_HEAD) dots
-wq = tl.load(...)  # weight loaded once
-for b in range(BATCH_SIZE):
-    h_norm = tl.load(h_norm_ptr + b * D_BLOCK + d)
-    Q = tl.dot(h_norm[None, :], wq).sum(axis=0)   # element-wise, M=1
+def sample_token(logits, temperature=1.0, top_p=1.0, rep_penalty=1.0,
+                 generated_ids=None, rng_key=None):
+    logits = np.array(logits, dtype=np.float32)  # transfer from GPU to CPU
 ```
 
-The optimization: stack all B hidden states into a 2D matrix and do one dot product:
+Sampling runs on the CPU using NumPy (not JAX) because it involves non-differentiable
+operations and random number generation that's simpler on CPU.
+
+#### Repetition Penalty
 
 ```python
-# NEW: single (B, D_BLOCK) × (D_BLOCK, D_HEAD) matmul
-b_range = tl.arange(0, BATCH_SIZE)
-h_batch = tl.load(h_norm_ptr + b_range[:, None] * D_BLOCK + d[None, :])
-Q_batch = tl.dot(h_batch, wq)  # (B, D_HEAD) — uses tensor cores when B >= 16
+    if rep_penalty != 1.0 and generated_ids:
+        seen = list(set(generated_ids))
+        for tid in seen:
+            if logits[tid] > 0:
+                logits[tid] /= rep_penalty    # positive logits: divide (reduce)
+            else:
+                logits[tid] *= rep_penalty    # negative logits: multiply (push more negative)
 ```
 
-At B>=16, the (16, 1024) × (1024, 32) matmul activates tensor cores (Ada Lovelace FP16
-tensor cores need M >= 16). At B=4, tensor cores don't activate but the 2D load/store
-pattern still reduces loop overhead.
+Previously generated tokens have their logits penalized. A `rep_penalty` of 1.2 means:
+- A token with logit 5.0 becomes 5.0 / 1.2 = 4.17 (less likely)
+- A token with logit -2.0 becomes -2.0 × 1.2 = -2.4 (even less likely)
 
-**Result:** +8-12% across all batch sizes. O projection not batched because the output
-(B, D_BLOCK) = (16, 1024) × 4B = 64KB overflows shared memory alongside the weight matrix.
+This prevents the model from repeating itself excessively.
 
----
-
-## 21. Sampling and Decoding Strategies
-
-Greedy decoding (always pick the highest-probability token) is simple but causes
-**repetition collapse**: once the model assigns slightly higher probability to a phrase
-it just produced, it locks into a loop. With our 242M param model, greedy decoding gives
-a 4-gram diversity score of just 0.22 — meaning 78% of 4-grams are repeated.
-
-Three techniques fix this, each attacking a different part of the problem:
-
-### Temperature
-
-Temperature scales the logits before softmax. Lower temperature sharpens the distribution
-(more deterministic), higher temperature flattens it (more random):
-
-$$p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}$$
-
-At $T=0$ this is greedy (argmax). At $T=1$ this samples from the model's actual
-distribution. At $T>1$ the distribution flattens and rare tokens become more likely.
-
-Concretely: if the model outputs logits $[5.0, 4.8, 2.0, 1.0]$ for four tokens:
-- $T=0.5$: divides by 0.5 → $[10.0, 9.6, 4.0, 2.0]$ → probabilities $[0.60, 0.40, 0.003, 0.0001]$ (almost always picks token 0 or 1)
-- $T=1.0$: unchanged → $[0.44, 0.36, 0.022, 0.008]$ (token 2 has a 2% chance)
-- $T=1.5$: divides by 1.5 → $[3.33, 3.20, 1.33, 0.67]$ → probabilities $[0.35, 0.31, 0.05, 0.02]$ (more spread out)
-
-The sweet spot for our model is $T \approx 0.7$ — enough randomness to avoid loops,
-not so much that it produces gibberish.
-
-### Top-p (nucleus sampling)
-
-Instead of sampling from the full vocabulary, sort tokens by probability and only keep
-the smallest set whose cumulative probability exceeds a threshold $p$:
-
-1. Sort tokens by descending probability
-2. Compute cumulative sum
-3. Keep tokens until cumsum $\ge p$
-4. Renormalize and sample from this subset
-
-With $p=0.95$, this dynamically adjusts the number of candidates: when the model is
-confident (one token has 90% probability), only 1-2 tokens are considered. When unsure,
-hundreds might be included. This is better than a fixed top-k because it adapts to the
-model's certainty at each position.
+#### Temperature Scaling
 
 ```python
-sorted_idx = np.argsort(-probs)
-sorted_probs = probs[sorted_idx]
-cumsum = np.cumsum(sorted_probs)
-cutoff = np.searchsorted(cumsum, top_p) + 1
-keep_idx = sorted_idx[:cutoff]
+    if temperature != 1.0:
+        logits = logits / temperature
 ```
 
-### Repetition penalty
+Temperature controls randomness:
+- `temperature < 1.0`: logits become more extreme → more confident, less random
+- `temperature > 1.0`: logits become flatter → more random, more creative
+- `temperature = 0.0`: special case → greedy (argmax)
 
-Repetition penalty directly discourages the model from producing tokens it already
-generated. Before computing softmax, we modify the logits of previously-seen tokens:
-
-$$z_i' = \begin{cases} z_i / \alpha & \text{if } z_i > 0 \text{ and token } i \text{ was already generated} \\ z_i \times \alpha & \text{if } z_i < 0 \text{ and token } i \text{ was already generated} \end{cases}$$
-
-With $\alpha = 1.2$: a positive logit of 5.0 becomes 4.17 (less likely), and a negative
-logit of -2.0 becomes -2.4 (even less likely). This pushes the model away from repeating
-itself without completely banning any token.
-
-### What we found
-
-We swept 18 parameter combinations across 6 prompt types (story, knowledge, code,
-creative, explanation, dialogue). The metric is 4-gram diversity: fraction of unique
-4-grams out of total 4-grams (1.0 = no repetition).
-
+Example:
 ```
-Setting                         Avg diversity
-greedy                          0.221  (78% repetition)
-temp=0.7                        0.825
-temp=0.7 top_p=0.95            0.534
-temp=0.7 top_p=0.95 rep=1.2    0.987  ← best balance
-temp=0.8 top_p=0.95 rep=1.2    0.994
-temp=0.8 top_p=0.95 rep=1.3    0.999  (too aggressive — forces odd word choices)
+logits = [3.0, 1.0, 0.5]
+
+temp=1.0: softmax → [0.67, 0.18, 0.15]  (original distribution)
+temp=0.5: [6.0, 2.0, 1.0] → softmax → [0.93, 0.05, 0.02]  (more peaked)
+temp=2.0: [1.5, 0.5, 0.25] → softmax → [0.47, 0.27, 0.26]  (more uniform)
 ```
 
-Key findings:
-- **Repetition penalty is the biggest single improvement.** Going from rep=1.0 to 1.2
-  with temp=0.7/top_p=0.95 takes diversity from 0.53 to 0.99.
-- **Top-p alone hurts** at moderate temperatures. With temp=0.7, adding top_p=0.95
-  actually reduced diversity from 0.83 to 0.53 because it cuts the tail that would have
-  introduced variety. Top-p works best combined with repetition penalty.
-- **temp=0.7 is more coherent than 0.8+.** Higher temperatures occasionally produce
-  gibberish (hallucinated citations, garbled text). The model at 242M params doesn't
-  have enough capacity to stay coherent at high temperature.
-- **Code is the hardest domain.** Even with optimal settings, code output has correct
-  Python structure but incorrect logic. This is expected at 242M params with only 18%
-  code in the training mix.
+#### Softmax
 
-Usage:
-```bash
-uv run generate.py --prompt "your text" --temp 0.7 --top-p 0.95 --rep-penalty 1.2
+```python
+    logits -= logits.max()      # subtract max for numerical stability
+    probs = np.exp(logits)
+    probs /= probs.sum()
 ```
+
+Standard softmax with the log-sum-exp trick: subtracting the max prevents overflow
+when exponentiating large values.
+
+#### Top-p (Nucleus) Sampling
+
+```python
+    if top_p < 1.0:
+        sorted_idx = np.argsort(-probs)          # sort by probability, descending
+        sorted_probs = probs[sorted_idx]
+        cumsum = np.cumsum(sorted_probs)          # cumulative sum
+        cutoff = np.searchsorted(cumsum, top_p) + 1  # find where cumsum reaches top_p
+        keep_idx = sorted_idx[:cutoff]            # keep only top tokens
+        filtered_probs = probs[keep_idx]
+        filtered_probs /= filtered_probs.sum()    # renormalize
+        return int(np.random.choice(keep_idx, p=filtered_probs))
+```
+
+Top-p keeps only the smallest set of tokens whose combined probability exceeds `top_p`.
+
+Example with top_p=0.9:
+```
+probs = [0.50, 0.25, 0.15, 0.05, 0.03, 0.02]  (sorted)
+cumsum = [0.50, 0.75, 0.90, 0.95, 0.98, 1.00]
+cutoff at cumsum >= 0.9 → index 2, keep first 3 tokens
+Remaining: [0.50, 0.25, 0.15] → renormalized: [0.556, 0.278, 0.167]
+```
+
+The rare tokens (0.05, 0.03, 0.02) are excluded — they can never be sampled.
+This prevents the model from generating nonsensical rare tokens while still
+allowing some diversity among the likely candidates.
+
+### CLI Entry Point — `main()` at line 150
+
+```python
+def main():
+    ...
+    parser = argparse.ArgumentParser(description="Generate text with Triton kernels")
+    parser.add_argument("--prompt", type=str, default="Once upon a time")
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--weights", type=str, default="weights.pkl")
+    parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--temp", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--rep-penalty", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=None)
+```
+
+Model weights are loaded from a pickle file:
+```python
+    with open(os.path.join(os.path.dirname(__file__), args.weights), "rb") as f:
+        saved = pickle.load(f)
+    params = {k: jnp.array(v) for k, v in saved["params"].items()}
+    config = saved["config"]
+```
+
+The tokenizer is loaded via `load_bpe_vocab()` from `data.py`:
+```python
+    bpe_vocab = load_bpe_vocab()
+    decode_fn = bpe_vocab["decode_fn"]    # token IDs → text
+    tok = Tokenizer.from_file(bpe_vocab["tokenizer_path"])
+    encode_fn = lambda text: tok.encode(text).ids     # text → token IDs
+```
+
+The prompt is encoded, truncated if necessary, and generation begins:
+```python
+    prompt_ids = encode_fn(args.prompt)
+    if len(prompt_ids) >= ctx_len:
+        prompt_ids = prompt_ids[:ctx_len - 1]    # leave room for at least 1 generated token
+    max_gen = min(args.max_tokens, ctx_len - len(prompt_ids))
+```
+
+#### Streaming Mode (default)
+
+```python
+    t0 = time.perf_counter()
+    all_tokens = []
+    t_first = None
+    for token_id in stream_tokens(params, config, prompt_ids, max_gen, ...):
+        if t_first is None:
+            t_first = time.perf_counter()   # time to first token
+        all_tokens.append(token_id)
+        new_text = decode_fn([token_id])
+        sys.stdout.write(new_text)
+        sys.stdout.flush()                  # display each token immediately
+```
+
+Each token is decoded and printed as soon as it's generated. The user sees text
+appear character by character.
+
+Performance metrics:
+```python
+    ttft = (t_first - t0) * 1000      # Time To First Token (includes prefill + JIT)
+    decode_time = elapsed - (t_first - t0)
+    decode_tok_s = (max_gen - 1) / decode_time   # decode throughput
+```
+
+**TTFT (Time To First Token)** includes prefill, weight packing, and Triton JIT
+compilation (on first run). Subsequent runs reuse compiled kernels.
+
+#### Non-streaming Mode (--no-stream)
+
+```python
+    tokens = generate_tokens(params, config, prompt_ids, max_gen, ...)
+    text = decode_fn(tokens)
+    sys.stdout.write(text)
+```
+
+Generates all tokens first, then prints the complete text at once. Slightly faster
+because there's no per-token print overhead, but the user sees nothing until generation
+completes.
 
 ---
 
----
+## 12. Profiling and Roofline Analysis
 
-### Files
+`profile_kernels.py` measures decode kernel performance and compares it against
+theoretical hardware limits.
+
+### Loading and Setup — Lines 22-123
+
+```python
+def load_params():
+    with open(os.path.join(os.path.dirname(__file__), "weights.pkl"), "rb") as f:
+        saved = pickle.load(f)
+    params = {k: jnp.array(v) for k, v in saved["params"].items()}
+    return params, saved["config"]
+```
+
+A fixed 128-token prompt is used for repeatable benchmarks:
+```python
+    PROMPT_LEN = min(128, ctx)
+    _prompt_text = ("The cat sat on the mat and looked at the sky. ...")
+    _prompt_ids = _tok.encode(_prompt_text).ids[:PROMPT_LEN]
+```
+
+### Prefill Measurement — `measure_prefill()` at line 29
+
+```python
+def measure_prefill(params, config, prompt, n_runs=20):
+    # 3 warmup runs (trigger JIT, fill caches)
+    for _ in range(3):
+        logits, kc, vc = prefill_with_kv(params, config, x)
+        _ = logits.block_until_ready()
+
+    # n_runs timed measurements
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        logits, kc, vc = prefill_with_kv(params, config, x)
+        _ = logits.block_until_ready()
+        times.append(time.perf_counter() - t0)
+    return np.median(times) * 1000    # median ms
+```
+
+Warmup runs are critical — the first JAX call triggers XLA compilation. We use
+**median** (not mean) to be robust against GC pauses and system jitter.
+
+### Decode Measurement — `measure_decode()` at line 44
+
+```python
+def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10):
+    # 5 warmup steps (trigger Triton JIT)
+    kv_tmp = kv_packed
+    t = tok
+    for i in range(5):
+        t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=1)
+        _ = int(t)
+
+    # n_runs full generations
+    times = []
+    for _ in range(n_runs):
+        kv_tmp = kv_packed   # reset KV cache each run
+        t = tok
+        t0 = time.perf_counter()
+        for i in range(n_tokens):
+            t, _, kv_tmp = multi_sm_decode_nlayer(
+                w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=1)
+            tokens.append(int(t))    # int() forces GPU→CPU sync
+        times.append(time.perf_counter() - t0)
+    return np.median(times) * 1000
+```
+
+`int(t)` forces GPU-to-CPU synchronization — without it, JAX would queue the kernel
+calls and `time.perf_counter()` would measure only the queuing time, not actual
+execution. This is one of the most common benchmarking mistakes with JAX.
+
+### Memory Statistics — `compute_memory_stats()` at line 67
+
+```python
+def compute_memory_stats(config):
+    per_layer = (d +                    # ln1_scale
+                 d*d + d*d_kv +         # Wq + Wk
+                 d*d_kv + d*d +         # Wv + Wo
+                 d +                     # ln2_scale
+                 d*d_ff + d*d_ff +      # gate + up
+                 d_ff*d)                # down
+    total_weights = vocab_size * d + n_layers * per_layer + d  # +embeddings +final_ln
+    weight_bytes = total_weights * 2    # bf16 = 2 bytes per element
+    kv_total = n_layers * 2 * n_kv_heads * ctx * d_head * 2
+    return {
+        "weight_buffer_mb": weight_bytes / 1e6,
+        "kv_cache_mb": kv_total / 1e6,
+        "total_inference_mb": (weight_bytes + kv_total) / 1e6,
+    }
+```
+
+### Roofline Analysis — Lines 163-169
+
+```python
+    bytes_per_step = (mem["weight_buffer_mb"] + mem["kv_cache_mb"]) * 1e6
+    theoretical_min_ms = bytes_per_step / (836e9) * 1000    # 836 GB/s peak bandwidth
+    bandwidth_util = theoretical_min_ms / ms_per_tok * 100
+```
+
+The **roofline model** gives the theoretical minimum time per token — the time to
+simply read all the data at peak bandwidth, assuming perfect memory access patterns
+and zero compute overhead.
 
 ```
-Inference:
-  kernels/multi_sm_decode.py         — fused multi-SM decode (all 24 layers in one kernel)
-  kernels/fused_decode_nlayer.py     — weight/KV packing utilities
-  generate.py                        — streaming text generation CLI
-  profile_kernels.py                 — decode kernel profiling
+bytes_per_step ≈ 613 MB
+theoretical_min = 613 MB / 836 GB/s = 0.73 ms
+
+If we achieve 4.2 ms/tok → bandwidth_util = 0.73 / 4.2 × 100 = 17%
 ```
 
-For the training pipeline (data preparation, model architecture, training loop),
-see [`training_explained.md`](training_explained.md).
+17% bandwidth utilization means we're spending 83% of time on overhead: barriers,
+work imbalance, memory access inefficiencies, and L2 cache misses. The roofline
+tells us how much room there is for improvement — in theory, we could be ~6x faster
+if we achieved perfect bandwidth utilization.
+
+### Profiling Output
+
+The profiler prints a complete performance summary:
+
+```
+============================================================
+KERNEL PROFILING
+============================================================
+Model:    d=1024 h=16 l=24 ctx=512
+Params:   305,889,280
+Generate: 128 tokens from 128-token prompt
+GPU:      NVIDIA GeForce RTX 4080 SUPER
+Weights:  607.2 MB, KV cache: 6.3 MB
+
+--- Prefill (128 tokens, JAX) ---
+  36.9 ms (3469 tok/s)
+
+--- Decode (128 tokens, Triton multi-SM, grid=16) ---
+  544.8 ms total, 4.256 ms/tok, 235 tok/s
+
+--- End-to-End ---
+  581.7 ms for 256 tokens
+  Text: [generated text preview]...
+
+--- Roofline ---
+  613.5 MB per step, theoretical min 0.734 ms/tok
+  Achieved 4.256 ms/tok = 17% bandwidth utilization
+```
