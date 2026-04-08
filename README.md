@@ -34,8 +34,9 @@ Inference:
   Weights:   607 MB bf16 (9.5x L2 — HBM-bound)
 
 Training:
-  28.4K tok/s (bs=16, cuDNN FlashAttention + fused cross-entropy)
-  ~83h per epoch, 3 epochs x 7.85B tokens = 23.5B total
+  RTX 4080 Super:  28.4K tok/s (bs=16), ~83h per epoch
+  NVIDIA B200:     ~341K tok/s (bs=256), ~6h per epoch
+  3 epochs x 7.85B tokens = 23.5B total
 ```
 
 The entire decode step — embedding, attention, FFN, output projection — runs in a single GPU kernel call across all 24 layers.
