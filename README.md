@@ -1,4 +1,4 @@
-# Single-GPU Transformer
+# 306M Transformer
 
 Training and inference for a 306M parameter transformer on a single GPU. Custom Triton kernels for inference, JAX + cuDNN for training.
 
