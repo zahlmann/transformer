@@ -526,21 +526,52 @@ distribution) + annealing dataset (~3B tokens). Run `uv run prepare_data_v3.py` 
 
 ---
 
-## Current Task: Run v3 Data Preparation and Train
+## Current Task: Simplify and Clean Up Code
 
-### Step 1: Prepare v3 data
+Rewrite `data.py`, `prepare_data_v3.py`, and `train.py` to be extremely clean,
+simple, and skimmable. Apply these rules strictly:
+
+### Code Style Rules
+
+1. **Write extremely simple code** — it should be "skimmable" and still understandable
+2. **Minimize possible states** — reduce number of arguments, remove or narrow any state
+3. **Use discriminated unions** to reduce number of states the code can be in
+4. **Exhaustively handle** any objects with multiple different types, fail on unknown type
+5. **Don't write defensive code** — assume values are always what types tell you they are
+6. **Use asserts when loading data** — be highly opinionated about parameters you pass around.
+   Don't let things be optional if not strictly required
+7. **Remove any code that is not strictly required**
+8. **Bias for fewer lines of code**
+9. **No complex or clever code**
+10. **Don't break out into too many functions** — that's hard to read
+11. **Early returns are great**
+12. **Use asserts instead of try/except or default values** when you expect something to exist
+13. **Never pass overrides except when strictly necessary** — keep argument count low
+14. **Don't make arguments optional if they are actually required**
+
+### Files to clean up
+
+- `data.py` — streaming data loading
+- `prepare_data_v3.py` — v3 data pipeline (download, tokenize, combine)
+- `train.py` — training loop
+
+### What NOT to change
+
+- Don't change model.py or any kernel files
+- Don't change the data mix ratios or training hyperparameters
+- Don't change what the code does — only how it's written
+- Don't remove the --data-dir flag from train.py (needed for v3)
+- Keep all existing CLI flags that are actually used
+- Make sure prepare_data_v3.py still works with --tokenize-only, --anneal-only, --stats
+
+### v3 Training Commands (for reference)
 
 ```bash
-# Download and tokenize main dataset (~28B tokens, several hours)
+# Prepare data
 uv run prepare_data_v3.py
-
-# Then prepare annealing dataset (~3B tokens)
 uv run prepare_data_v3.py --anneal-only
-```
 
-### Step 2: Train on v3 data (Phase 1 — extended pretraining)
-
-```bash
+# Phase 1: extended pretraining on v3 data
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 2 \
@@ -548,11 +579,8 @@ uv run python -u train.py \
   --curriculum --lr 3e-4 --no-checkpoint \
   --resume checkpoint.pkl \
   2>&1 | tee training_v3.log
-```
 
-### Step 3: Anneal (Phase 2 — high-quality cooldown)
-
-```bash
+# Phase 2: annealing on high-quality data
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 1 \
@@ -560,11 +588,8 @@ uv run python -u train.py \
   --lr 3e-5 --no-checkpoint \
   --resume checkpoint.pkl \
   2>&1 | tee training_anneal.log
-```
 
-### Step 4: Context extension (Phase 3 — optional)
-
-```bash
+# Phase 3: context extension (optional)
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 1024 --batch-size 8 --epochs 1 \
