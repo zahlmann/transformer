@@ -556,16 +556,12 @@ simple, and skimmable. Apply these rules strictly:
 - `prepare_data_v2.py` — v2 data pipeline
 - `train.py` — training loop
 - `model.py` — JAX transformer model
-- `generate.py` — streaming text generation CLI
-- `serve.py` — batched server + continuous batching
-- `profile_kernels.py` — primary profiling tool
-- `profile_vram.py` — VRAM profiling
-
-In short: all Python files except the Triton kernel files in `kernels/`.
 
 ### What NOT to change
 
-- Don't change any kernel files in `kernels/`
+- Don't change kernel files in `kernels/`
+- Don't change inference files: `generate.py`, `serve.py`
+- Don't change profiling files: `profile_kernels.py`, `profile_vram.py`
 - Don't change the data mix ratios or training hyperparameters
 - Don't change what the code does — only how it's written
 - Don't remove the --data-dir flag from train.py (needed for v3)
