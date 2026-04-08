@@ -58,9 +58,14 @@ def load_bpe_vocab():
 
     with open(os.path.join(DATA_DIR, "bpe_vocab.pkl"), "rb") as f:
         saved = pickle.load(f)
-    tok = Tokenizer.from_file(saved["tokenizer_path"])
+    tok_path = saved["tokenizer_path"]
+    if not os.path.isabs(tok_path):
+        tok_path = os.path.join(os.path.dirname(__file__), tok_path)
+    tok = Tokenizer.from_file(tok_path)
+    vocab_size = saved.get("vocab_size", saved.get("bpe_vocab_size"))
+    assert vocab_size is not None, "bpe_vocab.pkl missing vocab_size"
     return {
-        "tokenizer_path": saved["tokenizer_path"],
-        "vocab_size": saved["vocab_size"],
+        "tokenizer_path": tok_path,
+        "vocab_size": vocab_size,
         "decode_fn": lambda ids: tok.decode(list(int(i) for i in ids)),
     }
