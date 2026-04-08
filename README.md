@@ -2,14 +2,14 @@
 
 Training and inference for a 306M parameter transformer on a single RTX 4080 Super. Custom Triton kernels for inference, JAX + cuDNN for training.
 
-Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation.
+Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style autonomous development — a coding agent is pointed at `knowledge/program.md` repeatedly. The human steers direction; the agent handles implementation, debugging, benchmarking, and documentation.
 
 ## Documentation
 
-- [`inference_explained.md`](inference_explained.md) — ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all inference techniques used
-- [`training_explained.md`](training_explained.md) — first-principles explanation of the training pipeline (data, model, training loop)
-- [`program.md`](program.md) — full development log and agent program
-- [`data_research.md`](data_research.md) — training data research and rationale
+- [`inference_explained.md`](knowledge/inference_explained.md) — ground-up explanation of GPU kernels, register pressure, memory hierarchies, and all inference techniques used
+- [`training_explained.md`](knowledge/training_explained.md) — first-principles explanation of the training pipeline (data, model, training loop)
+- [`program.md`](knowledge/program.md) — full development log and agent program
+- [`data_research.md`](knowledge/data_research.md) — training data research and rationale
 
 ## Current Model
 
@@ -69,7 +69,7 @@ uv run profile_kernels.py
 # prepare training data (download + tokenize 7.85B tokens from 5 sources)
 uv run prepare_data_v2.py
 
-# train (see gpu_server_training_instructions.md for cloud GPU setup)
+# train (see knowledge/gpu_server_training_instructions.md for cloud GPU setup)
 uv run python -u train.py \
   --d-model 1024 --n-heads 16 --n-kv-heads 4 --n-layers 24 \
   --context-len 512 --batch-size 16 --epochs 3 \
@@ -98,7 +98,7 @@ Inference:
   generate.py                          streaming text generation CLI
   profile_kernels.py                   decode kernel profiling
 
-Documentation:
+Documentation (knowledge/):
   program.md                           agent program / development log
   inference_explained.md               ground-up GPU kernel explanation
   training_explained.md                first-principles training pipeline explanation
