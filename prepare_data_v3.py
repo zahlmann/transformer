@@ -676,6 +676,9 @@ def _combine_tokenized(source_configs, out_dir, dataset_name="main"):
         if meta_file.exists():
             with open(meta_file) as f:
                 meta = json.load(f)
+            if meta["total_tokens"] == 0:
+                print(f"  {name}: SKIPPED (0 tokens)")
+                continue
             source_sizes[name] = meta["total_tokens"]
             print(f"  {name}: {source_sizes[name]/1e9:.2f}B tokens")
 
@@ -692,7 +695,7 @@ def _combine_tokenized(source_configs, out_dir, dataset_name="main"):
     val_parts = []
     for name in source_configs:
         src_bin = out_dir / f"{name}.bin"
-        if src_bin.exists() and name in val_per_source:
+        if src_bin.exists() and src_bin.stat().st_size > 0 and name in val_per_source:
             src = np.memmap(src_bin, dtype=np.int32, mode="r")
             n_val = min(val_per_source[name], len(src))
             val_parts.append(np.array(src[:n_val]))
@@ -709,7 +712,7 @@ def _combine_tokenized(source_configs, out_dir, dataset_name="main"):
     with open(train_bin, "wb") as f:
         for name in source_configs:
             src_bin = out_dir / f"{name}.bin"
-            if src_bin.exists() and name in val_per_source:
+            if src_bin.exists() and src_bin.stat().st_size > 0 and name in val_per_source:
                 src = np.memmap(src_bin, dtype=np.int32, mode="r")
                 skip = val_per_source[name]
                 # stream in 100M token chunks to avoid loading all into RAM
