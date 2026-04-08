@@ -77,7 +77,7 @@ def measure_prefill(params, config, prompt, vocab_size, n_runs=20):
 
 
 def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=128, n_runs=10,
-                   use_multi_sm=True):
+                   use_multi_sm=True, kv_splits=1):
     """Measure decode throughput."""
     if use_multi_sm:
         # Multi-SM returns (next_token, logits, kv_out)
@@ -86,7 +86,7 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
         kv_tmp = kv_packed
         t = tok
         for i in range(5):
-            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=kv_splits)
             _ = int(t)
 
         times = []
@@ -97,7 +97,7 @@ def measure_decode(w, config, tok, start_pos, kv_packed, vocab_size, n_tokens=12
             tokens = []
             t0 = time.perf_counter()
             for i in range(n_tokens):
-                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size)
+                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, start_pos + i, kv_tmp, vocab_size, kv_splits=kv_splits)
                 tokens.append(int(t))
             times.append(time.perf_counter() - t0)
             all_tokens = tokens
@@ -264,8 +264,22 @@ def main():
     bpe_vocab = load_bpe_vocab()
     decode_fn = bpe_vocab["decode_fn"]
 
-    # Use a simple prompt (avoid re-tokenizing full dataset)
-    prompt = jnp.arange(PROMPT_LEN, dtype=jnp.int32) % vocab_size
+    # Use a real prompt for meaningful generated text
+    from tokenizers import Tokenizer
+    _tok = Tokenizer.from_file(bpe_vocab["tokenizer_path"])
+    _prompt_text = ("The cat sat on the mat and looked at the sky. Once upon a time, "
+                    "in a land far away, there lived a young wizard who dreamed of "
+                    "adventure and discovery. Every morning he would wake before dawn, "
+                    "climb to the top of the highest tower, and gaze at the stars fading "
+                    "into the pale blue light. He wondered what secrets the universe held, "
+                    "and whether he would ever find the courage to leave his small village "
+                    "and explore the great unknown world beyond the distant mountains and "
+                    "the vast dark forests that stretched endlessly toward the horizon. "
+                    "The wizard had read every book in the village library, memorized "
+                    "every spell and incantation, and practiced until his fingers ached.")
+    _prompt_ids = _tok.encode(_prompt_text).ids[:PROMPT_LEN]
+    assert len(_prompt_ids) >= PROMPT_LEN, f"prompt too short: {len(_prompt_ids)} < {PROMPT_LEN}"
+    prompt = jnp.array(_prompt_ids, dtype=jnp.int32)
 
     print(f"{'='*60}")
     print(f"KERNEL PROFILING")
@@ -293,15 +307,14 @@ def main():
 
     # Decode
     kv_packed = pack_kv_caches(kc, vc)
-    w = prepare_decode_weights_nlayer(params, config, vocab_size)
+    kv_splits = 1  # kv_splits=2 causes barrier noise at 24 layers; must match generate.py
+    w = prepare_decode_weights_nlayer(params, config, vocab_size, kv_splits=kv_splits)
     tok = jnp.argmax(logits[PROMPT_LEN - 1])
-
-    # Multi-SM decode (primary) — kv_splits=2 gives grid=N_HEADS*2
-    kv_splits = 2
     total_blocks = n_heads * kv_splits
     print(f"--- Decode: Multi-SM ({GEN_LEN} tokens, grid={total_blocks}, kv_splits={kv_splits}) ---")
     decode_ms, tokens = measure_decode(w, config, tok, PROMPT_LEN, kv_packed, vocab_size,
-                                        n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=True)
+                                        n_tokens=GEN_LEN, n_runs=args.n_runs, use_multi_sm=True,
+                                        kv_splits=kv_splits)
     tok_per_s = GEN_LEN / decode_ms * 1000
     ms_per_tok = decode_ms / GEN_LEN
     print(f"Total:            {decode_ms:.1f} ms")
@@ -401,7 +414,7 @@ def main():
         kv_tmp = kv_packed
         t = tok
         for i in range(5):
-            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
+            t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size, kv_splits=kv_splits)
         _ = int(t)  # single sync
 
         pipe_times = []
@@ -412,7 +425,7 @@ def main():
             tok_devs = []
             t0 = time.perf_counter()
             for i in range(GEN_LEN):
-                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size)
+                t, _, kv_tmp = multi_sm_decode_nlayer(w, config, t, PROMPT_LEN + i, kv_tmp, vocab_size, kv_splits=kv_splits)
                 tok_devs.append(t)
             pipe_toks = [int(td) for td in tok_devs]  # batch sync at end
             pipe_times.append(time.perf_counter() - t0)
@@ -438,7 +451,7 @@ def main():
     print(f"--- Decode: Persistent ({GEN_LEN} tokens, grid={total_blocks}, single launch) ---")
     try:
         _tok_out, _, _ = persistent_decode_nlayer(
-            w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=5)
+            w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=5, kv_splits=kv_splits)
         _ = _tok_out.block_until_ready()
 
         persist_times = []
@@ -446,7 +459,7 @@ def main():
         for _ in range(args.n_runs):
             t0 = time.perf_counter()
             tok_out, _, _ = persistent_decode_nlayer(
-                w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=GEN_LEN)
+                w, config, tok, PROMPT_LEN, kv_packed, vocab_size, n_steps=GEN_LEN, kv_splits=kv_splits)
             tok_list = tok_out.tolist()
             persist_times.append(time.perf_counter() - t0)
             persist_tokens = tok_list
