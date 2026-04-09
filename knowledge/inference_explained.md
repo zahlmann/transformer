@@ -205,7 +205,7 @@ is already idle most of the time. This is why we:
 4. Don't bother with quantization (our goal is learning kernels, not shrinking models)
 
 **Bandwidth utilization** is our key metric. Our multi-SM kernel achieves about 17%
-of theoretical bandwidth, delivering ~235 tok/s. The gap between 17% and 100% comes
+of theoretical bandwidth, delivering ~231 tok/s. The gap between 17% and 100% comes
 from:
 - Barrier synchronization overhead (blocks waiting for each other)
 - Uneven work distribution across blocks
@@ -580,8 +580,8 @@ This is **compute-bound** because the batch dimension amortizes the weight loadi
 each weight is loaded once but used for N tokens (where N = prompt length).
 
 We use JAX (not Triton) for prefill because JAX's XLA compiler with cuDNN FlashAttention
-is already highly optimized for parallel attention. Our prefill runs at ~3,469 tok/s
-for a 128-token prompt.
+is already highly optimized for parallel attention. Our prefill runs at ~814 tok/s
+for a 128-token prompt (157 ms).
 
 The implementation is in `model.py:195-232` (`prefill_with_kv()`):
 ```python
@@ -2184,7 +2184,7 @@ and zero compute overhead.
 bytes_per_step ≈ 613 MB
 theoretical_min = 613 MB / 836 GB/s = 0.73 ms
 
-If we achieve 4.2 ms/tok → bandwidth_util = 0.73 / 4.2 × 100 = 17%
+If we achieve 4.3 ms/tok → bandwidth_util = 0.73 / 4.3 × 100 = 17%
 ```
 
 17% bandwidth utilization means we're spending 83% of time on overhead: barriers,
@@ -2201,22 +2201,22 @@ The profiler prints a complete performance summary:
 KERNEL PROFILING
 ============================================================
 Model:    d=1024 h=16 l=24 ctx=512
-Params:   305,889,280
+Params:   303,350,784
 Generate: 128 tokens from 128-token prompt
 GPU:      NVIDIA GeForce RTX 4080 SUPER
 Weights:  607.2 MB, KV cache: 6.3 MB
 
 --- Prefill (128 tokens, JAX) ---
-  36.9 ms (3469 tok/s)
+  157.3 ms (814 tok/s)
 
 --- Decode (128 tokens, Triton multi-SM, grid=16) ---
-  544.8 ms total, 4.256 ms/tok, 235 tok/s
+  553.4 ms total, 4.323 ms/tok, 231 tok/s
 
 --- End-to-End ---
-  581.7 ms for 256 tokens
+  710.7 ms for 256 tokens
   Text: [generated text preview]...
 
 --- Roofline ---
-  613.5 MB per step, theoretical min 0.734 ms/tok
-  Achieved 4.256 ms/tok = 17% bandwidth utilization
+  619.3 MB per step, theoretical min 0.741 ms/tok
+  Achieved 4.323 ms/tok = 17% bandwidth utilization
 ```

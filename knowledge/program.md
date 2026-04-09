@@ -69,10 +69,10 @@ Components:
 
 ```
 d=1024, h=16, l=24 (current 306M model, kv_splits=1):
-  Multi-SM sync:       235 tok/s  (4.2 ms/tok, 17% BW util)
+  Multi-SM sync:       231 tok/s  (4.3 ms/tok, 17% BW util)
   Pipelined:           263 tok/s  (3.8 ms/tok, 1.12x)
   Persistent:          265 tok/s  (3.8 ms/tok, 1.13x)
-  Prefill (128 tok):   36.9 ms   (3469 tok/s, Triton)
+  Prefill (128 tok):   157 ms    (814 tok/s, JAX)
   Weight buffer:       607 MB (9.5x L2 — HBM-bound)
 
   Batched decode: shared memory overflow at 24 layers (works at <=16 layers)

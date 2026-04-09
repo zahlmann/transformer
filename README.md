@@ -29,8 +29,8 @@ Built using [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-st
 
 ```
 Inference:
-  Decode:    235 tok/s  (4.2 ms/tok, Triton multi-SM kernel)
-  Prefill:   170 ms for 128 tokens (JAX)
+  Decode:    231 tok/s  (4.3 ms/tok, Triton multi-SM kernel)
+  Prefill:   157 ms for 128 tokens (JAX)
   Weights:   607 MB bf16 (9.5x L2 — HBM-bound)
 
 Training:
