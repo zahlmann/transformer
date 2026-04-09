@@ -78,6 +78,14 @@ via `jax_triton`). If the kernel itself only takes 0.5ms, that overhead is signi
 This is why we fuse everything — embedding, 24 transformer layers, and output projection
 — into a **single kernel launch**. One launch, one overhead cost.
 
+**Why is this unusual?** Standard frameworks like PyTorch/JAX run each operation
+(normalization, projection, attention, FFN) as a separate kernel launch. For a 24-layer
+model, that's hundreds of launches per token — each with dispatch overhead and each
+writing intermediate results to global memory and reading them back. Our approach
+keeps the hidden state `h` in registers across all 24 layers. It's never written to
+HBM between layers. This is only possible because we write custom Triton kernels
+instead of composing framework-provided operations.
+
 ---
 
 ## 2. GPU Memory Hierarchy
@@ -301,12 +309,36 @@ bf16 (bfloat16) has the same exponent range as f32 but only 7 bits of mantissa
 loses precision. So we multiply in bf16 (fast, on tensor cores) and accumulate in
 f32 (accurate, on regular ALUs).
 
+**Why bf16 specifically?** bf16 was designed by Google Brain specifically for deep
+learning. Unlike fp16 (IEEE half-precision), bf16 keeps the same 8-bit exponent as
+f32, so it handles the same range of magnitudes — no overflow/underflow surprises.
+The tradeoff is fewer mantissa bits (7 vs 10 in fp16), but this is fine for neural
+network weights. This "mixed precision" approach — bf16 for compute, f32 for
+accumulation — is universal in LLM training and inference since 2020. It halves
+memory bandwidth (the bottleneck for decode) while maintaining numerical accuracy.
+
 ---
 
 ## 5. Our Transformer Model
 
-Our model is a **decoder-only transformer** with 306M parameters. Here are the key
-specs and what each means:
+Our model is a **decoder-only transformer** with 306M parameters, using the modern
+"Llama-style" architecture that has become the standard recipe since 2023. Each
+component is a conscious choice over alternatives:
+
+| Component | Replaces | Why |
+|-----------|----------|-----|
+| RMSNorm | LayerNorm | 10-15% faster, same quality |
+| RoPE | Learned pos embeddings | Relative positions, no extra params, length generalization |
+| GQA (4 KV heads) | MHA (16 KV heads) | 4x smaller KV cache, <1% quality loss |
+| SwiGLU | ReLU/GELU FFN | ~15% better quality per FLOP |
+| No biases | Biases | Simpler, no quality impact |
+| Tied embeddings | Separate output head | Fewer params, good regularizer at 306M scale |
+
+These are not experimental — they are the converged standard used by Llama 1/2/3/4,
+Mistral, Qwen, DeepSeek, and Gemma as of 2026. Each subsection below explains what
+the component does, why it exists, and exactly how it's implemented in our kernels.
+
+Here are the key specs:
 
 ```
 d_model  = 1024    # hidden dimension: every token is a vector of 1024 numbers
@@ -353,7 +385,7 @@ logits = h @ token_embedding.T   # tied embeddings: reuse the input embedding ma
 RMSNorm normalizes a vector by dividing by the root-mean-square of its elements,
 then scaling by a learned parameter:
 
-$$\text{RMSNorm}(h) = \gamma \cdot \frac{h}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} h_i^2 + \epsilon}}$$
+$$\text{RMSNorm}(h) = \gamma \cdot \frac{h}{\sqrt{\frac{1}{d}\sum\_{i=1}^{d} h\_i^2 + \epsilon}}$$
 
 In code:
 ```python
@@ -376,6 +408,14 @@ h_norm = scale * h * 0.730
 Unlike LayerNorm, RMSNorm doesn't subtract the mean — it only divides by the RMS.
 This is ~10-15% faster (one less reduction operation) and works just as well in practice.
 
+**Why RMSNorm?** The original transformer (2017) used LayerNorm, which both
+re-centers (subtracts mean) and re-scales (divides by std). Zhang & Sennrich
+(2019) showed that the re-centering is unnecessary — only the re-scaling matters
+for training stability. Removing it saves one reduction operation per normalization
+(a parallel sum across 1024 elements). RMSNorm was adopted by Llama 1 (2023) and
+is now universal in all major LLMs (Llama 2/3/4, Mistral, Qwen, DeepSeek, Gemma).
+No alternative has emerged as of 2026.
+
 ### RoPE (Rotary Position Embedding)
 
 RoPE encodes position information by rotating pairs of dimensions in Q and K by
@@ -385,9 +425,9 @@ high dimensions rotate fast (capturing fine-grained position).
 
 The rotation formula for position $p$ and dimension pair $i$:
 
-$$\theta_i = 10000^{-2i/d_\text{head}}$$
+$$\theta\_i = 10000^{-2i/d\_{\text{head}}}$$
 
-$$\begin{bmatrix} q'_{2i} \\ q'_{2i+1} \end{bmatrix} = \begin{bmatrix} \cos(p\theta_i) & -\sin(p\theta_i) \\ \sin(p\theta_i) & \cos(p\theta_i) \end{bmatrix} \begin{bmatrix} q_{2i} \\ q_{2i+1} \end{bmatrix}$$
+$$\begin{bmatrix} q'\_{2i} \\\ q'\_{2i+1} \end{bmatrix} = \begin{bmatrix} \cos(p\theta\_i) & -\sin(p\theta\_i) \\\ \sin(p\theta\_i) & \cos(p\theta\_i) \end{bmatrix} \begin{bmatrix} q\_{2i} \\\ q\_{2i+1} \end{bmatrix}$$
 
 In our implementation, the "even/odd" split is actually "first half / second half":
 ```python
@@ -422,6 +462,21 @@ The key property: the dot product Q·K between two positions depends only on the
 **relative distance**, not absolute positions. This means the model generalizes to
 positions it hasn't seen during training.
 
+**Why RoPE?** There are three generations of position encoding:
+
+1. **Sinusoidal (original transformer, 2017):** Fixed sine/cosine patterns added
+   to the input embeddings. The position signal gets diluted through layers.
+2. **Learned embeddings (GPT-2, 2019):** A separate trainable embedding per
+   position. Hard-caps context length — can't generalize beyond training length.
+3. **RoPE (Su et al. 2021):** Rotation applied to Q and K at every layer. No
+   extra parameters. Relative-position-aware by construction.
+
+RoPE's advantage over both: it's applied at every layer (position info can't be
+forgotten), requires zero additional parameters, and enables length generalization
+with extensions like NTK-aware scaling or YaRN for models with 128K+ context
+windows. Adopted by Llama 1 (2023), RoPE is now the universal default for
+decoder-only transformers in 2026.
+
 ### GQA (Grouped-Query Attention)
 
 Standard multi-head attention has separate K and V matrices for each head. With 16
@@ -438,22 +493,30 @@ GQA_GROUP = N_HEADS // N_KV_HEADS = 16 // 4 = 4
 kv_head = head_id // GQA_GROUP    # maps query head → shared KV head
 ```
 
-Why GQA? It reduces KV cache size by 4x (only 4 KV heads instead of 16) without
-significant quality loss. During decode, the KV cache is a major memory consumer,
-so this matters.
+**Why GQA?** Standard multi-head attention (MHA) gives each query head its own K
+and V — maximum quality but the KV cache is large. Multi-Query Attention (MQA,
+Shazeer 2019) goes to the opposite extreme: all heads share one K and one V —
+minimum cache but measurable quality loss. GQA (Ainslie et al. 2023) is the
+sweet spot: group query heads and share K/V within each group.
 
-Memory savings:
+Our 4 KV heads for 16 query heads cuts KV cache by 4x with <1% quality loss:
+
 ```
-Full attention KV cache:  16 heads × 512 positions × 64 dims × 2 bytes = 1.0 MB/layer
-GQA KV cache:              4 heads × 512 positions × 64 dims × 2 bytes = 0.25 MB/layer
-With 24 layers:            24 MB → 6 MB total KV cache (4x reduction)
+Full MHA KV cache:  16 heads × 512 positions × 64 dims × 2 bytes = 1.0 MB/layer
+GQA KV cache:        4 heads × 512 positions × 64 dims × 2 bytes = 0.25 MB/layer
+With 24 layers:      24 MB → 6 MB total KV cache (4x reduction)
 ```
+
+GQA has been the standard since Llama 2 (2023). DeepSeek V2/V3 introduced MLA
+(Multi-head Latent Attention), which compresses KV via low-rank projections —
+MLA is gaining traction in frontier models (Kimi K2.5, GLM-5) but GQA remains
+the default for most new models, especially at smaller scales.
 
 ### SwiGLU FFN
 
 SwiGLU is a gated activation function that replaced the standard ReLU FFN:
 
-$$\text{SwiGLU}(h) = (\text{SiLU}(h W_\text{gate}) \odot (h W_\text{up})) W_\text{down}$$
+$$\text{SwiGLU}(h) = (\text{SiLU}(h W\_{\text{gate}}) \odot (h W\_{\text{up}})) W\_{\text{down}}$$
 
 where SiLU(x) = x × sigmoid(x) and ⊙ is element-wise multiplication.
 
@@ -467,6 +530,17 @@ out  = act @ W_down        # (2816,) → (1024,) — down projection
 SwiGLU uses 3 weight matrices instead of 2 (standard FFN uses W1 and W2 only).
 This costs 50% more parameters per layer but gives ~15% better quality per FLOP.
 
+**Why SwiGLU?** The original transformer used ReLU: `relu(x @ W1) @ W2`. GPT-2/3
+switched to GELU (smoother). Shazeer (2020, "GLU Variants Improve Transformer")
+showed that adding a multiplicative gate — where one projection controls how much
+of the other passes through — consistently improves quality across all model sizes.
+The `d_ff` is reduced from `4d` to `8d/3` to compensate for the third matrix,
+keeping total parameter count similar.
+
+SwiGLU was adopted by PaLM (Google 2022), then Llama 1 (Meta 2023), and is now
+universal. Every major LLM as of 2026 uses SwiGLU or the near-identical GeGLU
+variant.
+
 ### Tied Embeddings
 
 The output projection (hidden state → vocabulary logits) reuses the token embedding
@@ -479,6 +553,12 @@ logits = h @ token_emb.T    # (1024,) @ (1024, 32000) → (32000,)
 This means the model doesn't learn separate input and output embeddings — one matrix
 serves both purposes. It saves 32000 × 1024 × 2 = 65.5 MB of parameters and acts as
 a regularizer.
+
+**Why tie?** Press & Wolf (2017) showed that tying input and output embeddings
+forces them to agree on token representations, which acts as regularization and
+improves quality at small-to-medium model scales (<1B parameters). Larger models
+like Llama 2/3 do NOT tie — at that scale, separate embeddings give more capacity.
+At our 306M scale, tying is clearly beneficial.
 
 ---
 
@@ -949,7 +1029,7 @@ RoPE to cached K values.
 
 This is the most mathematically interesting part. Standard attention computes:
 
-$$\text{attn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_\text{head}}}\right) V$$
+$$\text{attn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d\_{\text{head}}}}\right) V$$
 
 The naive implementation would:
 1. Compute all scores QK^T — a vector of length `pos+1` (all previous positions)
@@ -959,6 +1039,15 @@ The naive implementation would:
 This requires storing all scores simultaneously. With 512 positions, that's fine (512
 floats). But the pattern doesn't scale, and more importantly, it requires loading all
 KV cache data at once.
+
+**Why online softmax?** This is the same algorithmic idea behind FlashAttention
+(Dao et al. 2022), which revolutionized transformer training and inference. The key
+insight: softmax can be computed incrementally, processing one tile of K/V at a time,
+by maintaining a running correction factor. This reduces memory from $O(n)$ to
+$O(1)$ (we never store all scores) and improves cache locality (we process one small
+tile, use it, discard it). In training, FlashAttention gives 2-4x speedup. In our
+decode kernel, it lets us process the KV cache in 64-position tiles without ever
+materializing the full attention vector.
 
 **Online softmax** processes the KV cache in tiles of KV_TILE=64 positions, maintaining
 a running estimate of the softmax that's corrected as new tiles arrive:
